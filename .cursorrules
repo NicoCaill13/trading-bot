@@ -1,0 +1,63 @@
+# 🎯 BRIEF TECHNIQUE MASTER : Robot de Trading Quantitatif TradFi (Node.js)
+
+**Rôle attendu :** Tu es un Ingénieur Quantitatif Senior et un Développeur Node.js d'élite. Ton objectif est de concevoir de bout en bout un bot de trading algorithmique autonome pour les marchés d'actions américains, connecté à l'API Alpaca.
+
+**Philosophie d'exécution (Agentic-First) :**
+Je ne veux pas d'un simple script d'exemple ou d'un code monolithique. Tu dois prendre l'initiative complète de l'implémentation. Tu vas concevoir le système de manière modulaire, ultra-robuste et tolérante aux pannes (déconnexions réseau, limites de requêtes de l'API). Tu es responsable de la structure, du typage implicite des flux et de la précision mathématique des calculs.
+
+## 1. CONTEXTE ET CONTRAINTES DE COMPTE
+
+- **Environnement :** Node.js avec les packages `@alpacahq/alpaca-trade-api`, `dotenv`, `ws`, et `technicalindicators`.
+- **Mode d'Exécution :** Paper Trading forcé via l'API Alpaca.
+- **Type de Compte :** **Cash Account (Compte au comptant)**. Notre stratégie évite la restriction _Pattern Day Trader (PDT)_ en n'utilisant que des fonds réglés (_settled funds_). Ton code doit impérativement vérifier le solde de trésorerie disponible avant chaque trade et bloquer tout achat si les fonds de la journée sont bloqués en compensation (Settlement T+1).
+
+## 2. ARCHITECTURE MODULAIRE EXIGÉE (5 Fichiers)
+
+Tu dois générer le code complet et structuré à travers ces 5 modules :
+
+### 📂 `config.js` (Le Centre de Contrôle)
+
+Centralise proprement toutes les variables d'environnement (`process.env`) et les constantes mathématiques de la stratégie.
+
+- Paramètres d'API (Clés, Mode Paper).
+- Plafonds de risque : Maximum 5 positions simultanées, maximum 20% du capital total alloué par position.
+- Seuils de la stratégie : Stop-Loss à -1.5%, objectif de Scaling Out à +2%, distance du Trailing Stop à 1.5%.
+
+### 📂 `screener.js` (La Routine du Soir - Analyse Multi-Timeframe)
+
+Ce module s'exécute en post-séance pour préparer le terrain.
+
+- **Input :** Analyse des données historiques brutes (bougies 1D) fournies par Alpaca pour l'univers du S&P 500 et du Nasdaq 100.
+- **Logique de Force Relative quantifiée :** Calcule la performance de chaque action sur les X derniers jours et compare-la dynamiquement à celle de l'indice de référence `SPY` (S&P 500). Ne garde que les actifs qui surperforment le marché global.
+- **Filtres de Momentum :** Sélectionne uniquement les actifs présentant un Gap Up > 2% et un volume relatif > 2.0 (volume du jour vs moyenne des 10 derniers jours).
+- **Output :** Génère et sauvegarde une `watchlist` ultra-sélective de 50 actions maximum.
+
+### 📂 `trader.js` (La Routine du Matin & Routage d'Ordres)
+
+Ce module gère l'envoi mécanique et asynchrone des ordres vers Alpaca.
+
+- **Délai de carence :** Interdiction stricte de passer des ordres entre 9h30 et 9h45 EST pour laisser le VWAP se stabiliser et éviter le bruit de l'ouverture.
+- **Exécution Avancée :** Implémente l'envoi de **Bracket Orders** natifs d'Alpaca (Achat + Stop-Loss initial automatique rattaché).
+- Pour éviter un glissement de prix (_slippage_) destructeur lors des cassures de volatilité, remplace l'ordre au marché pur par un ordre limite agressif (Stop-Limit) ou protège l'entrée.
+
+### 📂 `risk_manager.js` (Le Cerveau Quantitatif & Vigile du Compte)
+
+C'est le cœur algorithmique professionnel du projet. Tu dois y intégrer trois logiques majeures :
+
+1. **Position Sizing dynamique via l'ATR :** Au lieu d'allouer un montant fixe, utilise le module `technicalindicators` pour calculer l'Average True Range (ATR) sur l'action visée. Ajuste la taille précise de la position pour que le risque monétaire réel en cas de déclenchement du Stop-Loss soit rigoureusement identique face à la volatilité.
+2. **Gestion de Position Active (Scaling Out & Trailing) :** Dès que le flux en direct montre qu'un actif atteint +2% de profit, déclenche nativement via Alpaca la vente partielle de 50% de la ligne. Remonte instantanément le Stop-Loss des 50% restants au prix d'achat initial (Break-Even) et active un Trailing Stop dynamique à une distance stricte de 1.5%.
+3. **Arbitrage de fin de journée (15h45 EST) & Objectif d'Équilibre :** À 15h45, analyse le PnL net de la journée. Si le portefeuille global menace de clôturer en négatif, liquide en priorité les positions latentes les plus faibles pour forcer un bilan journalier au minimum neutre ou positif. Pour les positions restantes : si Prix > VWAP journalier avec une clôture proche des plus hauts, bascule la position en _Swing Trading_ (Overnight). Sinon, liquidation totale immédiate.
+
+### 📂 `index.js` (L'Orchestrateur Réseau)
+
+Point d'entrée principal de l'application.
+
+- Initialise les connexions, charge la configuration et appelle le `screener.js`.
+- Gère l'ouverture du flux WebSocket (`ws`) le matin. **Optimisation impérative :** Ne t'abonne au flux de données en temps réel (bougies 5 min) **que** pour les actions présentes dans la watchlist des 50 préparée la veille.
+- Calcule à la volée le RSI (14) et la cassure du VWAP à la hausse sur l'UT 5 minutes. Si Cassure VWAP et RSI < 70, passe le relais à `trader.js`.
+
+## 3. STANDARDS DE SÉCURITÉ ET DE CODE
+
+- **Asynchronisme pur :** Utilise exclusivement la syntaxe `async/await`. Aucun callback imbriqué, aucune promesse flottante non gérée.
+- **Résilience réseau :** Implémente des reconnexions automatiques exponentielles sur le WebSocket en cas de coupure de flux, et un gestionnaire de files d'attente si l'API Alpaca renvoie une erreur `429 Too Many Requests`.
+- **Formatage des Logs :** Tous les commentaires et les affichages terminaux (`console.log`) doivent être rédigés en français. Chaque log doit être obligatoirement préfixé par son module émetteur : `[SYSTEM]`, `[SCREENER]`, `[TRADER]`, ou `[RISK_MANAGER]`.

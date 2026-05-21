@@ -4,6 +4,7 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
+import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
@@ -17,7 +18,7 @@ const ANALYSIS_CONCURRENCY = 5;
 // 1. Dynamic universe
 // ---------------------------------------------------------------------------
 
-async function getDynamicUniverse(): Promise<string[]> {
+export async function getDynamicUniverse(): Promise<string[]> {
   log.info('Fetching dynamic universe from Alpaca...');
 
   const assets = await alpaca.getAssets({
@@ -44,7 +45,7 @@ async function getDynamicUniverse(): Promise<string[]> {
 // 2. Liquidity pre-filter via snapshots (one request per batch of 100)
 // ---------------------------------------------------------------------------
 
-async function preFilterByLiquidity(symbols: string[]): Promise<string[]> {
+export async function preFilterByLiquidity(symbols: string[]): Promise<string[]> {
   log.info(
     `Liquidity pre-filter on ${symbols.length} symbols ` +
     `(close ≥ $${config.screener.minClosePrice}, ` +
@@ -254,6 +255,8 @@ async function analyzeSymbol(
 
     return {
       symbol: ticker,
+      origin: 'V1_CORE',
+      source: 'core',
       relativeReturn: symbolReturn - benchmarkReturn,
       symbolReturn,
       gapUp,
@@ -348,7 +351,7 @@ export async function runScreener(): Promise<Watchlist> {
   );
 
   const filtered = (candidates.filter(Boolean) as WatchlistSymbol[])
-    .sort((a, b) => b.relativeReturn - a.relativeReturn)
+    .sort((a, b) => (b.relativeReturn ?? 0) - (a.relativeReturn ?? 0))
     .slice(0, config.screener.watchlistMaxSize);
 
   log.info(
@@ -358,25 +361,29 @@ export async function runScreener(): Promise<Watchlist> {
 
   filtered.forEach(s => {
     log.info(
-      `  ${s.symbol.padEnd(6)} | alpha: ${(s.relativeReturn * 100).toFixed(2)}% ` +
-      `| gap: ${(s.gapUp * 100).toFixed(2)}% | rvol: ${s.relativeVolume.toFixed(2)}x ` +
-      `| DV: $${(s.dollarVolume / 1_000_000).toFixed(0)}M ` +
-      `| close: $${s.lastClose.toFixed(2)}`,
+      `  ${s.symbol.padEnd(6)} | alpha: ${((s.relativeReturn ?? 0) * 100).toFixed(2)}% ` +
+      `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
+      `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
+      `| close: $${(s.lastClose ?? 0).toFixed(2)}`,
     );
   });
+
+  const existing = await readWatchlist();
+  const v2Symbols = (existing?.symbols ?? []).filter(isV2Symbol);
 
   const watchlist: Watchlist = {
     generatedAt: new Date().toISOString(),
     benchmarkReturn,
     universeSize: rawUniverse.length,
     liquidFiltered: liquidUniverse.length,
-    symbols: filtered,
+    symbols: [...filtered, ...v2Symbols],
   };
 
-  const outputPath = path.resolve(config.paths.watchlist);
-  await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, JSON.stringify(watchlist, null, 2));
-  log.info(`Watchlist saved: ${outputPath}`);
+  await writeWatchlist(watchlist);
+  log.info(
+    `Watchlist saved: ${path.resolve(config.paths.watchlist)} ` +
+    `(${filtered.length} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER preserved)`,
+  );
 
   return watchlist;
 }

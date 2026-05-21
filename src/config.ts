@@ -57,11 +57,27 @@ const config = {
     minDollarVolume:              parseFloatEnv('MIN_DOLLAR_VOLUME', 50_000_000),
   },
 
+  portfolio: {
+    coreRiskShare:         parseFloatEnv('CORE_RISK_SHARE', 0.80),
+    satelliteRiskShare:    parseFloatEnv('SATELLITE_RISK_SHARE', 0.20),
+    coreMaxPositions:      parseIntEnv('CORE_MAX_POSITIONS', 0),
+    satelliteMaxPositions: parseIntEnv('SATELLITE_MAX_POSITIONS', 0),
+  },
+
+  premarket: {
+    minGapUpPct:           parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.04),
+    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 100_000),
+    watchlistMaxSize:      parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 10),
+  },
+
   entry: {
     volumeBreakoutMultiplier: parseFloatEnv('VOLUME_BREAKOUT_MULTIPLIER', 1.5),
     minBarsForVolumeAvg:      5,
     signalBatchWindowMs:      parseIntEnv('SIGNAL_BATCH_WINDOW_MS', 10000),
     tradeDuringLunch:         process.env.TRADE_DURING_LUNCH === 'true',
+    orbWindowBars:            parseIntEnv('ORB_WINDOW_BARS', 1),
+    // Marketable limit: VWAP × multiplier (default +0.1% slippage cap).
+    marketableLimitVwapMultiplier: parseFloatEnv('MARKETABLE_LIMIT_VWAP_MULTIPLIER', 1.001),
   },
 
   indicators: {
@@ -88,6 +104,7 @@ const config = {
 
   paths: {
     watchlist:    './data/watchlist.json',
+    watchlistV2:  './data/watchlist_v2.json',
     sessionState: './data/session_state.json',
   },
 
@@ -119,6 +136,55 @@ const config = {
 
   if (r.dailyProfitTargetPct <= 0 || r.dailyProfitTargetPct > 0.1)
     throw new Error(`[SYSTEM] DAILY_PROFIT_TARGET_PCT out of bounds (0–10%): ${r.dailyProfitTargetPct}`);
+
+  const p = config.portfolio;
+  const shareSum = p.coreRiskShare + p.satelliteRiskShare;
+  if (Math.abs(shareSum - 1.0) > 0.001) {
+    throw new Error(
+      `[SYSTEM] CORE_RISK_SHARE + SATELLITE_RISK_SHARE must equal 1.0: ${shareSum}`,
+    );
+  }
+
+  if (p.coreRiskShare <= 0 || p.satelliteRiskShare <= 0) {
+    throw new Error('[SYSTEM] CORE_RISK_SHARE and SATELLITE_RISK_SHARE must be > 0');
+  }
+
+  const slots = getPortfolioSlotLimits();
+  if (slots.coreMaxPositions + slots.satelliteMaxPositions > r.maxPositions) {
+    throw new Error(
+      `[SYSTEM] Core + Satellite slots (${slots.coreMaxPositions + slots.satelliteMaxPositions}) ` +
+      `exceed MAX_POSITIONS (${r.maxPositions})`,
+    );
+  }
 }());
+
+export function getPortfolioSlotLimits(): {
+  coreMaxPositions: number;
+  satelliteMaxPositions: number;
+} {
+  const max = config.risk.maxPositions;
+  let core = config.portfolio.coreMaxPositions;
+  let satellite = config.portfolio.satelliteMaxPositions;
+
+  if (core <= 0) {
+    core = Math.floor(max * config.portfolio.coreRiskShare);
+  }
+  if (satellite <= 0) {
+    satellite = max - core;
+  }
+
+  return { coreMaxPositions: core, satelliteMaxPositions: satellite };
+}
+
+export function getRiskShareForTier(tier: 'core' | 'satellite'): number {
+  return tier === 'core'
+    ? config.portfolio.coreRiskShare
+    : config.portfolio.satelliteRiskShare;
+}
+
+export function getMaxPositionPctForTier(tier: 'core' | 'satellite'): number {
+  const share = getRiskShareForTier(tier);
+  return config.risk.maxPositionPct * share;
+}
 
 export default config;

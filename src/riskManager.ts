@@ -1,9 +1,15 @@
 import { ATR } from 'technicalindicators';
 import alpaca from './alpacaClient';
-import config from './config';
+import config, { getRiskShareForTier } from './config';
 import * as trader from './trader';
 import { createLogger } from './logger';
-import type { PositionSizeResult } from './types';
+import type {
+  PortfolioAllocation,
+  PortfolioOrigin,
+  PositionSizeResult,
+  SignalTier,
+} from './types';
+import type { AlpacaPosition } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('RISK_MANAGER');
 
@@ -52,7 +58,51 @@ export function markScaledOut(symbols: string[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Coherent ATR sizing + hard-stop floor
+// 2. Portfolio capital allocation (Core 80% / Satellite 20%)
+// ---------------------------------------------------------------------------
+
+function resolvePositionMarketValue(pos: AlpacaPosition): number {
+  const qty = parseInt(pos.qty, 10);
+  const price = parseFloat(pos.current_price);
+  return Math.abs(qty) * price;
+}
+
+/**
+ * Enforces aggregate capital cap per origin (tier).
+ * Satellite may not exceed satelliteRiskShare × total equity deployed.
+ */
+export async function getPortfolioAllocation(
+  origin: PortfolioOrigin,
+  positionTiers: Map<string, SignalTier>,
+): Promise<PortfolioAllocation> {
+  const totalCapital = await trader.getAccountEquity();
+  const capitalShare = getRiskShareForTier(origin);
+  const maxCapital   = totalCapital * capitalShare;
+
+  const positions = await trader.getOpenPositions();
+  let deployed = 0;
+
+  for (const pos of positions) {
+    const tier = positionTiers.get(pos.symbol) ?? 'core';
+    if (tier === origin) {
+      deployed += resolvePositionMarketValue(pos);
+    }
+  }
+
+  const available = Math.max(0, maxCapital - deployed);
+
+  return {
+    origin,
+    totalCapital,
+    maxCapital,
+    deployed,
+    available,
+    canOpen: available > 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Coherent ATR sizing + hard-stop floor
 // ---------------------------------------------------------------------------
 
 /**
@@ -69,6 +119,8 @@ export async function computePositionSize(
   symbol: string,
   entryPrice: number,
   totalCapital: number,
+  tier: SignalTier = 'core',
+  positionTiers: Map<string, SignalTier> = new Map(),
 ): Promise<PositionSizeResult> {
   const period = config.indicators.atrPeriod;
   const needed = period + 5;
@@ -112,28 +164,47 @@ export async function computePositionSize(
   const hardFloorDistance = entryPrice * config.risk.hardStopFloorPct;
   const stopDistance      = Math.max(atrStopDistance, hardFloorDistance);
 
-  // Quantity calibrated to target monetary risk per trade
-  const riskBudget = totalCapital * config.risk.riskPerTradePct;
+  const allocation = await getPortfolioAllocation(tier, positionTiers);
+  if (!allocation.canOpen) {
+    throw new Error(
+      `${symbol}: ${tier} bucket full — deployed $${allocation.deployed.toFixed(2)} / ` +
+      `$${allocation.maxCapital.toFixed(2)} cap (${(getRiskShareForTier(tier) * 100).toFixed(0)}% equity)`,
+    );
+  }
+
+  const tierCapitalShare = getRiskShareForTier(tier);
+  const subEnvelopeCapital = totalCapital * tierCapitalShare;
+  const riskBudget = subEnvelopeCapital * config.risk.riskPerTradePct;
   const rawQty     = riskBudget / stopDistance;
   const qty        = Math.max(1, Math.floor(rawQty));
 
-  // Cap at maxPositionPct of capital (nominal value)
-  const maxPositionValue = totalCapital * config.risk.maxPositionPct;
+  const perTradeCap = subEnvelopeCapital * config.risk.maxPositionPct;
+  const bucketCap   = allocation.available;
+  const maxPositionValue = Math.min(perTradeCap, bucketCap);
   const cappedQty        = Math.min(qty, Math.floor(maxPositionValue / entryPrice));
+
+  if (cappedQty < 1) {
+    throw new Error(
+      `${symbol}: ${tier} allocation insufficient — ` +
+      `available $${allocation.available.toFixed(2)} for ~$${(entryPrice).toFixed(2)}/share`,
+    );
+  }
 
   const stopLossPrice = entryPrice - stopDistance;
 
   log.info(
-    `${symbol} sizing — ATR:${atr.toFixed(4)} | ` +
-    `stopDist:$${stopDistance.toFixed(4)} (ATR×${config.risk.atrStopMultiplier} vs floor ${(config.risk.hardStopFloorPct * 100).toFixed(1)}%) | ` +
-    `qty:${cappedQty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
+    `${symbol} sizing [${tier}] — ATR:${atr.toFixed(4)} | ` +
+    `risk ${(config.risk.riskPerTradePct * 100).toFixed(1)}% of ` +
+    `${(tierCapitalShare * 100).toFixed(0)}% sub-envelope ($${subEnvelopeCapital.toFixed(0)}) | ` +
+    `bucket $${allocation.deployed.toFixed(0)}/$${allocation.maxCapital.toFixed(0)} | ` +
+    `stopDist:$${stopDistance.toFixed(4)} | qty:${cappedQty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
   );
 
   return { qty: cappedQty, stopLossPrice, atr };
 }
 
 // ---------------------------------------------------------------------------
-// 3. Daily circuit breaker (+1% net PnL)
+// 4. Daily circuit breaker (+1% net PnL)
 // ---------------------------------------------------------------------------
 
 /**
@@ -161,7 +232,7 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
 }
 
 // ---------------------------------------------------------------------------
-// 4. Active position management (scale-out +3% + trailing stop)
+// 5. Active position management (scale-out +3% + trailing stop)
 // ---------------------------------------------------------------------------
 
 /**
@@ -202,7 +273,7 @@ export async function handlePositionUpdate(
 }
 
 // ---------------------------------------------------------------------------
-// 5. EOD sweep 15:45 EST (tight choke)
+// 6. EOD sweep 15:45 EST (tight choke)
 // ---------------------------------------------------------------------------
 
 export interface SessionDataEntry {
@@ -273,7 +344,7 @@ export async function runEodSweep(
 }
 
 // ---------------------------------------------------------------------------
-// 6. Hard close 15:58 EST
+// 7. Hard close 15:58 EST
 // ---------------------------------------------------------------------------
 
 /**

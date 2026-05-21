@@ -1,3 +1,26 @@
+export type SignalTier = 'core' | 'satellite';
+
+/** Strategy lineage tag persisted on the daily watchlist. */
+export type SignalOrigin = 'V1_CORE' | 'V2_PLAYMAKER';
+
+/** Portfolio bucket origin for capital allocation (Core / Satellite). */
+export type PortfolioOrigin = SignalTier;
+
+export function resolveSymbolTier(entry: Pick<WatchlistSymbol, 'origin' | 'source'>): SignalTier {
+  if (entry.origin === 'V2_PLAYMAKER') return 'satellite';
+  if (entry.origin === 'V1_CORE') return 'core';
+  return entry.source === 'satellite' ? 'satellite' : 'core';
+}
+
+export interface PortfolioAllocation {
+  origin: PortfolioOrigin;
+  totalCapital: number;
+  maxCapital: number;
+  deployed: number;
+  available: number;
+  canOpen: boolean;
+}
+
 export interface BarData {
   open: number;
   high: number;
@@ -15,6 +38,7 @@ export interface SessionBarData {
 
 export interface PendingSignal {
   symbol: string;
+  tier: SignalTier;
   score: number;
   barData: BarData;
   vwap: number;
@@ -23,14 +47,19 @@ export interface PendingSignal {
 
 export interface WatchlistSymbol {
   symbol: string;
-  relativeReturn: number;
-  symbolReturn: number;
-  gapUp: number;
-  gapHeld: boolean;
-  relativeVolume: number;
-  dollarVolume: number;
-  lastClose: number;
-  lastOpen: number;
+  origin: SignalOrigin;
+  /** @deprecated Use `origin` — kept for legacy watchlist files. */
+  source?: SignalTier;
+  relativeReturn?: number;
+  symbolReturn?: number;
+  gapUp?: number;
+  gapHeld?: boolean;
+  relativeVolume?: number;
+  dollarVolume?: number;
+  lastClose?: number;
+  lastOpen?: number;
+  preMarketGapPct?: number;
+  catalystScore?: number;
 }
 
 export interface Watchlist {
@@ -41,10 +70,29 @@ export interface Watchlist {
   symbols: WatchlistSymbol[];
 }
 
+export interface PremarketWatchlist {
+  generatedAt: string;
+  universeSize: number;
+  liquidFiltered: number;
+  symbols: WatchlistSymbol[];
+}
+
+export interface OrbState {
+  high: number;
+  low: number;
+  barsCollected: number;
+  triggered: boolean;
+}
+
 export interface PositionSizeResult {
   qty: number;
   stopLossPrice: number;
   atr: number;
+}
+
+export interface EnteredSymbolEntry {
+  symbol: string;
+  tier: SignalTier;
 }
 
 export interface DailyReportData {
@@ -57,7 +105,7 @@ export interface DailyReportData {
 
 export interface SessionState {
   date: string;
-  enteredSymbols: string[];
+  enteredSymbols: EnteredSymbolEntry[] | string[];
 }
 
 export interface Logger {

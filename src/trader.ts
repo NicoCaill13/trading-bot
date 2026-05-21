@@ -2,14 +2,15 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getESTDate, toErrorMessage } from './utils';
 import { createLogger } from './logger';
-import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition } from '@alpacahq/alpaca-trade-api';
+import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
+import type { SignalTier } from './types';
 
 const log = createLogger('TRADER');
 
 interface QueueEntry {
-  params:  AlpacaOrderParams;
+  params: AlpacaOrderParams;
   resolve: (order: AlpacaOrder) => void;
-  reject:  (err: unknown) => void;
+  reject: (err: unknown) => void;
 }
 
 // Order queue — serializes submissions and absorbs rate limits
@@ -22,8 +23,8 @@ let queueProcessing = false;
 
 function isInBlackoutPeriod(): boolean {
   const est = getESTDate();
-  const h   = est.getHours();
-  const m   = est.getMinutes();
+  const h = est.getHours();
+  const m = est.getMinutes();
   if (h < config.session.marketOpenHour) return true;
   if (h === config.session.marketOpenHour && m < config.session.blackoutEndMinute) return true;
   return false;
@@ -114,7 +115,7 @@ function enqueueOrder(params: AlpacaOrderParams): Promise<AlpacaOrder> {
 // ---------------------------------------------------------------------------
 
 export async function cancelOrdersForSymbol(symbol: string): Promise<void> {
-  const orders   = await alpaca.getOrders({ status: 'open', limit: 50 });
+  const orders = await alpaca.getOrders({ status: 'open', limit: 50 });
   const toCancel = orders.filter(o => o.symbol === symbol);
   for (const order of toCancel) {
     try {
@@ -176,18 +177,71 @@ export async function liquidateAll(reason: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Bracket order on entry: stop-limit entry + attached stop-loss.
- * Checks: blackout period, settled cash, position cap, no duplicate position.
+ * Resolves the most aggressive (highest) available price anchor from a snapshot.
+ * Priority: ask > last trade > minute bar close.
+ * Returns null when no live price data is available.
+ */
+function resolveAskPrice(snap: AlpacaSnapshot): number | null {
+  const ask = snap.LatestQuote?.AskPrice;
+  if (ask !== undefined && ask > 0) return ask;
+
+  const lastTrade = snap.LatestTrade?.Price;
+  if (lastTrade !== undefined && lastTrade > 0) return lastTrade;
+
+  const minuteClose = snap.MinuteBar?.ClosePrice;
+  if (minuteClose !== undefined && minuteClose > 0) return minuteClose;
+
+  return null;
+}
+
+/**
+ * Fetches the live ask price for a symbol.
+ * Falls back to signalPrice when the snapshot call fails.
+ */
+async function fetchLiveAskPrice(symbol: string, signalPrice: number): Promise<number> {
+  try {
+    const snapshots = await alpaca.getSnapshots([symbol]);
+    const snap = snapshots.find(
+      s => (s.Symbol ?? (s as { symbol?: string }).symbol) === symbol,
+    );
+    if (!snap) return signalPrice;
+
+    const ask = resolveAskPrice(snap);
+    return ask ?? signalPrice;
+  } catch {
+    return signalPrice;
+  }
+}
+
+/**
+ * Marketable buy limit: max(VWAP × mult, ask × mult).
+ * Using the live ask price at order submission time (not signal time)
+ * prevents the 422 caused by stale bar close + debounce latency.
+ */
+function computeMarketableLimitPrice(vwap: number, askPrice: number): number {
+  const mult = config.entry.marketableLimitVwapMultiplier;
+  return parseFloat(Math.max(vwap * mult, askPrice * mult).toFixed(2));
+}
+
+/**
+ * Bracket order on entry: aggressive marketable limit + stop-loss.
+ * Core entries respect opening blackout; Satellite (ORB) may enter during blackout.
  */
 export async function placeBracketOrder(
   symbol: string,
   qty: number,
-  entryPrice: number,
+  vwap: number,
+  signalPrice: number,
   stopLossPrice: number,
+  tier: SignalTier = 'core',
 ): Promise<AlpacaOrder> {
-  if (isInBlackoutPeriod()) {
-    throw new Error(`Blackout active — order ${symbol} blocked until 09:45 EST`);
+  if (tier === 'core' && isInBlackoutPeriod()) {
+    throw new Error(`Blackout active — Core order ${symbol} blocked until 09:45 EST`);
   }
+
+  // Fetch live ask price at submission time — bar close can be 0-5 min stale + 10s debounce.
+  // Using a stale price produces a non-marketable limit (422) when price runs up.
+  const liveAskPrice = await fetchLiveAskPrice(symbol, signalPrice);
 
   const [settledCash, positions] = await Promise.all([
     getSettledCash(),
@@ -204,7 +258,11 @@ export async function placeBracketOrder(
     );
   }
 
-  const requiredCash = entryPrice * qty;
+  const limitPrice = computeMarketableLimitPrice(vwap, liveAskPrice);
+  const vwapCap = parseFloat((vwap * config.entry.marketableLimitVwapMultiplier).toFixed(2));
+  const priceSource = limitPrice > vwapCap ? `ask $${liveAskPrice.toFixed(2)}` : `VWAP $${vwap.toFixed(2)}`;
+
+  const requiredCash = limitPrice * qty;
   if (requiredCash > settledCash) {
     throw new Error(
       `Insufficient cash for ${symbol}: need $${requiredCash.toFixed(2)}, ` +
@@ -212,26 +270,27 @@ export async function placeBracketOrder(
     );
   }
 
-  // Limit 0.1% above stop price to guarantee fill on a fast breakout
-  const limitPrice         = parseFloat((entryPrice * 1.001).toFixed(2));
-  const slipProtectionStop = parseFloat(entryPrice.toFixed(2));
-
+  // order_class 'oto' (One-Triggers-Other): when the entry fills, the stop-loss
+  // child order is automatically placed. Take-profit is handled manually by
+  // handlePositionUpdate (+3% scale-out + trailing stop) — no take_profit leg needed.
+  // 'bracket' requires BOTH stop_loss and take_profit; using it without take_profit
+  // causes an unconditional 422.
   const orderParams: AlpacaOrderParams = {
     symbol,
-    qty:           String(qty),
-    side:          'buy',
-    type:          'stop_limit',
+    qty: String(qty),
+    side: 'buy',
+    type: 'limit',
     time_in_force: 'day',
-    stop_price:    String(slipProtectionStop),
-    limit_price:   String(limitPrice),
-    order_class:   'bracket',
+    limit_price: String(limitPrice),
+    order_class: 'oto',
     stop_loss: {
       stop_price: String(parseFloat(stopLossPrice.toFixed(2))),
     },
   };
 
   log.info(
-    `Bracket order — ${symbol} qty:${qty} entry~$${entryPrice.toFixed(2)} ` +
+    `Marketable limit entry [${tier}] — ${symbol} qty:${qty} ` +
+    `limit:$${limitPrice.toFixed(2)} (anchor: ${priceSource} × ${config.entry.marketableLimitVwapMultiplier}) ` +
     `stop-loss:$${stopLossPrice.toFixed(2)}`,
   );
 
@@ -248,9 +307,9 @@ export async function placeSellOrder(
 ): Promise<AlpacaOrder> {
   const orderParams: AlpacaOrderParams = {
     symbol,
-    qty:           String(qty),
-    side:          'sell',
-    type:          'market',
+    qty: String(qty),
+    side: 'sell',
+    type: 'market',
     time_in_force: 'day',
   };
 
@@ -283,9 +342,9 @@ export async function replaceWithTrailingStop(
 
   const orderParams: AlpacaOrderParams = {
     symbol,
-    qty:           String(remainingQty),
-    side:          'sell',
-    type:          'trailing_stop',
+    qty: String(remainingQty),
+    side: 'sell',
+    type: 'trailing_stop',
     time_in_force: 'gtc',
     trail_percent: String((trailPercent * 100).toFixed(2)),
   };

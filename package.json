@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "tsx src/index.ts",
-    "screener": "tsx src/screener.ts"
+    "screener": "tsx src/screener.ts",
+    "premarket-screener": "tsx src/premarket_screener.ts"
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.2",

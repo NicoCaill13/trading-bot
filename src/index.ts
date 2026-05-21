@@ -1,25 +1,35 @@
 import fs from 'fs/promises';
 import path from 'path';
 import WebSocket from 'ws';
-import config from './config';
+import config, { getPortfolioSlotLimits } from './config';
 import { runScreener } from './screener';
+import { runPremarketScreener } from './premarket_screener';
+import * as signalQueue from './signalQueue';
 import * as trader from './trader';
 import * as riskManager from './riskManager';
+import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
+import { extractV2Symbols, readWatchlist } from './watchlistIO';
 import type {
   BarData,
   PendingSignal,
   SessionState,
+  SignalTier,
+  OrbState,
+  Watchlist,
+  WatchlistSymbol,
+  EnteredSymbolEntry,
   WsMessage,
   WsBarMessage,
   WsSuccessMessage,
   WsErrorMessage,
   DiscordField,
 } from './types';
+import { resolveSymbolTier } from './types';
 import type { SessionDataEntry } from './riskManager';
-import type { AlpacaOrder } from '@alpacahq/alpaca-trade-api';
+import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SYSTEM');
 
@@ -34,17 +44,25 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 // Set to true when circuit breaker or hard close triggers — blocks new entries
 let tradingHalted = false;
 
-// Symbols for which an entry order was emitted this session (prevents re-entry after stop-out)
-const enteredSymbols = new Set<string>();
+// Symbols entered this session with portfolio tier (Core / Satellite)
+const enteredByTier = new Map<string, SignalTier>();
+
+// Watchlist tier and Satellite pre-market gap metadata
+const symbolTier = new Map<string, SignalTier>();
+const preMarketGaps = new Map<string, number>();
+const orbState = new Map<string, OrbState>();
+
+// Symbols currently subscribed on the WebSocket
+let monitoredSymbols: string[] = [];
 
 // Accumulation of 5-min intraday bars per symbol
 const symbolBars = new Map<string, BarData[]>();
 
+let liveBarsAnnounced = false;
+
 // Session data for EOD sweep: cumulative VWAP, session high, last bar low
 const sessionData = new Map<string, SessionDataEntry>();
 
-// Signals pending ranking before execution
-const pendingSignals = new Map<string, PendingSignal>();
 let signalFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Equity check throttle: at most one REST /account call per minute
@@ -95,10 +113,21 @@ function getTodayDateStr(): string {
   return new Date().toISOString().split('T')[0];
 }
 
+function hasEntered(symbol: string): boolean {
+  return enteredByTier.has(symbol);
+}
+
+function getSymbolTier(symbol: string): SignalTier {
+  return symbolTier.get(symbol) ?? 'core';
+}
+
 async function saveSessionState(): Promise<void> {
+  const entries: EnteredSymbolEntry[] = [...enteredByTier.entries()].map(
+    ([symbol, tier]) => ({ symbol, tier }),
+  );
   const state: SessionState = {
     date:           getTodayDateStr(),
-    enteredSymbols: [...enteredSymbols],
+    enteredSymbols: entries,
   };
   try {
     await fs.mkdir(path.dirname(STATE_PATH), { recursive: true });
@@ -127,8 +156,8 @@ async function loadSessionState(): Promise<SessionState | null> {
 
 /**
  * At restart:
- *   1. Loads persisted state (enteredSymbols) if date matches today
- *   2. Queries Alpaca for open positions → adds to enteredSymbols
+ *   1. Loads persisted state (enteredByTier) if date matches today
+ *   2. Queries Alpaca for open positions → adds to enteredByTier
  *   3. Detects active trailing_stop orders → marks symbols as scaled-out in riskManager
  *      (prevents double scale-out post-crash)
  */
@@ -137,10 +166,14 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   const saved = await loadSessionState();
   if (saved) {
-    for (const sym of saved.enteredSymbols ?? []) {
-      enteredSymbols.add(sym);
+    for (const entry of saved.enteredSymbols ?? []) {
+      if (typeof entry === 'string') {
+        enteredByTier.set(entry, 'core');
+      } else {
+        enteredByTier.set(entry.symbol, entry.tier);
+      }
     }
-    log.info(`Persisted state loaded: ${enteredSymbols.size} symbol(s) already entered today`);
+    log.info(`Persisted state loaded: ${enteredByTier.size} symbol(s) already entered today`);
   }
 
   const [positions, orders] = await Promise.all([
@@ -150,7 +183,9 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   // Any open broker position = symbol already traded this session
   for (const pos of positions) {
-    enteredSymbols.add(pos.symbol);
+    if (!enteredByTier.has(pos.symbol)) {
+      enteredByTier.set(pos.symbol, 'core');
+    }
   }
 
   // Active trailing stop = scale-out already executed before the crash
@@ -164,7 +199,7 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   log.info(
     `Reconciliation done: ${positions.length} broker position(s), ` +
-    `${enteredSymbols.size} session symbol(s), ` +
+    `${enteredByTier.size} session symbol(s), ` +
     `${alreadyScaledOut.length} trailing stop(s) detected`,
   );
 
@@ -186,19 +221,64 @@ async function reconcileStateFromBroker(): Promise<void> {
 // Watchlist loading
 // ---------------------------------------------------------------------------
 
-async function loadWatchlist(): Promise<string[]> {
-  const watchlistPath = path.resolve(config.paths.watchlist);
-  try {
-    const raw  = await fs.readFile(watchlistPath, 'utf8');
-    const data = JSON.parse(raw) as { symbols: Array<{ symbol: string }>; generatedAt: string };
-    const symbols = data.symbols.map(s => s.symbol);
-    log.info(`Watchlist loaded: ${symbols.length} symbols (generated ${data.generatedAt})`);
-    return symbols;
-  } catch {
-    log.info('Watchlist missing — running screener...');
-    const watchlist = await runScreener();
-    return watchlist.symbols.map(s => s.symbol);
+function registerWatchlistSymbol(s: WatchlistSymbol): void {
+  const tier = resolveSymbolTier(s);
+  symbolTier.set(s.symbol, tier);
+  if (tier === 'satellite' && s.preMarketGapPct !== undefined) {
+    preMarketGaps.set(s.symbol, s.preMarketGapPct);
   }
+}
+
+async function loadWatchlistFromFile(): Promise<Watchlist | null> {
+  const data = await readWatchlist();
+  if (!data) return null;
+  for (const s of data.symbols) {
+    registerWatchlistSymbol(s);
+  }
+  return data;
+}
+
+async function loadWatchlist(): Promise<string[]> {
+  symbolTier.clear();
+  preMarketGaps.clear();
+
+  let data = await loadWatchlistFromFile();
+
+  if (!data || data.symbols.length === 0) {
+    log.info('Watchlist missing or empty — running Core screener...');
+    data = await runScreener();
+    symbolTier.clear();
+    preMarketGaps.clear();
+    for (const s of data.symbols) {
+      registerWatchlistSymbol(s);
+    }
+  }
+
+  const v2Symbols = extractV2Symbols(data);
+  signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
+
+  const v1Count = data.symbols.length - v2Symbols.length;
+  log.info(
+    `Watchlist loaded: ${data.symbols.length} symbol(s) ` +
+    `(${v1Count} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER) — generated ${data.generatedAt}`,
+  );
+
+  return data.symbols.map(s => s.symbol);
+}
+
+function applyV2WatchlistSymbols(v2Symbols: WatchlistSymbol[]): string[] {
+  const newSymbols: string[] = [];
+
+  for (const s of v2Symbols) {
+    registerWatchlistSymbol(s);
+    if (!monitoredSymbols.includes(s.symbol)) {
+      newSymbols.push(s.symbol);
+    }
+  }
+
+  signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
+  monitoredSymbols = [...new Set([...monitoredSymbols, ...v2Symbols.map(s => s.symbol)])];
+  return newSymbols;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +293,163 @@ function computeVwap(bars: BarData[]): number | null {
   return tpv / totalVolume;
 }
 
+function alpacaBarToBarData(bar: AlpacaBar): BarData {
+  return {
+    open:      bar.OpenPrice,
+    high:      bar.HighPrice,
+    low:       bar.LowPrice,
+    close:     bar.ClosePrice,
+    volume:    bar.Volume,
+    timestamp: bar.Timestamp,
+  };
+}
+
+function getSessionDateStr(): string {
+  const est = getESTDate();
+  const y = est.getFullYear();
+  const m = String(est.getMonth() + 1).padStart(2, '0');
+  const d = String(est.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function isRegularSessionStarted(): boolean {
+  const est = getESTDate();
+  const h = est.getHours();
+  const m = est.getMinutes();
+  if (h > config.session.marketOpenHour) return true;
+  if (h === config.session.marketOpenHour && m >= config.session.marketOpenMinute) return true;
+  return false;
+}
+
+/**
+ * Volume conviction using all prior bars available (min 1).
+ * Avoids a 30-minute dead zone after mid-session restarts when < 6 bars exist.
+ */
+function passesVolumeConviction(latestBar: BarData, bars: BarData[]): boolean {
+  if (bars.length < 2) return false;
+
+  const needed = config.entry.minBarsForVolumeAvg;
+  const baseline = bars.slice(0, -1).slice(-needed);
+  const avgVolume = baseline.reduce((sum, b) => sum + b.volume, 0) / baseline.length;
+  if (avgVolume <= 0) return false;
+
+  return latestBar.volume > avgVolume * config.entry.volumeBreakoutMultiplier;
+}
+
+function upsertBar(symbol: string, barData: BarData): BarData[] {
+  let bars = symbolBars.get(symbol);
+  if (!bars) {
+    bars = [];
+    symbolBars.set(symbol, bars);
+  }
+
+  const last = bars[bars.length - 1];
+  if (last?.timestamp === barData.timestamp) {
+    bars[bars.length - 1] = barData;
+  } else {
+    bars.push(barData);
+  }
+
+  const maxBars = 80;
+  if (bars.length > maxBars) bars.splice(0, bars.length - maxBars);
+
+  return bars;
+}
+
+function updateSessionDataFromBars(symbol: string, bars: BarData[]): void {
+  const currentVwap = computeVwap(bars);
+  if (currentVwap === null) return;
+
+  const sessionHigh = bars.reduce((max, b) => Math.max(max, b.high), -Infinity);
+  const lastBar = bars[bars.length - 1];
+  sessionData.set(symbol, {
+    vwap:       currentVwap,
+    high:       sessionHigh,
+    lastBarLow: lastBar.low,
+  });
+}
+
+/** Seeds ORB range from opening 5-min window(s) after REST hydration. */
+function seedOrbState(symbol: string, bars: BarData[]): void {
+  if (getSymbolTier(symbol) !== 'satellite') return;
+
+  const window = config.entry.orbWindowBars;
+  if (bars.length < window) return;
+
+  const opening = bars.slice(0, window);
+  orbState.set(symbol, {
+    high:          Math.max(...opening.map(b => b.high)),
+    low:           Math.min(...opening.map(b => b.low)),
+    barsCollected: window,
+    triggered:     false,
+  });
+}
+
+async function hydrateIntradayBars(symbols: string[]): Promise<void> {
+  if (!isRegularSessionStarted()) {
+    log.info('Pre-open — intraday bar hydration skipped');
+    return;
+  }
+
+  const sessionDate = getSessionDateStr();
+  const end         = new Date().toISOString();
+
+  log.info(
+    `Hydrating 5-min bars (${sessionDate} session) for ${symbols.length} symbols...`,
+  );
+
+  let symbolsWithBars = 0;
+  let totalBars       = 0;
+
+  for (let i = 0; i < symbols.length; i++) {
+    const symbol = symbols[i];
+    try {
+      const bars: BarData[] = [];
+      const iter = alpaca.getBarsV2(symbol, {
+        start:     sessionDate,
+        end,
+        timeframe: '5Min',
+        feed:      'iex',
+        limit:     80,
+      });
+
+      for await (const bar of iter) {
+        bars.push(alpacaBarToBarData(bar));
+      }
+
+      if (bars.length > 0) {
+        symbolBars.set(symbol, bars);
+        totalBars += bars.length;
+        symbolsWithBars++;
+        seedOrbState(symbol, bars);
+        updateSessionDataFromBars(symbol, bars);
+      }
+    } catch (err) {
+      log.warn(`${symbol}: hydration failed — ${toErrorMessage(err)}`);
+    }
+
+    if (i + 1 < symbols.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  log.info(
+    `Hydration done — ${symbolsWithBars}/${symbols.length} symbols, ` +
+    `${totalBars} bar(s) loaded`,
+  );
+
+  for (const symbol of symbols) {
+    const bars = symbolBars.get(symbol);
+    if (!bars || bars.length === 0) continue;
+
+    const latest = bars[bars.length - 1];
+    if (getSymbolTier(symbol) === 'satellite' && isBlackoutPeriod()) {
+      evaluateOrbSignal(symbol, latest);
+    }
+    evaluateSignal(symbol, latest);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Signal evaluation (VWAP breakout + volume conviction filter)
 // ---------------------------------------------------------------------------
@@ -225,17 +462,86 @@ function computeVwap(bars: BarData[]): number | null {
  *   4. VWAP breakout: prev_close <= vwap AND current_close > vwap (strict transition)
  *   5. Volume conviction: bar_volume > volumeBreakoutMultiplier × avg(5 previous bars)
  *
- * Qualified signals are stored in pendingSignals with their Momentum Score.
+ * Qualified signals are enqueued by tier (Satellite = priority bucket).
  * Execution is delegated to flushPendingSignals().
  */
+function queuePendingSignal(signal: PendingSignal): void {
+  signalQueue.enqueue(signal);
+  schedulePendingSignalFlush();
+}
+
+function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
+  if (tradingHalted)           return;
+  if (hasEntered(symbol))       return;
+  if (getSymbolTier(symbol) !== 'satellite') return;
+  if (!isBlackoutPeriod())      return;
+
+  let state = orbState.get(symbol);
+  if (!state) {
+    state = { high: -Infinity, low: Infinity, barsCollected: 0, triggered: false };
+    orbState.set(symbol, state);
+  }
+  if (state.triggered) return;
+
+  const window = config.entry.orbWindowBars;
+  const bars = symbolBars.get(symbol) ?? [];
+
+  if (state.barsCollected < window) {
+    state.high = state.barsCollected === 0
+      ? latestBar.high
+      : Math.max(state.high, latestBar.high);
+    state.low = state.barsCollected === 0
+      ? latestBar.low
+      : Math.min(state.low, latestBar.low);
+    state.barsCollected++;
+    orbState.set(symbol, state);
+    if (state.barsCollected < window) return;
+  }
+
+  if (latestBar.close <= state.high) return;
+
+  if (!passesVolumeConviction(latestBar, bars)) {
+    log.info(`${symbol}: ORB breakout without volume conviction — ignored`);
+    return;
+  }
+
+  const baselineBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
+  const avgVolume    = baselineBars.reduce((sum, b) => sum + b.volume, 0) / baselineBars.length;
+
+  const orbDeviation = (latestBar.close - state.high) / state.high;
+  const momentumScore = latestBar.volume * orbDeviation;
+  const vwap = computeVwap(bars) ?? latestBar.close;
+
+  state.triggered = true;
+  orbState.set(symbol, state);
+
+  log.info(
+    `${symbol}: Satellite ORB signal — ` +
+    `ORB high $${state.high.toFixed(2)} | close $${latestBar.close.toFixed(2)} | ` +
+    `break ${(orbDeviation * 100).toFixed(2)}% | score ${Math.round(momentumScore).toLocaleString()} → queued`,
+  );
+
+  queuePendingSignal({
+    symbol,
+    tier: 'satellite',
+    score: momentumScore,
+    barData: latestBar,
+    vwap,
+    avgVolume,
+  });
+}
+
 function evaluateSignal(symbol: string, latestBar: BarData): void {
-  if (tradingHalted)              return;
-  if (enteredSymbols.has(symbol)) return;
+  if (tradingHalted)           return;
+  if (hasEntered(symbol))      return;
+
+  const tier = getSymbolTier(symbol);
+  if (tier === 'satellite' && isBlackoutPeriod()) return;
 
   if (!config.entry.tradeDuringLunch && isLunchPeriod()) return;
 
   const bars = symbolBars.get(symbol) ?? [];
-  if (bars.length < config.entry.minBarsForVolumeAvg + 1) return;
+  if (bars.length < 2) return;
 
   const vwap = computeVwap(bars);
   if (vwap === null) return;
@@ -246,19 +552,13 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   const vwapBreakout = prevBar.close <= vwap && currentPrice > vwap;
   if (!vwapBreakout) return;
 
-  const recentBars = bars.slice(-(config.entry.minBarsForVolumeAvg + 1), -1);
-  if (recentBars.length < config.entry.minBarsForVolumeAvg) return;
-
-  const avgVolume      = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
-  const volumeRequired = avgVolume * config.entry.volumeBreakoutMultiplier;
-
-  if (latestBar.volume <= volumeRequired) {
-    log.info(
-      `${symbol}: VWAP breakout without volume conviction ` +
-      `(${latestBar.volume.toLocaleString()} vs ${Math.round(volumeRequired).toLocaleString()} required) — ignored`,
-    );
+  if (!passesVolumeConviction(latestBar, bars)) {
+    log.info(`${symbol}: VWAP breakout without volume conviction — ignored`);
     return;
   }
+
+  const recentBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
+  const avgVolume  = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
 
   // Momentum Score = breakout volume × VWAP deviation %
   // Higher score = stronger breakout on larger volume
@@ -266,15 +566,20 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   const momentumScore = latestBar.volume * vwapDeviation;
 
   log.info(
-    `${symbol}: qualified signal — ` +
+    `${symbol}: ${tier} VWAP signal — ` +
     `price $${currentPrice.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
     `deviation ${(vwapDeviation * 100).toFixed(2)}% | vol ×${(latestBar.volume / avgVolume).toFixed(1)} | ` +
     `score ${Math.round(momentumScore).toLocaleString()} → queued`,
   );
 
-  // Overwrites any previous entry for this symbol (more recent signal = more relevant)
-  pendingSignals.set(symbol, { symbol, score: momentumScore, barData: latestBar, vwap, avgVolume });
-  schedulePendingSignalFlush();
+  queuePendingSignal({
+    symbol,
+    tier,
+    score: momentumScore,
+    barData: latestBar,
+    vwap,
+    avgVolume,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -290,30 +595,93 @@ function schedulePendingSignalFlush(): void {
   }, config.entry.signalBatchWindowMs);
 }
 
+function countOpenPositionsByTier(
+  positions: Awaited<ReturnType<typeof trader.getOpenPositions>>,
+): { core: number; satellite: number } {
+  let core = 0;
+  let satellite = 0;
+  for (const pos of positions) {
+    const tier = enteredByTier.get(pos.symbol) ?? 'core';
+    if (tier === 'satellite') satellite++;
+    else core++;
+  }
+  return { core, satellite };
+}
+
+async function executeSignalsForTier(
+  signals: PendingSignal[],
+  maxExecutions: number,
+): Promise<string[]> {
+  const executed: string[] = [];
+  if (maxExecutions <= 0 || signals.length === 0) return executed;
+
+  const ranked    = [...signals].sort((a, b) => b.score - a.score);
+  const toExecute = ranked.slice(0, maxExecutions);
+  const rejected  = ranked.slice(maxExecutions);
+
+  rejected.forEach(s => {
+    log.info(
+      `  rejected  ${s.symbol.padEnd(6)} [${s.tier}] | score ${Math.round(s.score).toLocaleString()}`,
+    );
+  });
+
+  for (const signal of toExecute) {
+    const { symbol, barData, score, vwap, tier } = signal;
+
+    log.info(
+      `  executing ${symbol.padEnd(6)} [${tier}] | score ${Math.round(score).toLocaleString()} ` +
+      `| deviation ${(((barData.close - vwap) / vwap) * 100).toFixed(2)}% ` +
+      `| price $${barData.close.toFixed(2)}`,
+    );
+
+    try {
+      const settledCash = await trader.getSettledCash();
+      const allocation = await riskManager.getPortfolioAllocation(tier, enteredByTier);
+      if (!allocation.canOpen) {
+        log.warn(
+          `${symbol}: ${tier} bucket capital exhausted ` +
+          `($${allocation.deployed.toFixed(0)}/$${allocation.maxCapital.toFixed(0)}) — skipped`,
+        );
+        continue;
+      }
+
+      const { qty, stopLossPrice } = await riskManager.computePositionSize(
+        symbol,
+        barData.close,
+        settledCash,
+        tier,
+        enteredByTier,
+      );
+
+      if (qty < 1) {
+        log.warn(`${symbol}: position size 0 — ignored`);
+        continue;
+      }
+
+      await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
+      enteredByTier.set(symbol, tier);
+      executed.push(symbol);
+      await saveSessionState();
+    } catch (err) {
+      log.error(`${symbol}: order failed — ${toErrorMessage(err)}`);
+    }
+  }
+
+  return executed;
+}
+
 /**
- * After the batch window:
- *   - Retrieves the number of available slots
- *   - Ranks pending signals by descending score
- *   - Executes the N best (N = available slots)
- *   - Rejects the rest with an explicit log
+ * Dual-bucket flush: Core and Satellite slots and risk budgets are independent.
+ * During opening blackout, only Satellite (ORB) signals may execute; Core is deferred.
  */
 async function flushPendingSignals(): Promise<void> {
   signalFlushTimer = null;
 
-  if (pendingSignals.size === 0) return;
+  if (signalQueue.size() === 0) return;
 
-  // Double check: tradingHalted (set after await) AND circuitBreakerTriggered
-  // (set synchronously before any await in checkCircuitBreaker) — fixes race condition
   if (tradingHalted || riskManager.isCircuitBreakerTriggered()) {
-    log.info(`Flush cancelled: trading halted (${pendingSignals.size} signal(s) dropped)`);
-    pendingSignals.clear();
-    return;
-  }
-
-  // Opening blackout 09:30–09:45: defer execution until market settles
-  if (isBlackoutPeriod()) {
-    log.info(`Blackout active (09:30–09:45) — ${pendingSignals.size} signal(s) deferred`);
-    schedulePendingSignalFlush();
+    log.info(`Flush cancelled: trading halted (${signalQueue.size()} signal(s) dropped)`);
+    signalQueue.clear();
     return;
   }
 
@@ -322,69 +690,62 @@ async function flushPendingSignals(): Promise<void> {
     currentPositions = await trader.getOpenPositions();
   } catch (err) {
     log.error(`Flush impossible: API error on positions — ${toErrorMessage(err)}`);
-    pendingSignals.clear();
+    signalQueue.clear();
     return;
   }
 
-  const availableSlots = config.risk.maxPositions - currentPositions.length;
+  const slotLimits = getPortfolioSlotLimits();
+  const openCounts = countOpenPositionsByTier(currentPositions);
+  const coreSlotsAvailable      = slotLimits.coreMaxPositions - openCounts.core;
+  const satelliteSlotsAvailable = slotLimits.satelliteMaxPositions - openCounts.satellite;
 
-  // Filter symbols that entered during the batch window (race condition guard)
-  const candidates = [...pendingSignals.values()].filter(s => !enteredSymbols.has(s.symbol));
+  const filterEntered = (signals: PendingSignal[]) =>
+    signals.filter(s => !hasEntered(s.symbol));
 
-  if (availableSlots <= 0 || candidates.length === 0) {
-    log.info(
-      `Flush — ${candidates.length} candidate(s), ` +
-      `${currentPositions.length}/${config.risk.maxPositions} positions — no slot available`,
-    );
-    pendingSignals.clear();
+  const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
+  const coreCandidates      = filterEntered(signalQueue.getCoreSignals());
+
+  const blackout = isBlackoutPeriod();
+  if (blackout && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
+    log.info(`Blackout active — ${coreCandidates.length} Core signal(s) deferred`);
+    schedulePendingSignalFlush();
     return;
   }
 
-  const ranked    = candidates.sort((a, b) => b.score - a.score);
-  const toExecute = ranked.slice(0, availableSlots);
-  const rejected  = ranked.slice(availableSlots);
+  const executedSymbols: string[] = [];
 
-  log.info(
-    `Flush — ${candidates.length} candidate(s) | ` +
-    `${toExecute.length} selected | ${rejected.length} rejected | ` +
-    `slots: ${availableSlots}/${config.risk.maxPositions}`,
-  );
-
-  rejected.forEach(s => {
-    log.info(`  rejected  ${s.symbol.padEnd(6)} | score ${Math.round(s.score).toLocaleString()}`);
-  });
-
-  for (const signal of toExecute) {
-    const { symbol, barData, score, vwap } = signal;
-
+  if (satelliteCandidates.length > 0) {
     log.info(
-      `  executing ${symbol.padEnd(6)} | score ${Math.round(score).toLocaleString()} ` +
-      `| VWAP deviation ${(((barData.close - vwap) / vwap) * 100).toFixed(2)}% ` +
-      `| price $${barData.close.toFixed(2)}`,
+      `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
+      `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
     );
-
-    try {
-      const settledCash = await trader.getSettledCash();
-      const { qty, stopLossPrice } = await riskManager.computePositionSize(
-        symbol,
-        barData.close,
-        settledCash,
-      );
-
-      if (qty < 1) {
-        log.warn(`${symbol}: position size 0 — ignored`);
-        continue;
-      }
-
-      await trader.placeBracketOrder(symbol, qty, barData.close, stopLossPrice);
-      enteredSymbols.add(symbol);
-      await saveSessionState();
-    } catch (err) {
-      log.error(`${symbol}: order failed — ${toErrorMessage(err)}`);
-    }
+    const satExecuted = await executeSignalsForTier(
+      satelliteCandidates,
+      satelliteSlotsAvailable,
+    );
+    executedSymbols.push(...satExecuted);
   }
 
-  pendingSignals.clear();
+  if (!blackout && coreCandidates.length > 0) {
+    log.info(
+      `Flush Core — ${coreCandidates.length} candidate(s), ` +
+      `slots ${coreSlotsAvailable}/${slotLimits.coreMaxPositions}`,
+    );
+    const coreExecuted = await executeSignalsForTier(
+      coreCandidates,
+      coreSlotsAvailable,
+    );
+    executedSymbols.push(...coreExecuted);
+  } else if (blackout && coreCandidates.length > 0) {
+    log.info(`Blackout active — ${coreCandidates.length} Core signal(s) kept pending`);
+    schedulePendingSignalFlush();
+  }
+
+  signalQueue.remove(executedSymbols);
+
+  if (!blackout) {
+    signalQueue.clear();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -402,31 +763,17 @@ async function handleBarEvent(bar: WsBarMessage): Promise<void> {
     timestamp: bar.t,
   };
 
-  let bars = symbolBars.get(symbol);
-  if (!bars) {
-    bars = [];
-    symbolBars.set(symbol, bars);
+  if (!liveBarsAnnounced) {
+    liveBarsAnnounced = true;
+    log.info(`Live 5-min bars flowing — first tick: ${symbol} @ $${barData.close.toFixed(2)}`);
   }
-  bars.push(barData);
 
-  // Memory bound: keep only what's needed for VWAP + avg volume computation
-  const maxBars = 80;
-  if (bars.length > maxBars) bars.splice(0, bars.length - maxBars);
-
-  // Update session data for EOD sweep
-  const currentVwap = computeVwap(bars);
-  if (currentVwap !== null) {
-    const sessionHigh = bars.reduce((max, b) => Math.max(max, b.high), -Infinity);
-    sessionData.set(symbol, {
-      vwap:       currentVwap,
-      high:       sessionHigh,
-      lastBarLow: barData.low,
-    });
-  }
+  const bars = upsertBar(symbol, barData);
+  updateSessionDataFromBars(symbol, bars);
 
   // Active position management only for symbols entered this session
   // Avoids ~3,900 getPosition() 404 calls/day on non-portfolio symbols
-  if (enteredSymbols.has(symbol)) {
+  if (hasEntered(symbol)) {
     await riskManager.handlePositionUpdate(symbol, barData.close);
   }
 
@@ -458,7 +805,10 @@ async function handleBarEvent(bar: WsBarMessage): Promise<void> {
     }
   }
 
-  // Signal evaluation is synchronous — execution is deferred to flushPendingSignals()
+  const tier = getSymbolTier(symbol);
+  if (tier === 'satellite' && isBlackoutPeriod()) {
+    evaluateOrbSignal(symbol, barData);
+  }
   evaluateSignal(symbol, barData);
 }
 
@@ -599,9 +949,9 @@ function scheduleEodReport(): void {
         await sendDailyReport({
           startEquity:         sessionStartEquity,
           endEquity,
-          tradesEntered:       enteredSymbols.size,
+          tradesEntered:       enteredByTier.size,
           circuitBreakerFired: riskManager.isCircuitBreakerTriggered(),
-          symbols:             [...enteredSymbols],
+          symbols:             [...enteredByTier.keys()],
         });
       })
       .catch(() => {});
@@ -620,8 +970,12 @@ function scheduleDailyReset(): void {
 
     tradingHalted     = false;
     lastEquityCheckMs = 0;
-    enteredSymbols.clear();
-    pendingSignals.clear();
+    enteredByTier.clear();
+    symbolTier.clear();
+    preMarketGaps.clear();
+    orbState.clear();
+    monitoredSymbols = [];
+    signalQueue.clear();
     if (signalFlushTimer) {
       clearTimeout(signalFlushTimer);
       signalFlushTimer = null;
@@ -640,11 +994,16 @@ function scheduleDailyReset(): void {
       });
 
     runScreener()
-      .then(watchlist => {
+      .then(async watchlist => {
+        symbolTier.clear();
+        preMarketGaps.clear();
+        for (const s of watchlist.symbols) {
+          registerWatchlistSymbol(s);
+        }
         const newSymbols = watchlist.symbols.map(s => s.symbol);
-        log.info(`Screener done — ${newSymbols.length} symbol(s) ready for next session`);
+        monitoredSymbols = newSymbols;
+        log.info(`Core screener done — ${newSymbols.length} symbol(s) ready for next session`);
         if (newSymbols.length > 0) {
-          // Tear down existing connection (if any) and reconnect with fresh symbols
           if (ws) {
             ws.removeAllListeners();
             ws.close();
@@ -669,10 +1028,23 @@ function schedulePreMarketReconciliation(): void {
   const ms = msUntilESTTime(config.session.preMarketHour, config.session.preMarketMinute);
   log.info(`Pre-market reconciliation scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    log.info('Pre-market reconciliation 09:15...');
-    reconcileStateFromBroker().catch((err: unknown) => {
-      log.error(`Pre-market reconciliation error: ${toErrorMessage(err)}`);
-    });
+    log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
+    reconcileStateFromBroker()
+      .then(() => runPremarketScreener())
+      .then(watchlist => {
+        const v2Symbols = extractV2Symbols(watchlist);
+        const newSymbols = applyV2WatchlistSymbols(v2Symbols);
+        log.info(
+          `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
+          `${newSymbols.length} new WebSocket subscription(s)`,
+        );
+        if (ws && newSymbols.length > 0) {
+          ws.send(buildSubscribeMessage(newSymbols));
+        }
+      })
+      .catch((err: unknown) => {
+        log.error(`Pre-market routine error: ${toErrorMessage(err)}`);
+      });
     schedulePreMarketReconciliation();
   }, ms);
 }
@@ -685,6 +1057,7 @@ async function main(): Promise<void> {
   log.info('Initializing trading bot...');
 
   const symbols = await loadWatchlist();
+  monitoredSymbols = symbols;
 
   // Always arm all crons — they must fire even on empty-watchlist days
   scheduleEodSweep();
@@ -707,12 +1080,21 @@ async function main(): Promise<void> {
   // Reconcile state from broker (protects against mid-session crashes)
   await reconcileStateFromBroker();
 
+  await hydrateIntradayBars(symbols);
+
   connectWebSocket(symbols);
 
-  log.info(`Bot active — monitoring ${symbols.length} symbols`);
+  const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
+  const satCount  = [...symbolTier.values()].filter(t => t === 'satellite').length;
+  const slots     = getPortfolioSlotLimits();
+  log.info(
+    `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
+    `slots ${slots.coreMaxPositions} Core / ${slots.satelliteMaxPositions} Satellite`,
+  );
   await alertInfo(
     'Bot started',
-    `Monitoring ${symbols.length} symbols | Equity: $${sessionStartEquity.toFixed(2)}`,
+    `Monitoring ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
+    `Equity: $${sessionStartEquity.toFixed(2)}`,
   ).catch(() => {});
 
 }

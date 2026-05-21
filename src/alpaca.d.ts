@@ -29,11 +29,22 @@ declare module '@alpacahq/alpaca-trade-api' {
 
   // Matches the real SDK AlpacaSnapshot (PascalCase — entityv2.d.ts)
   // getSnapshots returns AlpacaSnapshot[] — Symbol field identifies the ticker
+  export interface AlpacaLatestTrade {
+    Price: number;
+  }
+
+  export interface AlpacaLatestQuote {
+    AskPrice: number;
+    BidPrice: number;
+  }
+
   export interface AlpacaSnapshot {
     Symbol: string;
-    DailyBar: AlpacaBar;
-    PrevDailyBar: AlpacaBar;
-    MinuteBar: AlpacaBar;
+    DailyBar?: AlpacaBar;
+    PrevDailyBar?: AlpacaBar;
+    MinuteBar?: AlpacaBar;
+    LatestTrade?: AlpacaLatestTrade;
+    LatestQuote?: AlpacaLatestQuote;
   }
 
   export interface AlpacaPosition {
@@ -78,6 +89,7 @@ declare module '@alpacahq/alpaca-trade-api' {
     timeframe?: string;
     feed?: string;
     limit?: number;
+    adjustment?: string;
   }
 
   export default class Alpaca {

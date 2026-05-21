@@ -55,8 +55,23 @@ const orbState = new Map<string, OrbState>();
 // Symbols currently subscribed on the WebSocket
 let monitoredSymbols: string[] = [];
 
-// Accumulation of 5-min intraday bars per symbol
-const symbolBars = new Map<string, BarData[]>();
+// 5-min bars for signal generation (VWAP breakout, ORB, EOD session metrics)
+const signalBars5m = new Map<string, BarData[]>();
+
+// Rolling 1-min → 5-min aggregation (Alpaca WS bars channel is 1-minute)
+const FIVE_MIN_MS = 5 * 60 * 1000;
+
+interface FiveMinuteAggregator {
+  periodStartMs: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  timestamp: string;
+}
+
+const fiveMinAggregators = new Map<string, FiveMinuteAggregator>();
 
 let liveBarsAnnounced = false;
 
@@ -336,11 +351,60 @@ function passesVolumeConviction(latestBar: BarData, bars: BarData[]): boolean {
   return latestBar.volume > avgVolume * config.entry.volumeBreakoutMultiplier;
 }
 
-function upsertBar(symbol: string, barData: BarData): BarData[] {
-  let bars = symbolBars.get(symbol);
+function getFiveMinutePeriodStartMs(timestamp: string): number {
+  return Math.floor(new Date(timestamp).getTime() / FIVE_MIN_MS) * FIVE_MIN_MS;
+}
+
+function aggregatorToBar(agg: FiveMinuteAggregator): BarData {
+  return {
+    open:      agg.open,
+    high:      agg.high,
+    low:       agg.low,
+    close:     agg.close,
+    volume:    agg.volume,
+    timestamp: agg.timestamp,
+  };
+}
+
+/**
+ * Ingests a 1-min WS bar. Returns a completed 5-min bar when the period rolls over.
+ */
+function ingestOneMinuteBar(symbol: string, bar: BarData): BarData | null {
+  const periodStartMs = getFiveMinutePeriodStartMs(bar.timestamp);
+  let agg             = fiveMinAggregators.get(symbol);
+  let completed: BarData | null = null;
+
+  if (agg !== undefined && agg.periodStartMs !== periodStartMs) {
+    completed = aggregatorToBar(agg);
+    agg       = undefined;
+  }
+
+  if (agg === undefined) {
+    fiveMinAggregators.set(symbol, {
+      periodStartMs,
+      open:      bar.open,
+      high:      bar.high,
+      low:       bar.low,
+      close:     bar.close,
+      volume:    bar.volume,
+      timestamp: new Date(periodStartMs).toISOString(),
+    });
+    return completed;
+  }
+
+  agg.high   = Math.max(agg.high, bar.high);
+  agg.low    = Math.min(agg.low, bar.low);
+  agg.close  = bar.close;
+  agg.volume += bar.volume;
+  fiveMinAggregators.set(symbol, agg);
+  return completed;
+}
+
+function upsertSignalBar(symbol: string, barData: BarData): BarData[] {
+  let bars = signalBars5m.get(symbol);
   if (!bars) {
     bars = [];
-    symbolBars.set(symbol, bars);
+    signalBars5m.set(symbol, bars);
   }
 
   const last = bars[bars.length - 1];
@@ -418,7 +482,7 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
       }
 
       if (bars.length > 0) {
-        symbolBars.set(symbol, bars);
+        signalBars5m.set(symbol, bars);
         totalBars += bars.length;
         symbolsWithBars++;
         seedOrbState(symbol, bars);
@@ -439,7 +503,7 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
   );
 
   for (const symbol of symbols) {
-    const bars = symbolBars.get(symbol);
+    const bars = signalBars5m.get(symbol);
     if (!bars || bars.length === 0) continue;
 
     const latest = bars[bars.length - 1];
@@ -484,7 +548,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
   if (state.triggered) return;
 
   const window = config.entry.orbWindowBars;
-  const bars = symbolBars.get(symbol) ?? [];
+  const bars = signalBars5m.get(symbol) ?? [];
 
   if (state.barsCollected < window) {
     state.high = state.barsCollected === 0
@@ -540,7 +604,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   if (!config.entry.tradeDuringLunch && isLunchPeriod()) return;
 
-  const bars = symbolBars.get(symbol) ?? [];
+  const bars = signalBars5m.get(symbol) ?? [];
   if (bars.length < 2) return;
 
   const vwap = computeVwap(bars);
@@ -749,10 +813,10 @@ async function flushPendingSignals(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 5-minute bar event handler
+// 1-minute WS bar handler (signals aggregated to 5-min; positions on 1-min)
 // ---------------------------------------------------------------------------
 
-async function handleBarEvent(bar: WsBarMessage): Promise<void> {
+async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   const symbol  = bar.S;
   const barData: BarData = {
     open:      bar.o,
@@ -765,16 +829,16 @@ async function handleBarEvent(bar: WsBarMessage): Promise<void> {
 
   if (!liveBarsAnnounced) {
     liveBarsAnnounced = true;
-    log.info(`Live 5-min bars flowing — first tick: ${symbol} @ $${barData.close.toFixed(2)}`);
+    log.info(`Live 1-min bars flowing — first tick: ${symbol} @ $${barData.close.toFixed(2)}`);
   }
 
-  const bars = upsertBar(symbol, barData);
-  updateSessionDataFromBars(symbol, bars);
-
-  // Active position management only for symbols entered this session
-  // Avoids ~3,900 getPosition() 404 calls/day on non-portfolio symbols
+  // Open positions: scale-out / trailing logic on every 1-min close (not 5-min).
   if (hasEntered(symbol)) {
-    await riskManager.handlePositionUpdate(symbol, barData.close);
+    try {
+      await riskManager.handlePositionUpdate(symbol, barData.close);
+    } catch (err) {
+      log.error(`${symbol}: position update error — ${toErrorMessage(err)}`);
+    }
   }
 
   // Circuit breaker equity check — throttled to 1 REST call/minute max
@@ -805,11 +869,18 @@ async function handleBarEvent(bar: WsBarMessage): Promise<void> {
     }
   }
 
+  // Aggregate 1-min → 5-min for signal path (VWAP breakout, ORB, EOD metrics).
+  const completed5m = ingestOneMinuteBar(symbol, barData);
+  if (!completed5m) return;
+
+  const bars5m = upsertSignalBar(symbol, completed5m);
+  updateSessionDataFromBars(symbol, bars5m);
+
   const tier = getSymbolTier(symbol);
   if (tier === 'satellite' && isBlackoutPeriod()) {
-    evaluateOrbSignal(symbol, barData);
+    evaluateOrbSignal(symbol, completed5m);
   }
-  evaluateSignal(symbol, barData);
+  evaluateSignal(symbol, completed5m);
 }
 
 // ---------------------------------------------------------------------------
@@ -849,7 +920,7 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
     }
 
     if (isWsBarMessage(msg)) {
-      await handleBarEvent(msg);
+      await handleOneMinuteBarEvent(msg);
     }
 
     if (isWsErrorMessage(msg)) {
@@ -980,7 +1051,8 @@ function scheduleDailyReset(): void {
       clearTimeout(signalFlushTimer);
       signalFlushTimer = null;
     }
-    symbolBars.clear();
+    signalBars5m.clear();
+    fiveMinAggregators.clear();
     sessionData.clear();
 
     trader.getAccountEquity()

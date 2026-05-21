@@ -114,17 +114,69 @@ function enqueueOrder(params: AlpacaOrderParams): Promise<AlpacaOrder> {
 // Order cancellation
 // ---------------------------------------------------------------------------
 
+/** Collects every open order id for a symbol (parents + nested legs). */
+function collectOpenOrderIds(symbol: string, orders: AlpacaOrder[]): string[] {
+  const ids = new Set<string>();
+
+  for (const order of orders) {
+    if (order.symbol !== symbol) continue;
+    ids.add(order.id);
+    order.legs?.forEach(leg => {
+      if (leg.symbol === symbol || leg.symbol === undefined) {
+        ids.add(leg.id);
+      }
+    });
+  }
+
+  return [...ids];
+}
+
 export async function cancelOrdersForSymbol(symbol: string): Promise<void> {
-  const orders = await alpaca.getOrders({ status: 'open', limit: 50 });
-  const toCancel = orders.filter(o => o.symbol === symbol);
-  for (const order of toCancel) {
+  const orders = await alpaca.getOrders({
+    status: 'open',
+    limit:  100,
+    nested: true,
+    symbols: symbol,
+  });
+
+  const orderIds = collectOpenOrderIds(symbol, orders);
+  if (orderIds.length === 0) {
+    log.info(`${symbol}: no open orders to cancel`);
+    return;
+  }
+
+  log.info(`${symbol}: cancelling ${orderIds.length} open order(s)...`);
+
+  for (const orderId of orderIds) {
     try {
-      await alpaca.cancelOrder(order.id);
-      log.info(`Order ${order.id} cancelled for ${symbol}`);
+      await alpaca.cancelOrder(orderId);
+      log.info(`Order ${orderId} cancelled for ${symbol}`);
     } catch (err) {
-      log.warn(`Cannot cancel order ${order.id}: ${toErrorMessage(err)}`);
+      log.warn(`Cannot cancel order ${orderId}: ${toErrorMessage(err)}`);
     }
   }
+}
+
+/**
+ * Partial exit: cancel stop-loss first (frees held qty), sell half, then trailing on remainder.
+ * The stop must be cancelled BEFORE the market sell — Alpaca returns 403 when open sell
+ * orders already cover the full position qty.
+ */
+export async function executeScaleOut(symbol: string, sellQty: number): Promise<void> {
+  log.info(`${symbol}: scale-out — releasing stop-loss before partial sell`);
+  await cancelOrdersForSymbol(symbol);
+
+  await placeSellOrder(symbol, sellQty, 'scale-out');
+
+  setTimeout(() => {
+    replaceWithTrailingStop(symbol, config.risk.trailingStopPct).catch(
+      (err: unknown) => {
+        log.warn(
+          `${symbol}: trailing stop after scale-out failed — ${toErrorMessage(err)}`,
+        );
+      },
+    );
+  }, config.risk.scaleOutSettlementDelayMs);
 }
 
 export async function cancelAllOrders(): Promise<void> {

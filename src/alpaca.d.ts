@@ -62,6 +62,8 @@ declare module '@alpacahq/alpaca-trade-api' {
     side: string;
     qty: string;
     status: string;
+    order_class?: string;
+    legs?: AlpacaOrder[];
   }
 
   export interface AlpacaAccount {
@@ -101,8 +103,14 @@ declare module '@alpacahq/alpaca-trade-api' {
     getAccount(): Promise<AlpacaAccount>;
     getPositions(): Promise<AlpacaPosition[]>;
     getPosition(symbol: string): Promise<AlpacaPosition>;
-    getOrders(params: { status?: string; limit?: number }): Promise<AlpacaOrder[]>;
+    getOrders(params: {
+      status?: string;
+      limit?: number;
+      nested?: boolean;
+      symbols?: string;
+    }): Promise<AlpacaOrder[]>;
     createOrder(params: AlpacaOrderParams): Promise<AlpacaOrder>;
     cancelOrder(orderId: string): Promise<void>;
+    replaceOrder(orderId: string, params: Partial<AlpacaOrderParams>): Promise<AlpacaOrder>;
   }
 }

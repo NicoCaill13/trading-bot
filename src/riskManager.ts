@@ -3,6 +3,7 @@ import alpaca from './alpacaClient';
 import config, { getRiskShareForTier } from './config';
 import * as trader from './trader';
 import { createLogger } from './logger';
+import { toErrorMessage } from './utils';
 import type {
   PortfolioAllocation,
   PortfolioOrigin,
@@ -22,14 +23,14 @@ const scaledOutPositions = new Set<string>();
 
 // Starting reference for the daily circuit breaker
 let startOfDayEquity: number | null = null;
-let circuitBreakerTriggered         = false;
+let circuitBreakerTriggered = false;
 
 // ---------------------------------------------------------------------------
 // 1. Session initialization
 // ---------------------------------------------------------------------------
 
 export function initDailyBaseline(equity: number): void {
-  startOfDayEquity        = equity;
+  startOfDayEquity = equity;
   circuitBreakerTriggered = false;
   scaledOutPositions.clear();
   log.info(`Daily baseline initialized at $${equity.toFixed(2)}`);
@@ -77,7 +78,7 @@ export async function getPortfolioAllocation(
 ): Promise<PortfolioAllocation> {
   const totalCapital = await trader.getAccountEquity();
   const capitalShare = getRiskShareForTier(origin);
-  const maxCapital   = totalCapital * capitalShare;
+  const maxCapital = totalCapital * capitalShare;
 
   const positions = await trader.getOpenPositions();
   let deployed = 0;
@@ -125,19 +126,19 @@ export async function computePositionSize(
   const period = config.indicators.atrPeriod;
   const needed = period + 5;
 
-  const end   = new Date();
+  const end = new Date();
   const start = new Date();
   start.setDate(start.getDate() - Math.ceil(needed * 1.6) + 1);
 
-  const highs:  number[] = [];
-  const lows:   number[] = [];
+  const highs: number[] = [];
+  const lows: number[] = [];
   const closes: number[] = [];
 
   const iter = alpaca.getBarsV2(symbol, {
-    start:     start.toISOString().split('T')[0],
-    end:       end.toISOString().split('T')[0],
+    start: start.toISOString().split('T')[0],
+    end: end.toISOString().split('T')[0],
     timeframe: '1Day',
-    feed:      'iex',
+    feed: 'iex',
   });
 
   for await (const bar of iter) {
@@ -153,16 +154,16 @@ export async function computePositionSize(
   }
 
   const atrValues = ATR.calculate({ period, high: highs, low: lows, close: closes });
-  const atr       = atrValues[atrValues.length - 1];
+  const atr = atrValues[atrValues.length - 1];
 
   if (!atr || atr <= 0) {
     throw new Error(`${symbol}: invalid ATR value (${atr})`);
   }
 
   // Stop coherent with sizing — hard-stop acts as safety floor
-  const atrStopDistance   = atr * config.risk.atrStopMultiplier;
+  const atrStopDistance = atr * config.risk.atrStopMultiplier;
   const hardFloorDistance = entryPrice * config.risk.hardStopFloorPct;
-  const stopDistance      = Math.max(atrStopDistance, hardFloorDistance);
+  const stopDistance = Math.max(atrStopDistance, hardFloorDistance);
 
   const allocation = await getPortfolioAllocation(tier, positionTiers);
   if (!allocation.canOpen) {
@@ -175,13 +176,13 @@ export async function computePositionSize(
   const tierCapitalShare = getRiskShareForTier(tier);
   const subEnvelopeCapital = totalCapital * tierCapitalShare;
   const riskBudget = subEnvelopeCapital * config.risk.riskPerTradePct;
-  const rawQty     = riskBudget / stopDistance;
-  const qty        = Math.max(1, Math.floor(rawQty));
+  const rawQty = riskBudget / stopDistance;
+  const qty = Math.max(1, Math.floor(rawQty));
 
   const perTradeCap = subEnvelopeCapital * config.risk.maxPositionPct;
-  const bucketCap   = allocation.available;
+  const bucketCap = allocation.available;
   const maxPositionValue = Math.min(perTradeCap, bucketCap);
-  const cappedQty        = Math.min(qty, Math.floor(maxPositionValue / entryPrice));
+  const cappedQty = Math.min(qty, Math.floor(maxPositionValue / entryPrice));
 
   if (cappedQty < 1) {
     throw new Error(
@@ -236,7 +237,7 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
 // ---------------------------------------------------------------------------
 
 /**
- * Called on each real-time bar for held symbols.
+ * Called on each 1-min WS bar close for held symbols (index.ts).
  * Triggers scale-out at +3% and activates a trailing stop on the remainder.
  */
 export async function handlePositionUpdate(
@@ -252,23 +253,25 @@ export async function handlePositionUpdate(
     return;
   }
 
-  const entryPrice    = parseFloat(position.avg_entry_price);
-  const totalQty      = parseInt(position.qty, 10);
+  const entryPrice = parseFloat(position.avg_entry_price);
+  const totalQty = parseInt(position.qty, 10);
   const unrealizedPct = (currentPrice - entryPrice) / entryPrice;
 
   if (unrealizedPct >= config.risk.scaleOutTargetPct) {
     const sellQty = Math.floor(totalQty / 2);
     if (sellQty < 1) return;
 
-    scaledOutPositions.add(symbol);
     log.info(
       `${symbol} — scale-out target reached ` +
       `(+${(unrealizedPct * 100).toFixed(2)}%) — selling ${sellQty}/${totalQty} shares`,
     );
 
-    await trader.placeSellOrder(symbol, sellQty, 'scale-out');
-    // Standard 1.5% trailing on remainder — break-even guaranteed since triggered at +3%
-    await trader.replaceWithTrailingStop(symbol, config.risk.trailingStopPct);
+    try {
+      await trader.executeScaleOut(symbol, sellQty);
+      scaledOutPositions.add(symbol);
+    } catch (err) {
+      log.error(`${symbol}: scale-out failed — ${toErrorMessage(err)}`);
+    }
   }
 }
 
@@ -305,11 +308,11 @@ export async function runEodSweep(
   log.info(`Total unrealized PnL: $${totalPnl.toFixed(2)}`);
 
   for (const pos of positions) {
-    const symbol       = pos.symbol;
+    const symbol = pos.symbol;
     const currentPrice = parseFloat(pos.current_price);
-    const positionPnl  = parseFloat(pos.unrealized_pl);
-    const qty          = parseInt(pos.qty, 10);
-    const data         = sessionData.get(symbol);
+    const positionPnl = parseFloat(pos.unrealized_pl);
+    const qty = parseInt(pos.qty, 10);
+    const data = sessionData.get(symbol);
 
     if (!data) {
       log.warn(`${symbol}: no session data — conservative liquidation`);
@@ -318,7 +321,7 @@ export async function runEodSweep(
     }
 
     const isBelowVwap = currentPrice < data.vwap;
-    const isInLoss    = positionPnl < 0;
+    const isInLoss = positionPnl < 0;
 
     if (isBelowVwap || isInLoss) {
       log.info(

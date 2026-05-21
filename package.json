@@ -2,17 +2,23 @@
   "name": "trading-bot",
   "version": "1.0.0",
   "description": "Quantitative algorithmic trading bot for US equities via Alpaca API",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/index.js",
-    "screener": "node -e \"require('./src/screener.js').runScreener()\""
+    "start": "tsx src/index.ts",
+    "screener": "tsx src/screener.ts"
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.2",
     "dotenv": "^16.4.5",
     "technicalindicators": "^3.1.0",
     "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.41",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.22.3",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=18.0.0"

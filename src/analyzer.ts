@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import config from './config';
 import { createLogger } from './logger';
+import { getESTDate } from './utils';
 import { sendTelegramAlert } from './notificationManager';
 import type { TradeRecord } from './types';
 
@@ -103,10 +104,15 @@ export async function runPostMortem(): Promise<void> {
     return;
   }
 
-  // Filter to today's completed trades only
-  const todayPrefix = new Date().toISOString().split('T')[0];
+  // Filter to today's completed trades only — use EST date to match session day
+  const est = getESTDate();
+  const y = est.getFullYear();
+  const m = String(est.getMonth() + 1).padStart(2, '0');
+  const d = String(est.getDate()).padStart(2, '0');
+  const todayESTPrefix = `${y}-${m}-${d}`;
+
   const records = allRecords.filter(
-    r => r.entry_time.startsWith(todayPrefix) && r.exit_time !== null,
+    r => r.entry_time.startsWith(todayESTPrefix) && r.exit_time !== null,
   );
 
   if (records.length === 0) {

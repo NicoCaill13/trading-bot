@@ -7,7 +7,6 @@ import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { sendTelegramAlert, formatExitAlert } from './notificationManager';
 import type {
-  ExitReason,
   PortfolioAllocation,
   PortfolioOrigin,
   PositionSizeResult,
@@ -312,10 +311,13 @@ export async function handlePositionUpdate(
       await trader.executeBreakEvenScaleOut(symbol, sellQty, entryPrice, targetPct, tierLabel);
       scaledOutPositions.add(symbol);
 
-      // Journal: record the scale-out exit at the approximate fill price
-      const exitReason: ExitReason = tier === 'satellite' ? 'target-7pct' : 'target-5pct';
+      // Journal: mark the partial scale-out without closing the record.
+      // The record stays alive for the trailing-stop leg; it will be closed
+      // when the remaining shares exit (wasExternallyExited in index.ts, or
+      // closeAllOpenTrades at hard-close / circuit-breaker).
+      const scaleOutReason = tier === 'satellite' ? 'target-7pct' as const : 'target-5pct' as const;
       const scaleOutPrice = parseFloat((entryPrice * (1 + targetPct)).toFixed(2));
-      journalManager.closeTrade(symbol, exitReason, scaleOutPrice);
+      journalManager.recordScaleOut(symbol, scaleOutReason, scaleOutPrice, sellQty);
     } catch (err) {
       log.error(`${symbol}: break-even scale-out failed — ${toErrorMessage(err)}`);
     }
@@ -363,6 +365,7 @@ export async function runEodSweep(
 
     if (!data) {
       log.warn(`${symbol}: no session data — conservative liquidation`);
+      journalManager.closeTrade(symbol, 'eod-liquidation', currentPrice);
       try {
         await trader.cancelOrdersForSymbol(symbol);
         await new Promise(r => setTimeout(r, 300));
@@ -384,7 +387,6 @@ export async function runEodSweep(
           `${isBelowVwap ? `price $${currentPrice.toFixed(2)} below VWAP $${data.vwap.toFixed(2)}` : ''} ` +
           `${isInLoss ? `negative PnL $${positionPnl.toFixed(2)}` : ''} — liquidating`,
         );
-        journalManager.closeTrade(symbol, 'eod-liquidation', currentPrice);
         // Cancel symbol's protection orders BEFORE selling (avoids accidental short).
         // 300 ms delay lets Alpaca propagate the cancellation before the market sell arrives.
         await trader.cancelOrdersForSymbol(symbol);

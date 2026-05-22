@@ -4,6 +4,8 @@ import config from './config';
 import { createLogger } from './logger';
 import type { TradeRecord, ExitReason, SignalOrigin, SpyTrend } from './types';
 
+type ScaleOutTarget = 'target-5pct' | 'target-7pct';
+
 const log = createLogger('JOURNAL');
 
 const JOURNAL_PATH = path.resolve(config.paths.journal);
@@ -62,6 +64,9 @@ export function openTrade(symbol: string, params: OpenTradeParams): void {
     sma20_at_entry: params.sma20_at_entry,
     distance_to_sma20_percent,
     spy_trend_5m: params.spy_trend_5m,
+    scale_out_price: null,
+    scale_out_qty: null,
+    scale_out_reason: null,
     exit_time: null,
     exit_price: null,
     exit_reason: null,
@@ -97,8 +102,36 @@ export function updateExcursions(symbol: string, currentPrice: number): void {
 }
 
 /**
+ * Records a partial scale-out (50% of the position sold at the take-profit target).
+ * The TradeRecord stays open — it will be closed when the remaining shares exit
+ * (trailing stop, EOD sweep, or hard close).
+ */
+export function recordScaleOut(
+  symbol: string,
+  reason: ScaleOutTarget,
+  scaleOutPrice: number,
+  scaleOutQty: number,
+): void {
+  const record = openRecords.get(symbol);
+  if (!record) return;
+
+  record.scale_out_price = scaleOutPrice;
+  record.scale_out_qty = scaleOutQty;
+  record.scale_out_reason = reason;
+  lastKnownPrices.set(symbol, scaleOutPrice);
+
+  log.info(
+    `${symbol}: scale-out recorded — reason:${reason} ` +
+    `price:$${scaleOutPrice.toFixed(2)} qty:${scaleOutQty} ` +
+    `(record stays open for trailing leg)`,
+  );
+}
+
+/**
  * Closes a trade record.
  * If exitPrice is omitted, the last price observed via updateExcursions is used.
+ * When a scale-out was previously recorded, computes a dollar-weighted PnL
+ * across both legs: (50% at scale_out_price) + (remainder at exit_price).
  * Safe to call on a symbol with no open record — silently ignored.
  */
 export function closeTrade(
@@ -114,8 +147,22 @@ export function closeTrade(
   // Final excursion update at the exit price
   updateExcursions(symbol, price);
 
-  const net_pnl_dollars = (price - record.entry_price) * record.qty;
-  const net_pnl_percentage = ((price - record.entry_price) / record.entry_price) * 100;
+  // Dollar-weighted PnL: accounts for partial scale-out when present
+  let net_pnl_dollars: number;
+  let net_pnl_percentage: number;
+
+  if (record.scale_out_price !== null && record.scale_out_qty !== null) {
+    const soldQty = record.scale_out_qty;
+    const remainingQty = record.qty - soldQty;
+    const pnlLeg1 = (record.scale_out_price - record.entry_price) * soldQty;
+    const pnlLeg2 = (price - record.entry_price) * remainingQty;
+    net_pnl_dollars = pnlLeg1 + pnlLeg2;
+    // Return on the full notional deployed (entry_price × total qty)
+    net_pnl_percentage = (net_pnl_dollars / (record.entry_price * record.qty)) * 100;
+  } else {
+    net_pnl_dollars = (price - record.entry_price) * record.qty;
+    net_pnl_percentage = ((price - record.entry_price) / record.entry_price) * 100;
+  }
 
   record.exit_time = new Date().toISOString();
   record.exit_price = price;
@@ -127,9 +174,12 @@ export function closeTrade(
   lastKnownPrices.delete(symbol);
   closedRecords.push(record);
 
+  const scaleOutLabel = record.scale_out_price !== null
+    ? ` scale-out:$${record.scale_out_price.toFixed(2)} +`
+    : '';
   log.info(
-    `${symbol}: trade closed — reason:${exitReason} ` +
-    `price:$${price.toFixed(2)} PnL:${net_pnl_percentage.toFixed(2)}% ` +
+    `${symbol}: trade closed — reason:${exitReason}${scaleOutLabel} ` +
+    `finalPrice:$${price.toFixed(2)} PnL:${net_pnl_percentage.toFixed(2)}% ` +
     `($${net_pnl_dollars.toFixed(2)}) | MFE:${(record.mfe_percent ?? 0).toFixed(2)}% ` +
     `MAE:${(record.mae_percent ?? 0).toFixed(2)}%`,
   );

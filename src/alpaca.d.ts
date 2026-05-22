@@ -62,6 +62,8 @@ declare module '@alpacahq/alpaca-trade-api' {
     side: string;
     qty: string;
     status: string;
+    limit_price?: string;
+    filled_avg_price?: string;
     order_class?: string;
     legs?: AlpacaOrder[];
   }

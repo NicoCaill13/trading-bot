@@ -138,10 +138,16 @@ export interface TradeRecord {
   distance_to_sma20_percent: number | null;
   spy_trend_5m: SpyTrend;
 
-  // Exit Metrics (null until closed)
+  // Partial exit — populated when a scale-out fires (50% sold at target)
+  scale_out_price: number | null;
+  scale_out_qty: number | null;
+  scale_out_reason: 'target-5pct' | 'target-7pct' | null;
+
+  // Final exit metrics (null until fully closed)
   exit_time: string | null;
   exit_price: number | null;
   exit_reason: ExitReason | null;
+  // Dollar-weighted PnL across both scale-out and final exit legs
   net_pnl_dollars: number | null;
   net_pnl_percentage: number | null;
   mfe_percent: number | null;

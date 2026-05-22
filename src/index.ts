@@ -891,8 +891,15 @@ async function executeSignalsForTier(
         continue;
       }
 
-      await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
+      const order = await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
       enteredByTier.set(symbol, tier);
+
+      // Prefer the actual submitted limit price over the stale bar close (can diverge by
+      // up to marketableLimitVwapMultiplier × live-ask slippage).
+      const submittedLimitPrice =
+        order.limit_price !== undefined && order.limit_price !== ''
+          ? parseFloat(order.limit_price)
+          : barData.close;
 
       // Open journal record — capture all pre-trade and entry context
       const screenerData = screenerDataMap.get(symbol);
@@ -902,7 +909,7 @@ async function executeSignalsForTier(
         alpha_vs_spy: screenerData?.relativeReturn ?? null,
         gap_percentage: screenerData?.gapUp ?? screenerData?.preMarketGapPct ?? null,
         relative_volume: screenerData?.relativeVolume ?? null,
-        entry_price: barData.close,
+        entry_price: submittedLimitPrice,
         qty,
         vwap_at_entry: vwap,
         ema9_at_entry: computeEMA9(symbol),

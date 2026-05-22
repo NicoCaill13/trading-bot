@@ -1,11 +1,14 @@
 'use strict';
 
+const path = require('path');
+
 module.exports = {
   apps: [
     {
       name:              'trading-bot',
-      script:            'node_modules/.bin/tsx',
-      args:              'src/index.ts',
+      // interpreter + script: PM2 captures stdout/stderr (tsx as "script" leaves pm2-out empty)
+      script:            path.join(__dirname, 'src/index.ts'),
+      interpreter:       path.join(__dirname, 'node_modules/.bin/tsx'),
       cwd:               __dirname,
       instances:         1,
       autorestart:       true,

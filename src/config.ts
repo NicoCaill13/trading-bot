@@ -77,12 +77,15 @@ const config = {
     signalBatchWindowMs: parseIntEnv('SIGNAL_BATCH_WINDOW_MS', 10000),
     tradeDuringLunch: process.env.TRADE_DURING_LUNCH === 'true',
     orbWindowBars: parseIntEnv('ORB_WINDOW_BARS', 1),
-    // Marketable limit: VWAP × multiplier (default +0.1% slippage cap).
+    minRvolForPullback: parseFloatEnv('MIN_RVOL_FOR_PULLBACK', 1.2),
+    pullbackSupportPct: parseFloatEnv('PULLBACK_SUPPORT_PCT', 0.002),
+    // Marketable limit: ask × multiplier (default +0.1% slippage cap).
     marketableLimitVwapMultiplier: parseFloatEnv('MARKETABLE_LIMIT_VWAP_MULTIPLIER', 1.001),
   },
 
   indicators: {
     atrPeriod: parseIntEnv('ATR_PERIOD', 14),
+    ema9Period: parseIntEnv('EMA9_PERIOD', 9),
   },
 
   session: {
@@ -175,6 +178,51 @@ export function getPortfolioSlotLimits(): {
   }
 
   return { coreMaxPositions: core, satelliteMaxPositions: satellite };
+}
+
+/**
+ * V3 time-decay slot allocation. Cascades forward only when activeCore is below
+ * the threshold for each tier; otherwise the previous tier limits remain.
+ */
+export function getTimedecaySlotLimits(
+  estNow: Date,
+  activeCoreCount: number,
+): { coreMaxPositions: number; satelliteMaxPositions: number } {
+  const max = config.risk.maxPositions;
+  const minutesSinceMidnight = estNow.getHours() * 60 + estNow.getMinutes();
+  const t1015 = 10 * 60 + 15;
+  const t1100 = 11 * 60;
+  const t1145 = 11 * 60 + 45;
+
+  let core = 4;
+  let satellite = max - core;
+
+  if (minutesSinceMidnight >= t1015 && activeCoreCount < 4) {
+    core = 3;
+    satellite = 2;
+  }
+  if (minutesSinceMidnight >= t1100 && activeCoreCount < 3) {
+    core = 2;
+    satellite = 3;
+  }
+  if (minutesSinceMidnight >= t1145 && activeCoreCount < 2) {
+    core = 1;
+    satellite = 4;
+  }
+
+  if (core + satellite !== max) {
+    satellite = max - core;
+  }
+
+  return { coreMaxPositions: core, satelliteMaxPositions: satellite };
+}
+
+/**
+ * CTPO slot equiparity: each position consumes exactly 1/maxPositions of total equity.
+ * Core and Satellite use the same envelope — tier is for routing/observability only.
+ */
+export function getSlotCapitalShare(): number {
+  return 1 / config.risk.maxPositions;
 }
 
 export function getRiskShareForTier(tier: 'core' | 'satellite'): number {

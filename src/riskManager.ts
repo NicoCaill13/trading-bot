@@ -1,6 +1,6 @@
 import { ATR } from 'technicalindicators';
 import alpaca from './alpacaClient';
-import config, { getRiskShareForTier } from './config';
+import config, { getSlotCapitalShare } from './config';
 import * as trader from './trader';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
@@ -59,7 +59,7 @@ export function markScaledOut(symbols: string[]): void {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Portfolio capital allocation (Core 80% / Satellite 20%)
+// 2. Slot-based capital allocation (CTPO: N equal slots × 20% equity each)
 // ---------------------------------------------------------------------------
 
 function resolvePositionMarketValue(pos: AlpacaPosition): number {
@@ -69,57 +69,58 @@ function resolvePositionMarketValue(pos: AlpacaPosition): number {
 }
 
 /**
- * Enforces aggregate capital cap per origin (tier).
- * Satellite may not exceed satelliteRiskShare × total equity deployed.
+ * CTPO equiparity: each of maxPositions slots owns an immutable share of equity
+ * (default 5 × 20%). Tier (Core / Satellite) does not shrink the slot envelope —
+ * a Satellite backfill into a Core time-decay slot still sizes at the full 20%.
  */
 export async function getPortfolioAllocation(
   origin: PortfolioOrigin,
-  positionTiers: Map<string, SignalTier>,
+  _positionTiers: Map<string, SignalTier>,
 ): Promise<PortfolioAllocation> {
   const totalCapital = await trader.getAccountEquity();
-  const capitalShare = getRiskShareForTier(origin);
-  const maxCapital = totalCapital * capitalShare;
+  const slotShare = getSlotCapitalShare();
+  const positionCapital = totalCapital * slotShare;
 
   const positions = await trader.getOpenPositions();
   let deployed = 0;
 
   for (const pos of positions) {
-    const tier = positionTiers.get(pos.symbol) ?? 'core';
-    if (tier === origin) {
-      deployed += resolvePositionMarketValue(pos);
-    }
+    deployed += resolvePositionMarketValue(pos);
   }
 
-  const available = Math.max(0, maxCapital - deployed);
+  const slotsUsed = positions.length;
+  const slotsAvailable = config.risk.maxPositions - slotsUsed;
+  const canOpen = slotsAvailable > 0;
 
   return {
     origin,
     totalCapital,
-    maxCapital,
+    maxCapital: positionCapital,
     deployed,
-    available,
-    canOpen: available > 0,
+    available: canOpen ? positionCapital : 0,
+    canOpen,
   };
 }
 
 // ---------------------------------------------------------------------------
-// 3. Coherent ATR sizing + hard-stop floor
+// 3. Coherent ATR sizing + hard-stop floor (full slot envelope per trade)
 // ---------------------------------------------------------------------------
 
 /**
- * Computes position size and stop level coherently.
+ * Computes position size and stop level coherently (CTPO slot equiparity).
  *
- * stopDistance = max(ATR × atrStopMultiplier, entryPrice × hardStopFloorPct)
- * qty          = floor( (capital × riskPerTradePct) / stopDistance )
- * qty          = min(qty, floor(capital × maxPositionPct / entryPrice))  [value cap]
+ * positionCapital = totalEquity × (1 / maxPositions)   [e.g. $20k on $100k, 5 slots]
+ * riskBudget      = positionCapital × riskPerTradePct [1% of slot → ATR distance]
+ * stopDistance    = max(ATR × atrStopMultiplier, entryPrice × hardStopFloorPct)
+ * qty             = floor(riskBudget / stopDistance), capped to positionCapital notional
  *
- * This guarantees identical real monetary risk per trade regardless of
- * the instrument's volatility.
+ * Core and Satellite (including V2 backfill into a Core time-decay slot) use the
+ * same 20% global slot envelope — tier is observability only for sizing.
  */
 export async function computePositionSize(
   symbol: string,
   entryPrice: number,
-  totalCapital: number,
+  _totalCapital: number,
   tier: SignalTier = 'core',
   positionTiers: Map<string, SignalTier> = new Map(),
 ): Promise<PositionSizeResult> {
@@ -168,26 +169,24 @@ export async function computePositionSize(
   const allocation = await getPortfolioAllocation(tier, positionTiers);
   if (!allocation.canOpen) {
     throw new Error(
-      `${symbol}: ${tier} bucket full — deployed $${allocation.deployed.toFixed(2)} / ` +
-      `$${allocation.maxCapital.toFixed(2)} cap (${(getRiskShareForTier(tier) * 100).toFixed(0)}% equity)`,
+      `${symbol}: no slots available — ${config.risk.maxPositions} max, ` +
+      `deployed $${allocation.deployed.toFixed(2)} / $${allocation.totalCapital.toFixed(2)} equity`,
     );
   }
 
-  const tierCapitalShare = getRiskShareForTier(tier);
-  const subEnvelopeCapital = totalCapital * tierCapitalShare;
-  const riskBudget = subEnvelopeCapital * config.risk.riskPerTradePct;
+  const totalEquity = allocation.totalCapital;
+  const positionCapital = totalEquity * getSlotCapitalShare();
+  const riskBudget = positionCapital * config.risk.riskPerTradePct;
   const rawQty = riskBudget / stopDistance;
   const qty = Math.max(1, Math.floor(rawQty));
 
-  const perTradeCap = subEnvelopeCapital * config.risk.maxPositionPct;
-  const bucketCap = allocation.available;
-  const maxPositionValue = Math.min(perTradeCap, bucketCap);
+  const maxPositionValue = positionCapital;
   const cappedQty = Math.min(qty, Math.floor(maxPositionValue / entryPrice));
 
   if (cappedQty < 1) {
     throw new Error(
-      `${symbol}: ${tier} allocation insufficient — ` +
-      `available $${allocation.available.toFixed(2)} for ~$${(entryPrice).toFixed(2)}/share`,
+      `${symbol}: slot envelope insufficient — ` +
+      `positionCapital $${positionCapital.toFixed(2)} for ~$${entryPrice.toFixed(2)}/share`,
     );
   }
 
@@ -195,9 +194,9 @@ export async function computePositionSize(
 
   log.info(
     `${symbol} sizing [${tier}] — ATR:${atr.toFixed(4)} | ` +
-    `risk ${(config.risk.riskPerTradePct * 100).toFixed(1)}% of ` +
-    `${(tierCapitalShare * 100).toFixed(0)}% sub-envelope ($${subEnvelopeCapital.toFixed(0)}) | ` +
-    `bucket $${allocation.deployed.toFixed(0)}/$${allocation.maxCapital.toFixed(0)} | ` +
+    `slot ${(getSlotCapitalShare() * 100).toFixed(0)}% equity ($${positionCapital.toFixed(0)}) | ` +
+    `risk ${(config.risk.riskPerTradePct * 100).toFixed(1)}% of slot ($${riskBudget.toFixed(0)}) | ` +
+    `envelope $${positionCapital.toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
     `stopDist:$${stopDistance.toFixed(4)} | qty:${cappedQty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
   );
 

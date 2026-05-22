@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import WebSocket from 'ws';
-import config, { getPortfolioSlotLimits } from './config';
+import config, { getTimedecaySlotLimits } from './config';
 import { runScreener } from './screener';
 import { runPremarketScreener } from './premarket_screener';
 import * as signalQueue from './signalQueue';
@@ -15,6 +15,7 @@ import { extractV2Symbols, readWatchlist } from './watchlistIO';
 import type {
   BarData,
   PendingSignal,
+  PullbackTracker,
   SessionState,
   SignalTier,
   OrbState,
@@ -54,6 +55,15 @@ const orbState = new Map<string, OrbState>();
 
 // Symbols currently subscribed on the WebSocket
 let monitoredSymbols: string[] = [];
+
+// V2 Play-Maker symbols that must stay monitored for the full session (no purge after 09:15)
+const v2PersistentSymbols = new Set<string>();
+
+// V3 pullback state machine and 1-min EMA9 inputs
+const pullbackTrackers = new Map<string, PullbackTracker>();
+const ema9ClosePrices = new Map<string, number[]>();
+const EMA9_HISTORY_MAX = 50;
+let isFlushInProgress = false;
 
 // 5-min bars for signal generation (VWAP breakout, ORB, EOD session metrics)
 const signalBars5m = new Map<string, BarData[]>();
@@ -270,6 +280,9 @@ async function loadWatchlist(): Promise<string[]> {
   }
 
   const v2Symbols = extractV2Symbols(data);
+  for (const s of v2Symbols) {
+    v2PersistentSymbols.add(s.symbol);
+  }
   signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
 
   const v1Count = data.symbols.length - v2Symbols.length;
@@ -286,14 +299,20 @@ function applyV2WatchlistSymbols(v2Symbols: WatchlistSymbol[]): string[] {
 
   for (const s of v2Symbols) {
     registerWatchlistSymbol(s);
+    v2PersistentSymbols.add(s.symbol);
     if (!monitoredSymbols.includes(s.symbol)) {
       newSymbols.push(s.symbol);
     }
   }
 
   signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
-  monitoredSymbols = [...new Set([...monitoredSymbols, ...v2Symbols.map(s => s.symbol)])];
+  monitoredSymbols = [...new Set([...monitoredSymbols, ...v2PersistentSymbols])];
   return newSymbols;
+}
+
+function ensureV2SymbolsMonitored(): void {
+  if (v2PersistentSymbols.size === 0) return;
+  monitoredSymbols = [...new Set([...monitoredSymbols, ...v2PersistentSymbols])];
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +325,42 @@ function computeVwap(bars: BarData[]): number | null {
   if (totalVolume === 0) return null;
   const tpv = bars.reduce((sum, b) => sum + ((b.high + b.low + b.close) / 3) * b.volume, 0);
   return tpv / totalVolume;
+}
+
+function pushEma9Close(symbol: string, close: number): void {
+  const history = ema9ClosePrices.get(symbol) ?? [];
+  history.push(close);
+  if (history.length > EMA9_HISTORY_MAX) {
+    history.shift();
+  }
+  ema9ClosePrices.set(symbol, history);
+}
+
+function computeEMA9(symbol: string): number | null {
+  const prices = ema9ClosePrices.get(symbol);
+  const period = config.indicators.ema9Period;
+  if (!prices || prices.length < period) return null;
+
+  const slice = prices.slice(-period);
+  const k = 2 / (period + 1);
+  let ema = slice[0];
+  for (let i = 1; i < slice.length; i++) {
+    ema = slice[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function computeIntradayRvol(latestBar: BarData, bars: BarData[]): number | null {
+  if (bars.length < 2) return null;
+  const baseline = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
+  const avgVolume = baseline.reduce((sum, b) => sum + b.volume, 0) / baseline.length;
+  if (avgVolume <= 0) return null;
+  return latestBar.volume / avgVolume;
+}
+
+function passesRvolForPullback(latestBar: BarData, bars: BarData[]): boolean {
+  const rvol = computeIntradayRvol(latestBar, bars);
+  return rvol !== null && rvol >= config.entry.minRvolForPullback;
 }
 
 function alpacaBarToBarData(bar: AlpacaBar): BarData {
@@ -519,15 +574,8 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Conditions required for a signal to qualify:
- *   1. Trading not halted
- *   2. No entry already emitted for this symbol this session
- *   3. Lunch filter: blocked 12:00–14:00 EST if tradeDuringLunch = false
- *   4. VWAP breakout: prev_close <= vwap AND current_close > vwap (strict transition)
- *   5. Volume conviction: bar_volume > volumeBreakoutMultiplier × avg(5 previous bars)
- *
- * Qualified signals are enqueued by tier (Satellite = priority bucket).
- * Execution is delegated to flushPendingSignals().
+ * V3 VWAP breakout starts the pullback state machine (TRACKING_PULLBACK).
+ * Execution is deferred until dynamic support + first tick up (evaluatePullbackState).
  */
 function queuePendingSignal(signal: PendingSignal): void {
   signalQueue.enqueue(signal);
@@ -598,6 +646,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
 function evaluateSignal(symbol: string, latestBar: BarData): void {
   if (tradingHalted)           return;
   if (hasEntered(symbol))      return;
+  if (pullbackTrackers.has(symbol)) return;
 
   const tier = getSymbolTier(symbol);
   if (tier === 'satellite' && isBlackoutPeriod()) return;
@@ -616,34 +665,98 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   const vwapBreakout = prevBar.close <= vwap && currentPrice > vwap;
   if (!vwapBreakout) return;
 
-  if (!passesVolumeConviction(latestBar, bars)) {
-    log.info(`${symbol}: VWAP breakout without volume conviction — ignored`);
+  if (currentPrice <= vwap) return;
+
+  if (!passesRvolForPullback(latestBar, bars)) {
+    const rvol = computeIntradayRvol(latestBar, bars);
+    log.info(
+      `${symbol}: VWAP breakout below RVOL threshold — ` +
+      `rvol ${rvol === null ? 'N/A' : rvol.toFixed(2)}x (min ${config.entry.minRvolForPullback})`,
+    );
     return;
   }
 
   const recentBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
   const avgVolume  = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
 
-  // Momentum Score = breakout volume × VWAP deviation %
-  // Higher score = stronger breakout on larger volume
   const vwapDeviation = (currentPrice - vwap) / vwap;
   const momentumScore = latestBar.volume * vwapDeviation;
 
-  log.info(
-    `${symbol}: ${tier} VWAP signal — ` +
-    `price $${currentPrice.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
-    `deviation ${(vwapDeviation * 100).toFixed(2)}% | vol ×${(latestBar.volume / avgVolume).toFixed(1)} | ` +
-    `score ${Math.round(momentumScore).toLocaleString()} → queued`,
-  );
-
-  queuePendingSignal({
-    symbol,
+  pullbackTrackers.set(symbol, {
+    state: 'TRACKING_PULLBACK',
+    localHigh: latestBar.high,
+    prevClose: currentPrice,
+    vwapAtDetection: vwap,
     tier,
     score: momentumScore,
-    barData: latestBar,
-    vwap,
     avgVolume,
   });
+
+  log.info(
+    `${symbol}: ${tier} VWAP breakout — tracking pullback | ` +
+    `price $${currentPrice.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
+    `deviation ${(vwapDeviation * 100).toFixed(2)}% | ` +
+    `score ${Math.round(momentumScore).toLocaleString()}`,
+  );
+}
+
+/**
+ * V3 pullback micro-structure on 1-min bars: support touch then first tick up → queue.
+ */
+function evaluatePullbackState(symbol: string, bar1m: BarData): void {
+  if (tradingHalted || hasEntered(symbol)) {
+    pullbackTrackers.delete(symbol);
+    return;
+  }
+
+  const tracker = pullbackTrackers.get(symbol);
+  if (!tracker) return;
+
+  const session = sessionData.get(symbol);
+  const vwap = session?.vwap ?? tracker.vwapAtDetection;
+  const supportThreshold = bar1m.close * config.entry.pullbackSupportPct;
+
+  if (tracker.state === 'TRACKING_PULLBACK') {
+    if (bar1m.high > tracker.localHigh) {
+      tracker.localHigh = bar1m.high;
+    }
+
+    const ema9 = computeEMA9(symbol);
+    const distVwap = Math.abs(bar1m.close - vwap);
+    const distEma = ema9 === null ? Infinity : Math.abs(bar1m.close - ema9);
+    const distSupport = Math.min(distVwap, distEma);
+
+    if (distSupport <= supportThreshold) {
+      tracker.state = 'TRIGGERED';
+      tracker.prevClose = bar1m.close;
+      log.info(
+        `${symbol}: pullback support touched — awaiting tick up | ` +
+        `close $${bar1m.close.toFixed(2)} | VWAP $${vwap.toFixed(2)}` +
+        (ema9 !== null ? ` | EMA9 $${ema9.toFixed(2)}` : ''),
+      );
+    }
+    return;
+  }
+
+  if (tracker.state === 'TRIGGERED') {
+    if (bar1m.close > tracker.prevClose) {
+      pullbackTrackers.delete(symbol);
+      log.info(
+        `${symbol}: ${tracker.tier} pullback triggered — ` +
+        `tick up $${tracker.prevClose.toFixed(2)} → $${bar1m.close.toFixed(2)} → queued`,
+      );
+      queuePendingSignal({
+        symbol,
+        tier: tracker.tier,
+        score: tracker.score,
+        barData: bar1m,
+        vwap,
+        avgVolume: tracker.avgVolume,
+      });
+      return;
+    }
+    tracker.prevClose = bar1m.close;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -735,80 +848,90 @@ async function executeSignalsForTier(
 }
 
 /**
- * Dual-bucket flush: Core and Satellite slots and risk budgets are independent.
+ * V3 dual-bucket flush: time-decay slots, Core-first priority, serialized execution.
  * During opening blackout, only Satellite (ORB) signals may execute; Core is deferred.
  */
 async function flushPendingSignals(): Promise<void> {
   signalFlushTimer = null;
 
   if (signalQueue.size() === 0) return;
+  if (isFlushInProgress) return;
 
-  if (tradingHalted || riskManager.isCircuitBreakerTriggered()) {
-    log.info(`Flush cancelled: trading halted (${signalQueue.size()} signal(s) dropped)`);
-    signalQueue.clear();
-    return;
-  }
-
-  let currentPositions: Awaited<ReturnType<typeof trader.getOpenPositions>>;
+  isFlushInProgress = true;
   try {
-    currentPositions = await trader.getOpenPositions();
-  } catch (err) {
-    log.error(`Flush impossible: API error on positions — ${toErrorMessage(err)}`);
-    signalQueue.clear();
-    return;
-  }
+    if (tradingHalted || riskManager.isCircuitBreakerTriggered()) {
+      log.info(`Flush cancelled: trading halted (${signalQueue.size()} signal(s) dropped)`);
+      signalQueue.clear();
+      return;
+    }
 
-  const slotLimits = getPortfolioSlotLimits();
-  const openCounts = countOpenPositionsByTier(currentPositions);
-  const coreSlotsAvailable      = slotLimits.coreMaxPositions - openCounts.core;
-  const satelliteSlotsAvailable = slotLimits.satelliteMaxPositions - openCounts.satellite;
+    let currentPositions: Awaited<ReturnType<typeof trader.getOpenPositions>>;
+    try {
+      currentPositions = await trader.getOpenPositions();
+    } catch (err) {
+      log.error(`Flush impossible: API error on positions — ${toErrorMessage(err)}`);
+      signalQueue.clear();
+      return;
+    }
 
-  const filterEntered = (signals: PendingSignal[]) =>
-    signals.filter(s => !hasEntered(s.symbol));
+    const estNow = getESTDate();
+    const openCounts = countOpenPositionsByTier(currentPositions);
+    const slotLimits = getTimedecaySlotLimits(estNow, openCounts.core);
+    const coreSlotsAvailable =
+      slotLimits.coreMaxPositions - openCounts.core;
+    const satelliteSlotsAvailable =
+      slotLimits.satelliteMaxPositions - openCounts.satellite;
 
-  const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
-  const coreCandidates      = filterEntered(signalQueue.getCoreSignals());
+    const filterEntered = (signals: PendingSignal[]) =>
+      signals.filter(s => !hasEntered(s.symbol));
 
-  const blackout = isBlackoutPeriod();
-  if (blackout && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
-    log.info(`Blackout active — ${coreCandidates.length} Core signal(s) deferred`);
-    schedulePendingSignalFlush();
-    return;
-  }
+    const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
+    const coreCandidates      = filterEntered(signalQueue.getCoreSignals());
 
-  const executedSymbols: string[] = [];
+    const blackout = isBlackoutPeriod();
+    if (blackout && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
+      log.info(`Blackout active — ${coreCandidates.length} Core signal(s) deferred`);
+      schedulePendingSignalFlush();
+      return;
+    }
 
-  if (satelliteCandidates.length > 0) {
-    log.info(
-      `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
-      `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
-    );
-    const satExecuted = await executeSignalsForTier(
-      satelliteCandidates,
-      satelliteSlotsAvailable,
-    );
-    executedSymbols.push(...satExecuted);
-  }
+    const executedSymbols: string[] = [];
 
-  if (!blackout && coreCandidates.length > 0) {
-    log.info(
-      `Flush Core — ${coreCandidates.length} candidate(s), ` +
-      `slots ${coreSlotsAvailable}/${slotLimits.coreMaxPositions}`,
-    );
-    const coreExecuted = await executeSignalsForTier(
-      coreCandidates,
-      coreSlotsAvailable,
-    );
-    executedSymbols.push(...coreExecuted);
-  } else if (blackout && coreCandidates.length > 0) {
-    log.info(`Blackout active — ${coreCandidates.length} Core signal(s) kept pending`);
-    schedulePendingSignalFlush();
-  }
+    if (!blackout && coreCandidates.length > 0) {
+      log.info(
+        `Flush Core — ${coreCandidates.length} candidate(s), ` +
+        `slots ${coreSlotsAvailable}/${slotLimits.coreMaxPositions} ` +
+        `(time-decay @ ${estNow.getHours()}:${String(estNow.getMinutes()).padStart(2, '0')} EST)`,
+      );
+      const coreExecuted = await executeSignalsForTier(
+        coreCandidates,
+        coreSlotsAvailable,
+      );
+      executedSymbols.push(...coreExecuted);
+    } else if (blackout && coreCandidates.length > 0) {
+      log.info(`Blackout active — ${coreCandidates.length} Core signal(s) kept pending`);
+      schedulePendingSignalFlush();
+    }
 
-  signalQueue.remove(executedSymbols);
+    if (satelliteCandidates.length > 0) {
+      log.info(
+        `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
+        `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
+      );
+      const satExecuted = await executeSignalsForTier(
+        satelliteCandidates,
+        satelliteSlotsAvailable,
+      );
+      executedSymbols.push(...satExecuted);
+    }
 
-  if (!blackout) {
-    signalQueue.clear();
+    signalQueue.remove(executedSymbols);
+
+    if (!blackout) {
+      signalQueue.clear();
+    }
+  } finally {
+    isFlushInProgress = false;
   }
 }
 
@@ -831,6 +954,9 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
     liveBarsAnnounced = true;
     log.info(`Live 1-min bars flowing — first tick: ${symbol} @ $${barData.close.toFixed(2)}`);
   }
+
+  pushEma9Close(symbol, barData.close);
+  evaluatePullbackState(symbol, barData);
 
   // Open positions: scale-out / trailing logic on every 1-min close (not 5-min).
   if (hasEntered(symbol)) {
@@ -1045,6 +1171,10 @@ function scheduleDailyReset(): void {
     symbolTier.clear();
     preMarketGaps.clear();
     orbState.clear();
+    v2PersistentSymbols.clear();
+    pullbackTrackers.clear();
+    ema9ClosePrices.clear();
+    isFlushInProgress = false;
     monitoredSymbols = [];
     signalQueue.clear();
     if (signalFlushTimer) {
@@ -1074,6 +1204,7 @@ function scheduleDailyReset(): void {
         }
         const newSymbols = watchlist.symbols.map(s => s.symbol);
         monitoredSymbols = newSymbols;
+        ensureV2SymbolsMonitored();
         log.info(`Core screener done — ${newSymbols.length} symbol(s) ready for next session`);
         if (newSymbols.length > 0) {
           if (ws) {
@@ -1158,7 +1289,8 @@ async function main(): Promise<void> {
 
   const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
   const satCount  = [...symbolTier.values()].filter(t => t === 'satellite').length;
-  const slots     = getPortfolioSlotLimits();
+  const openCore  = [...enteredByTier.values()].filter(t => t === 'core').length;
+  const slots     = getTimedecaySlotLimits(getESTDate(), openCore);
   log.info(
     `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
     `slots ${slots.coreMaxPositions} Core / ${slots.satelliteMaxPositions} Satellite`,

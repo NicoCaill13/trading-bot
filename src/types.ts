@@ -36,6 +36,19 @@ export interface SessionBarData {
   lastBarLow: number;
 }
 
+/** Pullback state machine phase (V3). */
+export type SignalState = 'TRACKING_PULLBACK' | 'TRIGGERED';
+
+export interface PullbackTracker {
+  state: SignalState;
+  localHigh: number;
+  prevClose: number;
+  vwapAtDetection: number;
+  tier: SignalTier;
+  score: number;
+  avgVolume: number;
+}
+
 export interface PendingSignal {
   symbol: string;
   tier: SignalTier;

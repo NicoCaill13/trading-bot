@@ -266,13 +266,12 @@ async function fetchLiveAskPrice(symbol: string, signalPrice: number): Promise<n
 }
 
 /**
- * Marketable buy limit: max(VWAP × mult, ask × mult).
- * Using the live ask price at order submission time (not signal time)
- * prevents the 422 caused by stale bar close + debounce latency.
+ * Marketable buy limit anchored on live ask at submission time.
+ * Prevents 422 from stale bar close + debounce latency.
  */
-function computeMarketableLimitPrice(vwap: number, askPrice: number): number {
+function computeMarketableLimitPrice(askPrice: number): number {
   const mult = config.entry.marketableLimitVwapMultiplier;
-  return parseFloat(Math.max(vwap * mult, askPrice * mult).toFixed(2));
+  return parseFloat((askPrice * mult).toFixed(2));
 }
 
 /**
@@ -310,9 +309,7 @@ export async function placeBracketOrder(
     );
   }
 
-  const limitPrice = computeMarketableLimitPrice(vwap, liveAskPrice);
-  const vwapCap = parseFloat((vwap * config.entry.marketableLimitVwapMultiplier).toFixed(2));
-  const priceSource = limitPrice > vwapCap ? `ask $${liveAskPrice.toFixed(2)}` : `VWAP $${vwap.toFixed(2)}`;
+  const limitPrice = computeMarketableLimitPrice(liveAskPrice);
 
   const requiredCash = limitPrice * qty;
   if (requiredCash > settledCash) {
@@ -342,7 +339,7 @@ export async function placeBracketOrder(
 
   log.info(
     `Marketable limit entry [${tier}] — ${symbol} qty:${qty} ` +
-    `limit:$${limitPrice.toFixed(2)} (anchor: ${priceSource} × ${config.entry.marketableLimitVwapMultiplier}) ` +
+    `limit:$${limitPrice.toFixed(2)} (ask $${liveAskPrice.toFixed(2)} × ${config.entry.marketableLimitVwapMultiplier}) ` +
     `stop-loss:$${stopLossPrice.toFixed(2)}`,
   );
 

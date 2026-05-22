@@ -315,30 +315,43 @@ export async function runEodSweep(
 
     if (!data) {
       log.warn(`${symbol}: no session data — conservative liquidation`);
-      await trader.placeSellOrder(symbol, qty, 'eod-no-session-data');
+      try {
+        await trader.cancelOrdersForSymbol(symbol);
+        await new Promise(r => setTimeout(r, 300));
+        await trader.placeSellOrder(symbol, qty, 'eod-no-session-data');
+      } catch (err) {
+        log.error(`EOD sweep: ${symbol} (no-data) sell failed — ${toErrorMessage(err)}`);
+      }
       continue;
     }
 
     const isBelowVwap = currentPrice < data.vwap;
     const isInLoss = positionPnl < 0;
 
-    if (isBelowVwap || isInLoss) {
-      log.info(
-        `${symbol}: ` +
-        `${isBelowVwap ? `price $${currentPrice.toFixed(2)} below VWAP $${data.vwap.toFixed(2)}` : ''} ` +
-        `${isInLoss ? `negative PnL $${positionPnl.toFixed(2)}` : ''} — liquidating`,
-      );
-      // Cancel symbol's protection orders BEFORE selling (avoids accidental short)
-      await trader.cancelOrdersForSymbol(symbol);
-      await trader.placeSellOrder(symbol, qty, 'eod-liquidation');
-    } else {
-      // Winning position above VWAP: tighten trailing to 0.5%
-      log.info(
-        `${symbol}: winning position $${currentPrice.toFixed(2)} ` +
-        `(VWAP $${data.vwap.toFixed(2)}, PnL +$${positionPnl.toFixed(2)}) — ` +
-        `ultra-tight trailing ${(config.risk.eodTightTrailPct * 100).toFixed(1)}%`,
-      );
-      await trader.replaceWithTrailingStop(symbol, config.risk.eodTightTrailPct);
+    // Each symbol is isolated: one failure must not abort the remaining positions
+    try {
+      if (isBelowVwap || isInLoss) {
+        log.info(
+          `${symbol}: ` +
+          `${isBelowVwap ? `price $${currentPrice.toFixed(2)} below VWAP $${data.vwap.toFixed(2)}` : ''} ` +
+          `${isInLoss ? `negative PnL $${positionPnl.toFixed(2)}` : ''} — liquidating`,
+        );
+        // Cancel symbol's protection orders BEFORE selling (avoids accidental short).
+        // 300 ms delay lets Alpaca propagate the cancellation before the market sell arrives.
+        await trader.cancelOrdersForSymbol(symbol);
+        await new Promise(r => setTimeout(r, 300));
+        await trader.placeSellOrder(symbol, qty, 'eod-liquidation');
+      } else {
+        // Winning position above VWAP: tighten trailing to 0.5%
+        log.info(
+          `${symbol}: winning position $${currentPrice.toFixed(2)} ` +
+          `(VWAP $${data.vwap.toFixed(2)}, PnL +$${positionPnl.toFixed(2)}) — ` +
+          `ultra-tight trailing ${(config.risk.eodTightTrailPct * 100).toFixed(1)}%`,
+        );
+        await trader.replaceWithTrailingStop(symbol, config.risk.eodTightTrailPct);
+      }
+    } catch (err) {
+      log.error(`EOD sweep: ${symbol} failed — ${toErrorMessage(err)}`);
     }
   }
 

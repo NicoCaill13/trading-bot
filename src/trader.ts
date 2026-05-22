@@ -52,6 +52,8 @@ export async function getOpenOrders(limit = 500): Promise<AlpacaOrder[]> {
 // Queue engine with exponential retry on HTTP 429
 // ---------------------------------------------------------------------------
 
+type HttpErrorShape = Error & { response?: { status?: number; data?: unknown } };
+
 async function submitOrderWithRetry(
   orderParams: AlpacaOrderParams,
   attempt = 1,
@@ -66,10 +68,11 @@ async function submitOrderWithRetry(
     );
     return order;
   } catch (err) {
-    const is429 =
-      err instanceof Error &&
-      ((err as Error & { response?: { status?: number } }).response?.status === 429 ||
-        err.message.includes('429'));
+    const httpErr = err as HttpErrorShape;
+    const status  = httpErr.response?.status;
+    const body    = httpErr.response?.data;
+
+    const is429 = status === 429 || (err instanceof Error && err.message.includes('429'));
 
     if (is429 && attempt < maxAttempts) {
       const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), 30000);
@@ -80,6 +83,15 @@ async function submitOrderWithRetry(
       await new Promise(resolve => setTimeout(resolve, delay));
       return submitOrderWithRetry(orderParams, attempt + 1, maxAttempts);
     }
+
+    // Surface the full Alpaca error body on any 4xx so the root cause is visible in logs
+    if (status !== undefined && status >= 400 && status < 500) {
+      log.error(
+        `Order rejected HTTP ${status} — ${orderParams.symbol} ${orderParams.side} ` +
+        `x${orderParams.qty}: ${JSON.stringify(body ?? toErrorMessage(err))}`,
+      );
+    }
+
     throw err;
   }
 }
@@ -180,15 +192,24 @@ export async function executeScaleOut(symbol: string, sellQty: number): Promise<
 }
 
 export async function cancelAllOrders(): Promise<void> {
-  const orders = await alpaca.getOrders({ status: 'open', limit: 500 });
-  log.info(`Cancelling ${orders.length} pending order(s)...`);
+  // nested:true ensures OTO/bracket child orders (stop-losses) surface as legs
+  // when the parent entry is still pending — both cases are collapsed into a flat id set.
+  const orders = await alpaca.getOrders({ status: 'open', limit: 500, nested: true });
+
+  const ids = new Set<string>();
   for (const order of orders) {
+    ids.add(order.id);
+    order.legs?.forEach(leg => ids.add(leg.id));
+  }
+
+  log.info(`Cancelling ${ids.size} pending order(s)...`);
+  for (const orderId of ids) {
     try {
-      await alpaca.cancelOrder(order.id);
+      await alpaca.cancelOrder(orderId);
       // Inter-cancellation pause to avoid 429 during mass sweeps
       await new Promise(r => setTimeout(r, 100));
     } catch (err) {
-      log.warn(`Cannot cancel order ${order.id}: ${toErrorMessage(err)}`);
+      log.warn(`Cannot cancel order ${orderId}: ${toErrorMessage(err)}`);
     }
   }
 }
@@ -210,6 +231,12 @@ export async function liquidateAll(reason: string): Promise<void> {
   // Purge in-memory queue BEFORE API calls to immediately cut pending orders
   clearQueue();
   await cancelAllOrders();
+
+  // Allow broker-side cancellations to propagate before submitting sells.
+  // Without this delay, a stop-loss that Alpaca acknowledged-cancelled can still
+  // appear as covering the full qty for ~300–500 ms, causing 403 on the market sell.
+  await new Promise(r => setTimeout(r, 500));
+
   const positions = await alpaca.getPositions();
   if (positions.length === 0) {
     log.info(`Liquidation (${reason}): no open positions`);
@@ -218,8 +245,12 @@ export async function liquidateAll(reason: string): Promise<void> {
   log.info(`Full liquidation (${reason}) — ${positions.length} position(s)`);
   for (const pos of positions) {
     const qty = parseInt(pos.qty, 10);
-    if (qty > 0) {
+    if (qty <= 0) continue;
+    try {
       await placeSellOrder(pos.symbol, qty, reason);
+    } catch (err) {
+      // Log and continue — one failed sell must not block the remaining positions
+      log.error(`Liquidation: ${pos.symbol} sell failed — ${toErrorMessage(err)}`);
     }
   }
 }

@@ -5,6 +5,7 @@ import { registerSatelliteWatchlist } from './signalQueue';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { mergeV2IntoWatchlist } from './watchlistIO';
+import { notifyWatchlistSaved } from './notificationManager';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 
@@ -160,6 +161,8 @@ export async function runPremarketScreener(): Promise<Watchlist> {
     `${v2Symbols.length} V2_PLAYMAKER symbol(s) merged into watchlist.json ` +
     `(${watchlist.symbols.length} total)`,
   );
+
+  void notifyWatchlistSaved(watchlist);
 
   return watchlist;
 }

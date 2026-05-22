@@ -5,6 +5,7 @@ import config from './config';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
+import { notifyWatchlistSaved } from './notificationManager';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
@@ -384,6 +385,8 @@ export async function runScreener(): Promise<Watchlist> {
     `Watchlist saved: ${path.resolve(config.paths.watchlist)} ` +
     `(${filtered.length} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER preserved)`,
   );
+
+  void notifyWatchlistSaved(watchlist);
 
   return watchlist;
 }

@@ -4,6 +4,7 @@ import config, { getSlotCapitalShare } from './config';
 import * as trader from './trader';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
+import { sendTelegramAlert, formatExitAlert } from './notificationManager';
 import type {
   PortfolioAllocation,
   PortfolioOrigin,
@@ -21,6 +22,9 @@ const log = createLogger('RISK_MANAGER');
 // Symbols that already triggered scale-out (prevents double execution)
 const scaledOutPositions = new Set<string>();
 
+// Prevents duplicate exit alerts when broker-side stops fill between bar events
+const externalExitNotified = new Set<string>();
+
 // Starting reference for the daily circuit breaker
 let startOfDayEquity: number | null = null;
 let circuitBreakerTriggered = false;
@@ -33,6 +37,7 @@ export function initDailyBaseline(equity: number): void {
   startOfDayEquity = equity;
   circuitBreakerTriggered = false;
   scaledOutPositions.clear();
+  externalExitNotified.clear();
   log.info(`Daily baseline initialized at $${equity.toFixed(2)}`);
 }
 
@@ -260,6 +265,12 @@ export async function handlePositionUpdate(
   try {
     position = await alpaca.getPosition(symbol);
   } catch {
+    if (!externalExitNotified.has(symbol)) {
+      externalExitNotified.add(symbol);
+      void sendTelegramAlert(
+        formatExitAlert(symbol, 'Stop Loss / Trailing Stop'),
+      );
+    }
     return;
   }
 

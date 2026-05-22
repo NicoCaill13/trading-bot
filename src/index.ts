@@ -11,6 +11,11 @@ import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
+import {
+  sendTelegramAlert,
+  formatStartupAlert,
+  formatErrorAlert,
+} from './notificationManager';
 import { extractV2Symbols, readWatchlist } from './watchlistIO';
 import type {
   BarData,
@@ -841,6 +846,7 @@ async function executeSignalsForTier(
       await saveSessionState();
     } catch (err) {
       log.error(`${symbol}: order failed — ${toErrorMessage(err)}`);
+      void sendTelegramAlert(formatErrorAlert(`${symbol}: ${toErrorMessage(err)}`));
     }
   }
 
@@ -992,6 +998,11 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
               { name: 'Equity', value: `$${equity.toFixed(2)}`, inline: true },
             ],
           ).catch(() => { });
+          void sendTelegramAlert(
+            formatErrorAlert(
+              `Circuit Breaker déclenché — PnL +${pnlPct}% atteint. Trading suspendu.`,
+            ),
+          );
           return;
         }
       } catch (err) {
@@ -1056,6 +1067,7 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 
     if (isWsErrorMessage(msg)) {
       log.warn(`WebSocket error: code ${msg.code} — ${msg.msg}`);
+      void sendTelegramAlert(formatErrorAlert(`WebSocket: code ${msg.code} — ${msg.msg}`));
     }
   }
 }
@@ -1083,6 +1095,7 @@ function connectWebSocket(symbols: string[]): void {
 
   ws.on('close', (code: number) => {
     log.warn(`WebSocket closed (code ${code}) — reconnection scheduled...`);
+    void sendTelegramAlert(formatErrorAlert(`WebSocket déconnecté (code ${code}) — reconnexion...`));
     scheduleReconnect(symbols);
   });
 
@@ -1098,6 +1111,11 @@ function scheduleReconnect(symbols: string[]): void {
       'WebSocket unrecoverable',
       `${MAX_RECONNECT_ATTEMPTS} reconnect attempts exhausted. Bot no longer receiving market data. Manual intervention required.`,
     ).catch(() => { });
+    void sendTelegramAlert(
+      formatErrorAlert(
+        `WebSocket irrecoverable — ${MAX_RECONNECT_ATTEMPTS} tentatives épuisées. Intervention manuelle requise.`,
+      ),
+    );
     return;
   }
   reconnectAttempt++;
@@ -1231,6 +1249,20 @@ function scheduleDailyReset(): void {
   }, ms);
 }
 
+// 09:30 EST: market open session alert
+function scheduleMarketOpenAlert(): void {
+  const ms = msUntilESTTime(config.session.marketOpenHour, config.session.marketOpenMinute);
+  log.info(`Market open alert 09:30 scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
+  setTimeout((): void => {
+    const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
+    const slots = getTimedecaySlotLimits(getESTDate(), openCore);
+    void sendTelegramAlert(
+      formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
+    );
+    scheduleMarketOpenAlert();
+  }, ms);
+}
+
 // 09:15 EST: pre-market broker reconciliation (post-crash / post-weekend safety net)
 function schedulePreMarketReconciliation(): void {
   const ms = msUntilESTTime(config.session.preMarketHour, config.session.preMarketMinute);
@@ -1273,6 +1305,7 @@ async function main(): Promise<void> {
   scheduleEodReport();
   scheduleDailyReset();
   schedulePreMarketReconciliation();
+  scheduleMarketOpenAlert();
 
   if (symbols.length === 0) {
     // No symbols today: keep process alive so the 20:00 screener can populate the
@@ -1300,6 +1333,9 @@ async function main(): Promise<void> {
     `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
     `slots ${slots.coreMaxPositions} Core / ${slots.satelliteMaxPositions} Satellite`,
   );
+  await sendTelegramAlert(
+    formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
+  );
   await alertInfo(
     'Bot started',
     `Monitoring ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
@@ -1324,6 +1360,7 @@ process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(() => { }); });
 main().catch(async (err: unknown) => {
   const message = toErrorMessage(err);
   log.error(`Fatal error at startup: ${message}`);
+  await sendTelegramAlert(formatErrorAlert(`Fatal startup: ${message}`));
   await alertCritical('Fatal startup error', message).catch(() => { });
   process.exit(1);
 });

@@ -1,6 +1,7 @@
 import https from 'https';
 import { URL } from 'url';
 import { createLogger } from './logger';
+import { sendTelegramAlert } from './notificationManager';
 import type { DiscordField, DailyReportData } from './types';
 
 const log = createLogger('NOTIFIER');
@@ -26,17 +27,11 @@ interface DiscordPayload {
   embeds: DiscordEmbed[];
 }
 
-interface TelegramPayload {
-  chat_id: string;
-  text: string;
-  parse_mode: string;
-}
-
 // ---------------------------------------------------------------------------
-// Generic HTTPS transport — zero external deps
+// Generic HTTPS transport — zero external deps (Discord only)
 // ---------------------------------------------------------------------------
 
-function postJson(urlStr: string, payload: DiscordPayload | TelegramPayload): Promise<void> {
+function postJson(urlStr: string, payload: DiscordPayload): Promise<void> {
   return new Promise((resolve) => {
     let parsed: URL;
     try {
@@ -108,19 +103,6 @@ async function sendDiscord(
 }
 
 // ---------------------------------------------------------------------------
-// Telegram
-// ---------------------------------------------------------------------------
-
-async function sendTelegram(html: string): Promise<void> {
-  const token  = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
-
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  await postJson(url, { chat_id: chatId, text: html, parse_mode: 'HTML' });
-}
-
-// ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
 
@@ -132,7 +114,7 @@ export async function alertCritical(
   log.error(`[CRITICAL ALERT] ${title} — ${message}`);
   await Promise.all([
     sendDiscord(`🚨 ${title}`, message, COLOR.CRITICAL, fields),
-    sendTelegram(`<b>🚨 CRITICAL — ${title}</b>\n${message}`),
+    sendTelegramAlert(`<b>🚨 CRITICAL — ${title}</b>\n${message}`),
   ]);
 }
 
@@ -144,7 +126,7 @@ export async function alertInfo(
   log.info(`[NOTIFICATION] ${title} — ${message}`);
   await Promise.all([
     sendDiscord(`ℹ️ ${title}`, message, COLOR.INFO, fields),
-    sendTelegram(`<b>ℹ️ ${title}</b>\n${message}`),
+    sendTelegramAlert(`<b>ℹ️ ${title}</b>\n${message}`),
   ]);
 }
 
@@ -180,6 +162,6 @@ export async function sendDailyReport(report: DailyReportData): Promise<void> {
       color,
       fields,
     ),
-    sendTelegram(telegramText),
+    sendTelegramAlert(telegramText),
   ]);
 }

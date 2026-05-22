@@ -2,6 +2,14 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getESTDate, toErrorMessage } from './utils';
 import { createLogger } from './logger';
+import {
+  sendTelegramAlert,
+  formatEntryAlert,
+  formatTakeProfitAlert,
+  formatExitAlert,
+  formatErrorAlert,
+  humanizeExitReason,
+} from './notificationManager';
 import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 import type { SignalTier } from './types';
 
@@ -89,6 +97,11 @@ async function submitOrderWithRetry(
       log.error(
         `Order rejected HTTP ${status} — ${orderParams.symbol} ${orderParams.side} ` +
         `x${orderParams.qty}: ${JSON.stringify(body ?? toErrorMessage(err))}`,
+      );
+      void sendTelegramAlert(
+        formatErrorAlert(
+          `Ordre rejeté HTTP ${status} — ${orderParams.symbol} ${orderParams.side} x${orderParams.qty}`,
+        ),
       );
     }
 
@@ -206,6 +219,8 @@ export async function executeBreakEvenScaleOut(
 
   await cancelOrdersForSymbol(symbol);
   await placeSellOrder(symbol, sellQty, `tp-${targetLabel}`);
+
+  void sendTelegramAlert(formatTakeProfitAlert(symbol));
 
   setTimeout(() => {
     log.info(
@@ -405,7 +420,13 @@ export async function placeBracketOrder(
     `stop-loss:$${stopLossPrice.toFixed(2)}`,
   );
 
-  return enqueueOrder(orderParams);
+  const order = await enqueueOrder(orderParams);
+
+  void sendTelegramAlert(
+    formatEntryAlert(qty, symbol, tier, limitPrice, stopLossPrice),
+  );
+
+  return order;
 }
 
 /**
@@ -425,6 +446,13 @@ export async function placeSellOrder(
   };
 
   log.info(`Sell order — ${symbol} qty:${qty} reason:${reason}`);
+
+  if (!reason.startsWith('tp-')) {
+    void sendTelegramAlert(
+      formatExitAlert(symbol, humanizeExitReason(reason)),
+    );
+  }
+
   return enqueueOrder(orderParams);
 }
 

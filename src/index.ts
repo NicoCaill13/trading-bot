@@ -138,6 +138,12 @@ function isBlackoutPeriod(): boolean {
   );
 }
 
+// True only during the ORB window: market is open (>= 09:30) AND before 09:45.
+// Prevents Satellite ORB signals from firing during pre-market bars.
+function isOrbWindow(): boolean {
+  return isRegularSessionStarted() && isBlackoutPeriod();
+}
+
 // ---------------------------------------------------------------------------
 // Session state persistence (crash recovery)
 // ---------------------------------------------------------------------------
@@ -642,7 +648,8 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
   if (getSymbolTier(symbol) !== 'satellite') return;
-  if (!isBlackoutPeriod()) return;
+  // Restrict ORB to the 09:30–09:45 window; pre-market bars are excluded.
+  if (!isOrbWindow()) return;
 
   let state = orbState.get(symbol);
   if (!state) {
@@ -995,15 +1002,21 @@ async function flushPendingSignals(): Promise<void> {
     }
 
     if (satelliteCandidates.length > 0) {
-      log.info(
-        `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
-        `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
-      );
-      const satExecuted = await executeSignalsForTier(
-        satelliteCandidates,
-        satelliteSlotsAvailable,
-      );
-      executedSymbols.push(...satExecuted);
+      if (!isRegularSessionStarted()) {
+        // Market not yet open — keep Satellite signals pending until 09:30.
+        log.info(`Pre-market — ${satelliteCandidates.length} Satellite signal(s) held until 09:30`);
+        schedulePendingSignalFlush();
+      } else {
+        log.info(
+          `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
+          `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
+        );
+        const satExecuted = await executeSignalsForTier(
+          satelliteCandidates,
+          satelliteSlotsAvailable,
+        );
+        executedSymbols.push(...satExecuted);
+      }
     }
 
     signalQueue.remove(executedSymbols);
@@ -1105,7 +1118,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   updateSessionDataFromBars(symbol, bars5m);
 
   const tier = getSymbolTier(symbol);
-  if (tier === 'satellite' && isBlackoutPeriod()) {
+  if (tier === 'satellite' && isOrbWindow()) {
     evaluateOrbSignal(symbol, completed5m);
   }
   evaluateSignal(symbol, completed5m);

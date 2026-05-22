@@ -38,6 +38,17 @@ function isInBlackoutPeriod(): boolean {
   return false;
 }
 
+// True before 09:30 (cash market not yet open).
+function isPreMarketPeriod(): boolean {
+  const est = getESTDate();
+  const h = est.getHours();
+  const m = est.getMinutes();
+  return (
+    h < config.session.marketOpenHour ||
+    (h === config.session.marketOpenHour && m < config.session.marketOpenMinute)
+  );
+}
+
 export async function getSettledCash(): Promise<number> {
   const account = await alpaca.getAccount();
   return parseFloat(account.cash);
@@ -365,6 +376,9 @@ export async function placeBracketOrder(
 ): Promise<AlpacaOrder> {
   if (tier === 'core' && isInBlackoutPeriod()) {
     throw new Error(`Blackout active — Core order ${symbol} blocked until 09:45 EST`);
+  }
+  if (tier === 'satellite' && isPreMarketPeriod()) {
+    throw new Error(`Pre-market — Satellite order ${symbol} blocked before 09:30 EST`);
   }
 
   // Fetch live ask price at submission time — bar close can be 0-5 min stale + 10s debounce.

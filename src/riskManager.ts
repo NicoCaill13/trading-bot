@@ -198,15 +198,12 @@ export async function computePositionSize(
   }
 
   const totalEquity = allocation.totalCapital;
+  // Each slot deploys a fixed 1/maxPositions share of total equity.
+  // ATR is used exclusively to place the stop — not to size the position.
   const positionCapital = totalEquity * getSlotCapitalShare();
-  const riskBudget = positionCapital * config.risk.riskPerTradePct;
-  const rawQty = riskBudget / stopDistance;
-  const qty = Math.max(1, Math.floor(rawQty));
+  const qty = Math.floor(positionCapital / entryPrice);
 
-  const maxPositionValue = positionCapital;
-  const cappedQty = Math.min(qty, Math.floor(maxPositionValue / entryPrice));
-
-  if (cappedQty < 1) {
+  if (qty < 1) {
     throw new Error(
       `${symbol}: slot envelope insufficient — ` +
       `positionCapital $${positionCapital.toFixed(2)} for ~$${entryPrice.toFixed(2)}/share`,
@@ -218,12 +215,11 @@ export async function computePositionSize(
   log.info(
     `${symbol} sizing [${tier}] — ATR:${atr.toFixed(4)} | ` +
     `slot ${(getSlotCapitalShare() * 100).toFixed(0)}% equity ($${positionCapital.toFixed(0)}) | ` +
-    `risk ${(config.risk.riskPerTradePct * 100).toFixed(1)}% of slot ($${riskBudget.toFixed(0)}) | ` +
-    `envelope $${positionCapital.toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
-    `stopDist:$${stopDistance.toFixed(4)} | qty:${cappedQty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
+    `notional $${(qty * entryPrice).toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
+    `stopDist:$${stopDistance.toFixed(4)} | qty:${qty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
   );
 
-  return { qty: cappedQty, stopLossPrice, atr };
+  return { qty, stopLossPrice, atr };
 }
 
 // ---------------------------------------------------------------------------

@@ -167,7 +167,13 @@ function collectOpenOrderIds(symbol: string, orders: AlpacaOrder[]): string[] {
   return [...ids];
 }
 
-export async function cancelOrdersForSymbol(symbol: string): Promise<void> {
+/**
+ * Cancels all open orders for a symbol (parents + OTO legs).
+ * Returns the number of orders that could NOT be cancelled (API errors).
+ * Callers that sell immediately after must abort when failedCancels > 0 to
+ * avoid a 403 from Alpaca (held_for_orders still covers the full position qty).
+ */
+export async function cancelOrdersForSymbol(symbol: string): Promise<number> {
   const orders = await alpaca.getOrders({
     status: 'open',
     limit:  100,
@@ -178,19 +184,22 @@ export async function cancelOrdersForSymbol(symbol: string): Promise<void> {
   const orderIds = collectOpenOrderIds(symbol, orders);
   if (orderIds.length === 0) {
     log.info(`${symbol}: no open orders to cancel`);
-    return;
+    return 0;
   }
 
   log.info(`${symbol}: cancelling ${orderIds.length} open order(s)...`);
 
+  let failedCancels = 0;
   for (const orderId of orderIds) {
     try {
       await alpaca.cancelOrder(orderId);
       log.info(`Order ${orderId} cancelled for ${symbol}`);
     } catch (err) {
       log.warn(`Cannot cancel order ${orderId}: ${toErrorMessage(err)}`);
+      failedCancels++;
     }
   }
+  return failedCancels;
 }
 
 /**
@@ -228,7 +237,22 @@ export async function executeBreakEvenScaleOut(
     `Selling 50% (qty: ${sellQty}). Moving remaining stop to Break-Even.`,
   );
 
-  await cancelOrdersForSymbol(symbol);
+  const failedCancels = await cancelOrdersForSymbol(symbol);
+  if (failedCancels > 0) {
+    // One or more stop orders could not be cancelled — Alpaca still holds the full
+    // position qty for those orders. Selling now would produce a 403. Abort and let
+    // the next bar retry (the stop order will either complete its cancel or fill).
+    throw new Error(
+      `${symbol}: scale-out aborted — ${failedCancels} order cancellation(s) failed; ` +
+      `shares still held. Will retry next bar.`,
+    );
+  }
+
+  // Allow Alpaca to propagate the cancellation before submitting the sell.
+  // Without this pause, held_for_orders can still cover the full qty for ~300-500 ms
+  // after a successful cancel ACK, causing a 403 on the partial sell.
+  await new Promise(r => setTimeout(r, 500));
+
   await placeSellOrder(symbol, sellQty, `tp-${targetLabel}`);
 
   void sendTelegramAlert(formatTakeProfitAlert(symbol));

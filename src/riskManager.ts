@@ -2,10 +2,12 @@ import { ATR } from 'technicalindicators';
 import alpaca from './alpacaClient';
 import config, { getSlotCapitalShare } from './config';
 import * as trader from './trader';
+import * as journalManager from './journalManager';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { sendTelegramAlert, formatExitAlert } from './notificationManager';
 import type {
+  ExitReason,
   PortfolioAllocation,
   PortfolioOrigin,
   PositionSizeResult,
@@ -45,6 +47,23 @@ export function initDailyBaseline(equity: number): void {
 // — fixes the race condition with the debounce timer
 export function isCircuitBreakerTriggered(): boolean {
   return circuitBreakerTriggered;
+}
+
+/**
+ * Returns true when the position was closed by a broker-side order
+ * (stop-loss or trailing stop fill) without a direct placeSellOrder call.
+ * Used by index.ts to close the corresponding journal record.
+ */
+export function wasExternallyExited(symbol: string): boolean {
+  return externalExitNotified.has(symbol);
+}
+
+/**
+ * Returns true when the symbol already had a 50% scale-out executed.
+ * Lets index.ts distinguish trailing-stop exit from initial stop-loss exit.
+ */
+export function wasScaledOut(symbol: string): boolean {
+  return scaledOutPositions.has(symbol);
 }
 
 /**
@@ -230,6 +249,7 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
       `target ${(config.risk.dailyProfitTargetPct * 100).toFixed(1)}% reached`,
     );
     log.warn('Immediate liquidation of all positions...');
+    journalManager.closeAllOpenTrades('circuit-breaker');
     await trader.liquidateAll('circuit-breaker-daily-target');
     return true;
   }
@@ -291,6 +311,11 @@ export async function handlePositionUpdate(
     try {
       await trader.executeBreakEvenScaleOut(symbol, sellQty, entryPrice, targetPct, tierLabel);
       scaledOutPositions.add(symbol);
+
+      // Journal: record the scale-out exit at the approximate fill price
+      const exitReason: ExitReason = tier === 'satellite' ? 'target-7pct' : 'target-5pct';
+      const scaleOutPrice = parseFloat((entryPrice * (1 + targetPct)).toFixed(2));
+      journalManager.closeTrade(symbol, exitReason, scaleOutPrice);
     } catch (err) {
       log.error(`${symbol}: break-even scale-out failed — ${toErrorMessage(err)}`);
     }
@@ -359,6 +384,7 @@ export async function runEodSweep(
           `${isBelowVwap ? `price $${currentPrice.toFixed(2)} below VWAP $${data.vwap.toFixed(2)}` : ''} ` +
           `${isInLoss ? `negative PnL $${positionPnl.toFixed(2)}` : ''} — liquidating`,
         );
+        journalManager.closeTrade(symbol, 'eod-liquidation', currentPrice);
         // Cancel symbol's protection orders BEFORE selling (avoids accidental short).
         // 300 ms delay lets Alpaca propagate the cancellation before the market sell arrives.
         await trader.cancelOrdersForSymbol(symbol);
@@ -390,6 +416,7 @@ export async function runEodSweep(
  */
 export async function runHardClose(): Promise<void> {
   log.warn('*** HARD CLOSE 15:58 EST *** Unconditional full liquidation');
+  journalManager.closeAllOpenTrades('hard-close');
   await trader.liquidateAll('hard-close-15h58');
   log.info('Hard close done');
 }

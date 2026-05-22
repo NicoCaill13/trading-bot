@@ -111,6 +111,7 @@ const config = {
     watchlist: './data/watchlist.json',
     watchlistV2: './data/watchlist_v2.json',
     sessionState: './data/session_state.json',
+    journal: './data/journal.json',
   },
 
   notify: {

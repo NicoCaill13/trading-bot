@@ -1,5 +1,17 @@
 export type SignalTier = 'core' | 'satellite';
 
+export type ExitReason =
+  | 'target-5pct'
+  | 'target-7pct'
+  | 'stop-loss-initial'
+  | 'trailing-stop'
+  | 'eod-liquidation'
+  | 'hard-close'
+  | 'circuit-breaker'
+  | 'unknown';
+
+export type SpyTrend = 'bullish' | 'bearish' | 'neutral' | 'unknown';
+
 /** Strategy lineage tag persisted on the daily watchlist. */
 export type SignalOrigin = 'V1_CORE' | 'V2_PLAYMAKER';
 
@@ -106,6 +118,34 @@ export interface PositionSizeResult {
 export interface EnteredSymbolEntry {
   symbol: string;
   tier: SignalTier;
+}
+
+export interface TradeRecord {
+  // Pre-trade context (Screener Data)
+  symbol: string;
+  origin: SignalOrigin;
+  alpha_vs_spy: number | null;
+  gap_percentage: number | null;
+  relative_volume: number | null;
+
+  // Entry & Technical Indicators
+  entry_time: string;
+  entry_price: number;
+  qty: number;
+  vwap_at_entry: number;
+  ema9_at_entry: number | null;
+  sma20_at_entry: number | null;
+  distance_to_sma20_percent: number | null;
+  spy_trend_5m: SpyTrend;
+
+  // Exit Metrics (null until closed)
+  exit_time: string | null;
+  exit_price: number | null;
+  exit_reason: ExitReason | null;
+  net_pnl_dollars: number | null;
+  net_pnl_percentage: number | null;
+  mfe_percent: number | null;
+  mae_percent: number | null;
 }
 
 export interface DailyReportData {

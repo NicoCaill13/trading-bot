@@ -7,6 +7,8 @@ import { runPremarketScreener } from './premarket_screener';
 import * as signalQueue from './signalQueue';
 import * as trader from './trader';
 import * as riskManager from './riskManager';
+import * as journalManager from './journalManager';
+import { runPostMortem } from './analyzer';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
@@ -32,6 +34,7 @@ import type {
   WsSuccessMessage,
   WsErrorMessage,
   DiscordField,
+  SpyTrend,
 } from './types';
 import { resolveSymbolTier } from './types';
 import type { SessionDataEntry } from './riskManager';
@@ -56,6 +59,8 @@ const enteredByTier = new Map<string, SignalTier>();
 // Watchlist tier and Satellite pre-market gap metadata
 const symbolTier = new Map<string, SignalTier>();
 const preMarketGaps = new Map<string, number>();
+// Screener metadata per symbol — feeds the journal pre-trade context
+const screenerDataMap = new Map<string, WatchlistSymbol>();
 const orbState = new Map<string, OrbState>();
 
 // Symbols currently subscribed on the WebSocket
@@ -254,6 +259,7 @@ async function reconcileStateFromBroker(): Promise<void> {
 function registerWatchlistSymbol(s: WatchlistSymbol): void {
   const tier = resolveSymbolTier(s);
   symbolTier.set(s.symbol, tier);
+  screenerDataMap.set(s.symbol, s);
   if (tier === 'satellite' && s.preMarketGapPct !== undefined) {
     preMarketGaps.set(s.symbol, s.preMarketGapPct);
   }
@@ -353,6 +359,51 @@ function computeEMA9(symbol: string): number | null {
     ema = slice[i] * k + ema * (1 - k);
   }
   return ema;
+}
+
+function computeSMA20ForSymbol(symbol: string): number | null {
+  const bars = signalBars5m.get(symbol);
+  if (!bars || bars.length < 20) return null;
+  const last20 = bars.slice(-20);
+  return last20.reduce((sum, b) => sum + b.close, 0) / 20;
+}
+
+/**
+ * Determines SPY 5-min trend at signal execution time.
+ * Uses the in-memory 5-min bars if SPY is monitored; falls back to a REST call.
+ */
+async function fetchSpyTrend5m(): Promise<SpyTrend> {
+  try {
+    const spyBars = signalBars5m.get('SPY');
+    if (spyBars && spyBars.length >= 2) {
+      const last = spyBars[spyBars.length - 1];
+      const prev = spyBars[spyBars.length - 2];
+      if (last.close > prev.close) return 'bullish';
+      if (last.close < prev.close) return 'bearish';
+      return 'neutral';
+    }
+
+    const now = new Date();
+    const start = new Date(now.getTime() - 30 * 60 * 1000);
+    const bars: BarData[] = [];
+    const iter = alpaca.getBarsV2('SPY', {
+      start: start.toISOString(),
+      end: now.toISOString(),
+      timeframe: '5Min',
+      feed: 'iex',
+    });
+    for await (const bar of iter) {
+      bars.push(alpacaBarToBarData(bar));
+    }
+    if (bars.length < 2) return 'unknown';
+    const last = bars[bars.length - 1];
+    const prev = bars[bars.length - 2];
+    if (last.close > prev.close) return 'bullish';
+    if (last.close < prev.close) return 'bearish';
+    return 'neutral';
+  } catch {
+    return 'unknown';
+  }
 }
 
 function computeIntradayRvol(latestBar: BarData, bars: BarData[]): number | null {
@@ -842,6 +893,23 @@ async function executeSignalsForTier(
 
       await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
       enteredByTier.set(symbol, tier);
+
+      // Open journal record — capture all pre-trade and entry context
+      const screenerData = screenerDataMap.get(symbol);
+      const spyTrend = await fetchSpyTrend5m();
+      journalManager.openTrade(symbol, {
+        origin: screenerData?.origin ?? 'V1_CORE',
+        alpha_vs_spy: screenerData?.relativeReturn ?? null,
+        gap_percentage: screenerData?.gapUp ?? screenerData?.preMarketGapPct ?? null,
+        relative_volume: screenerData?.relativeVolume ?? null,
+        entry_price: barData.close,
+        qty,
+        vwap_at_entry: vwap,
+        ema9_at_entry: computeEMA9(symbol),
+        sma20_at_entry: computeSMA20ForSymbol(symbol),
+        spy_trend_5m: spyTrend,
+      });
+
       executed.push(symbol);
       await saveSessionState();
     } catch (err) {
@@ -967,6 +1035,9 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   // UT1m take-profit monitoring: every 1-min close triggers the tier-specific
   // scale-out check (5% Core / 7% Satellite) for confirmed open positions.
   if (hasEntered(symbol)) {
+    // Track excursions for MFE/MAE before any exit check
+    journalManager.updateExcursions(symbol, barData.close);
+
     try {
       await riskManager.handlePositionUpdate(
         symbol,
@@ -975,6 +1046,14 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
       );
     } catch (err) {
       log.error(`${symbol}: position update error — ${toErrorMessage(err)}`);
+    }
+
+    // Detect broker-side stop fills (stop-loss or trailing stop)
+    if (riskManager.wasExternallyExited(symbol)) {
+      const exitReason = riskManager.wasScaledOut(symbol)
+        ? 'trailing-stop' as const
+        : 'stop-loss-initial' as const;
+      journalManager.closeTrade(symbol, exitReason, barData.close);
     }
   }
 
@@ -1158,7 +1237,7 @@ function scheduleHardClose(): void {
 // Daily lifecycle — three independent crons
 // ---------------------------------------------------------------------------
 
-// 16:05 EST: market fully closed → send EOD report (state untouched)
+// 16:05 EST: market fully closed → send EOD report + V5 post-mortem (state untouched)
 function scheduleEodReport(): void {
   const ms = msUntilESTTime(config.session.eodReportHour, config.session.eodReportMinute);
   log.info(`EOD report scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
@@ -1175,6 +1254,13 @@ function scheduleEodReport(): void {
         });
       })
       .catch(() => { });
+
+    // V5 post-mortem analysis
+    log.info('Running V5 post-mortem analysis...');
+    runPostMortem().catch((err: unknown) => {
+      log.error(`Post-mortem analysis failed: ${toErrorMessage(err)}`);
+    });
+
     scheduleEodReport();
   }, ms);
 }
@@ -1193,10 +1279,12 @@ function scheduleDailyReset(): void {
     enteredByTier.clear();
     symbolTier.clear();
     preMarketGaps.clear();
+    screenerDataMap.clear();
     orbState.clear();
     v2PersistentSymbols.clear();
     pullbackTrackers.clear();
     ema9ClosePrices.clear();
+    journalManager.reset();
     isFlushInProgress = false;
     monitoredSymbols = [];
     signalQueue.clear();

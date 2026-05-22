@@ -170,21 +170,52 @@ export async function cancelOrdersForSymbol(symbol: string): Promise<void> {
 }
 
 /**
- * Partial exit: cancel stop-loss first (frees held qty), sell half, then trailing on remainder.
- * The stop must be cancelled BEFORE the market sell — Alpaca returns 403 when open sell
- * orders already cover the full position qty.
+ * Partial exit triggered by a UT1m take-profit target (5% Core / 7% Satellite).
+ *
+ * Sequence:
+ *   1. Cancel the existing stop-loss (which sits at -ATR distance below entry).
+ *   2. Sell sellQty shares at market (50% of the position).
+ *   3. After settlement: place a trailing stop on the remaining 50%.
+ *      When placed at +targetPct, a 1.5% trail creates an effective floor of
+ *      targetPct × (1 - 0.015) above entry — strictly above break-even.
+ *
+ * The stop must be cancelled BEFORE the market sell — Alpaca returns 403 when open
+ * sell orders already cover the full position qty.
+ *
+ * @param sellQty    - Math.floor(totalQty / 2) — no fractional shares
+ * @param entryPrice - avg_entry_price for break-even floor calculation and logging
+ * @param targetPct  - 0.05 or 0.07 — the threshold that triggered this call
+ * @param tierLabel  - 'Core' or 'Satellite' — used in the log line
  */
-export async function executeScaleOut(symbol: string, sellQty: number): Promise<void> {
-  log.info(`${symbol}: scale-out — releasing stop-loss before partial sell`);
-  await cancelOrdersForSymbol(symbol);
+export async function executeBreakEvenScaleOut(
+  symbol: string,
+  sellQty: number,
+  entryPrice: number,
+  targetPct: number,
+  tierLabel: 'Core' | 'Satellite',
+): Promise<void> {
+  const targetLabel = `${(targetPct * 100).toFixed(0)}%`;
+  const breakEvenFloor = parseFloat(
+    (entryPrice * (1 + targetPct) * (1 - config.risk.trailingStopPct)).toFixed(2),
+  );
 
-  await placeSellOrder(symbol, sellQty, 'scale-out');
+  log.info(
+    `[UT1M] ${tierLabel} Target ${targetLabel} hit for ${symbol}. ` +
+    `Selling 50% (qty: ${sellQty}). Moving remaining stop to Break-Even.`,
+  );
+
+  await cancelOrdersForSymbol(symbol);
+  await placeSellOrder(symbol, sellQty, `tp-${targetLabel}`);
 
   setTimeout(() => {
+    log.info(
+      `${symbol}: trailing stop on remainder — ` +
+      `effective floor ~$${breakEvenFloor.toFixed(2)} (break-even $${entryPrice.toFixed(2)})`,
+    );
     replaceWithTrailingStop(symbol, config.risk.trailingStopPct).catch(
       (err: unknown) => {
         log.warn(
-          `${symbol}: trailing stop after scale-out failed — ${toErrorMessage(err)}`,
+          `${symbol}: trailing stop after break-even scale-out failed — ${toErrorMessage(err)}`,
         );
       },
     );

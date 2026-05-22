@@ -236,12 +236,23 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
 // ---------------------------------------------------------------------------
 
 /**
- * Called on each 1-min WS bar close for held symbols (index.ts).
- * Triggers scale-out at +3% and activates a trailing stop on the remainder.
+ * Called on each 1-min WS bar close for held symbols (index.ts — UT1m loop).
+ *
+ * Tier-specific take-profit targets:
+ *   - V1_CORE  (tier 'core')      → +5%  triggers a 50% partial exit
+ *   - V2_PLAYMAKER (tier 'satellite') → +7%  triggers a 50% partial exit
+ *
+ * After the target is hit:
+ *   - Cancels the original stop-loss (placed at -ATR distance below entry).
+ *   - Sells Math.floor(qty / 2) shares at market (no fractional shares).
+ *   - Places a trailing stop on the remainder with a floor above break-even.
+ *
+ * @param tier - from enteredByTier map in index.ts ('core' | 'satellite')
  */
 export async function handlePositionUpdate(
   symbol: string,
   currentPrice: number,
+  tier: SignalTier = 'core',
 ): Promise<void> {
   if (scaledOutPositions.has(symbol)) return;
 
@@ -256,20 +267,21 @@ export async function handlePositionUpdate(
   const totalQty = parseInt(position.qty, 10);
   const unrealizedPct = (currentPrice - entryPrice) / entryPrice;
 
-  if (unrealizedPct >= config.risk.scaleOutTargetPct) {
+  const targetPct = tier === 'satellite'
+    ? config.risk.scaleOutTargetPctSatellite
+    : config.risk.scaleOutTargetPctCore;
+
+  const tierLabel: 'Core' | 'Satellite' = tier === 'satellite' ? 'Satellite' : 'Core';
+
+  if (unrealizedPct >= targetPct) {
     const sellQty = Math.floor(totalQty / 2);
     if (sellQty < 1) return;
 
-    log.info(
-      `${symbol} — scale-out target reached ` +
-      `(+${(unrealizedPct * 100).toFixed(2)}%) — selling ${sellQty}/${totalQty} shares`,
-    );
-
     try {
-      await trader.executeScaleOut(symbol, sellQty);
+      await trader.executeBreakEvenScaleOut(symbol, sellQty, entryPrice, targetPct, tierLabel);
       scaledOutPositions.add(symbol);
     } catch (err) {
-      log.error(`${symbol}: scale-out failed — ${toErrorMessage(err)}`);
+      log.error(`${symbol}: break-even scale-out failed — ${toErrorMessage(err)}`);
     }
   }
 }

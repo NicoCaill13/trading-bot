@@ -39,7 +39,7 @@ const log = createLogger('SYSTEM');
 // ---------------------------------------------------------------------------
 
 let ws: WebSocket | null = null;
-let reconnectAttempt     = 0;
+let reconnectAttempt = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 
 // Set to true when circuit breaker or hard close triggers — blocks new entries
@@ -104,7 +104,7 @@ const WS_URL = 'wss://stream.data.alpaca.markets/v2/iex';
 // ---------------------------------------------------------------------------
 
 function msUntilESTTime(hour: number, minute: number): number {
-  const now    = getESTDate();
+  const now = getESTDate();
   const target = new Date(now);
   target.setHours(hour, minute, 0, 0);
   let diff = target.getTime() - now.getTime();
@@ -120,8 +120,8 @@ function isLunchPeriod(): boolean {
 
 function isBlackoutPeriod(): boolean {
   const est = getESTDate();
-  const h   = est.getHours();
-  const m   = est.getMinutes();
+  const h = est.getHours();
+  const m = est.getMinutes();
   return (
     h < config.session.marketOpenHour ||
     (h === config.session.marketOpenHour && m < config.session.blackoutEndMinute)
@@ -151,7 +151,7 @@ async function saveSessionState(): Promise<void> {
     ([symbol, tier]) => ({ symbol, tier }),
   );
   const state: SessionState = {
-    date:           getTodayDateStr(),
+    date: getTodayDateStr(),
     enteredSymbols: entries,
   };
   try {
@@ -164,7 +164,7 @@ async function saveSessionState(): Promise<void> {
 
 async function loadSessionState(): Promise<SessionState | null> {
   try {
-    const raw   = await fs.readFile(STATE_PATH, 'utf8');
+    const raw = await fs.readFile(STATE_PATH, 'utf8');
     const state = JSON.parse(raw) as SessionState;
     if (state.date === getTodayDateStr()) {
       return state;
@@ -230,8 +230,8 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   if (positions.length > 0) {
     const fields: DiscordField[] = positions.map(p => ({
-      name:   p.symbol,
-      value:  `qty:${p.qty} PnL:$${parseFloat(p.unrealized_pl).toFixed(2)}`,
+      name: p.symbol,
+      value: `qty:${p.qty} PnL:$${parseFloat(p.unrealized_pl).toFixed(2)}`,
       inline: true,
     }));
     await alertInfo(
@@ -365,11 +365,11 @@ function passesRvolForPullback(latestBar: BarData, bars: BarData[]): boolean {
 
 function alpacaBarToBarData(bar: AlpacaBar): BarData {
   return {
-    open:      bar.OpenPrice,
-    high:      bar.HighPrice,
-    low:       bar.LowPrice,
-    close:     bar.ClosePrice,
-    volume:    bar.Volume,
+    open: bar.OpenPrice,
+    high: bar.HighPrice,
+    low: bar.LowPrice,
+    close: bar.ClosePrice,
+    volume: bar.Volume,
     timestamp: bar.Timestamp,
   };
 }
@@ -412,11 +412,11 @@ function getFiveMinutePeriodStartMs(timestamp: string): number {
 
 function aggregatorToBar(agg: FiveMinuteAggregator): BarData {
   return {
-    open:      agg.open,
-    high:      agg.high,
-    low:       agg.low,
-    close:     agg.close,
-    volume:    agg.volume,
+    open: agg.open,
+    high: agg.high,
+    low: agg.low,
+    close: agg.close,
+    volume: agg.volume,
     timestamp: agg.timestamp,
   };
 }
@@ -426,30 +426,30 @@ function aggregatorToBar(agg: FiveMinuteAggregator): BarData {
  */
 function ingestOneMinuteBar(symbol: string, bar: BarData): BarData | null {
   const periodStartMs = getFiveMinutePeriodStartMs(bar.timestamp);
-  let agg             = fiveMinAggregators.get(symbol);
+  let agg = fiveMinAggregators.get(symbol);
   let completed: BarData | null = null;
 
   if (agg !== undefined && agg.periodStartMs !== periodStartMs) {
     completed = aggregatorToBar(agg);
-    agg       = undefined;
+    agg = undefined;
   }
 
   if (agg === undefined) {
     fiveMinAggregators.set(symbol, {
       periodStartMs,
-      open:      bar.open,
-      high:      bar.high,
-      low:       bar.low,
-      close:     bar.close,
-      volume:    bar.volume,
+      open: bar.open,
+      high: bar.high,
+      low: bar.low,
+      close: bar.close,
+      volume: bar.volume,
       timestamp: new Date(periodStartMs).toISOString(),
     });
     return completed;
   }
 
-  agg.high   = Math.max(agg.high, bar.high);
-  agg.low    = Math.min(agg.low, bar.low);
-  agg.close  = bar.close;
+  agg.high = Math.max(agg.high, bar.high);
+  agg.low = Math.min(agg.low, bar.low);
+  agg.close = bar.close;
   agg.volume += bar.volume;
   fiveMinAggregators.set(symbol, agg);
   return completed;
@@ -482,8 +482,8 @@ function updateSessionDataFromBars(symbol: string, bars: BarData[]): void {
   const sessionHigh = bars.reduce((max, b) => Math.max(max, b.high), -Infinity);
   const lastBar = bars[bars.length - 1];
   sessionData.set(symbol, {
-    vwap:       currentVwap,
-    high:       sessionHigh,
+    vwap: currentVwap,
+    high: sessionHigh,
     lastBarLow: lastBar.low,
   });
 }
@@ -497,10 +497,10 @@ function seedOrbState(symbol: string, bars: BarData[]): void {
 
   const opening = bars.slice(0, window);
   orbState.set(symbol, {
-    high:          Math.max(...opening.map(b => b.high)),
-    low:           Math.min(...opening.map(b => b.low)),
+    high: Math.max(...opening.map(b => b.high)),
+    low: Math.min(...opening.map(b => b.low)),
     barsCollected: window,
-    triggered:     false,
+    triggered: false,
   });
 }
 
@@ -511,25 +511,25 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
   }
 
   const sessionDate = getSessionDateStr();
-  const end         = new Date().toISOString();
+  const end = new Date().toISOString();
 
   log.info(
     `Hydrating 5-min bars (${sessionDate} session) for ${symbols.length} symbols...`,
   );
 
   let symbolsWithBars = 0;
-  let totalBars       = 0;
+  let totalBars = 0;
 
   for (let i = 0; i < symbols.length; i++) {
     const symbol = symbols[i];
     try {
       const bars: BarData[] = [];
       const iter = alpaca.getBarsV2(symbol, {
-        start:     sessionDate,
+        start: sessionDate,
         end,
         timeframe: '5Min',
-        feed:      'iex',
-        limit:     80,
+        feed: 'iex',
+        limit: 80,
       });
 
       for await (const bar of iter) {
@@ -583,10 +583,10 @@ function queuePendingSignal(signal: PendingSignal): void {
 }
 
 function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
-  if (tradingHalted)           return;
-  if (hasEntered(symbol))       return;
+  if (tradingHalted) return;
+  if (hasEntered(symbol)) return;
   if (getSymbolTier(symbol) !== 'satellite') return;
-  if (!isBlackoutPeriod())      return;
+  if (!isBlackoutPeriod()) return;
 
   let state = orbState.get(symbol);
   if (!state) {
@@ -618,7 +618,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
   }
 
   const baselineBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
-  const avgVolume    = baselineBars.reduce((sum, b) => sum + b.volume, 0) / baselineBars.length;
+  const avgVolume = baselineBars.reduce((sum, b) => sum + b.volume, 0) / baselineBars.length;
 
   const orbDeviation = (latestBar.close - state.high) / state.high;
   const momentumScore = latestBar.volume * orbDeviation;
@@ -644,8 +644,8 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
 }
 
 function evaluateSignal(symbol: string, latestBar: BarData): void {
-  if (tradingHalted)           return;
-  if (hasEntered(symbol))      return;
+  if (tradingHalted) return;
+  if (hasEntered(symbol)) return;
   if (pullbackTrackers.has(symbol)) return;
 
   const tier = getSymbolTier(symbol);
@@ -660,7 +660,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   if (vwap === null) return;
 
   const currentPrice = latestBar.close;
-  const prevBar      = bars[bars.length - 2];
+  const prevBar = bars[bars.length - 2];
 
   const vwapBreakout = prevBar.close <= vwap && currentPrice > vwap;
   if (!vwapBreakout) return;
@@ -677,7 +677,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   }
 
   const recentBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
-  const avgVolume  = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
+  const avgVolume = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
 
   const vwapDeviation = (currentPrice - vwap) / vwap;
   const momentumScore = latestBar.volume * vwapDeviation;
@@ -792,9 +792,9 @@ async function executeSignalsForTier(
   const executed: string[] = [];
   if (maxExecutions <= 0 || signals.length === 0) return executed;
 
-  const ranked    = [...signals].sort((a, b) => b.score - a.score);
+  const ranked = [...signals].sort((a, b) => b.score - a.score);
   const toExecute = ranked.slice(0, maxExecutions);
-  const rejected  = ranked.slice(maxExecutions);
+  const rejected = ranked.slice(maxExecutions);
 
   rejected.forEach(s => {
     log.info(
@@ -886,7 +886,7 @@ async function flushPendingSignals(): Promise<void> {
       signals.filter(s => !hasEntered(s.symbol));
 
     const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
-    const coreCandidates      = filterEntered(signalQueue.getCoreSignals());
+    const coreCandidates = filterEntered(signalQueue.getCoreSignals());
 
     const blackout = isBlackoutPeriod();
     if (blackout && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
@@ -940,13 +940,13 @@ async function flushPendingSignals(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
-  const symbol  = bar.S;
+  const symbol = bar.S;
   const barData: BarData = {
-    open:      bar.o,
-    high:      bar.h,
-    low:       bar.l,
-    close:     bar.c,
-    volume:    bar.v,
+    open: bar.o,
+    high: bar.h,
+    low: bar.l,
+    close: bar.c,
+    volume: bar.v,
     timestamp: bar.t,
   };
 
@@ -958,10 +958,15 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   pushEma9Close(symbol, barData.close);
   evaluatePullbackState(symbol, barData);
 
-  // Open positions: scale-out / trailing logic on every 1-min close (not 5-min).
+  // UT1m take-profit monitoring: every 1-min close triggers the tier-specific
+  // scale-out check (5% Core / 7% Satellite) for confirmed open positions.
   if (hasEntered(symbol)) {
     try {
-      await riskManager.handlePositionUpdate(symbol, barData.close);
+      await riskManager.handlePositionUpdate(
+        symbol,
+        barData.close,
+        enteredByTier.get(symbol) ?? 'core',
+      );
     } catch (err) {
       log.error(`${symbol}: position update error — ${toErrorMessage(err)}`);
     }
@@ -973,7 +978,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
     if (now - lastEquityCheckMs >= EQUITY_CHECK_INTERVAL_MS) {
       lastEquityCheckMs = now;
       try {
-        const equity    = await trader.getAccountEquity();
+        const equity = await trader.getAccountEquity();
         const triggered = await riskManager.checkCircuitBreaker(equity);
         if (triggered) {
           tradingHalted = true;
@@ -983,10 +988,10 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
             'Daily circuit breaker triggered',
             `Target +${config.risk.dailyProfitTargetPct * 100}% reached. All positions liquidated. No new trades today.`,
             [
-              { name: 'PnL',    value: `+${pnlPct}%`,          inline: true },
+              { name: 'PnL', value: `+${pnlPct}%`, inline: true },
               { name: 'Equity', value: `$${equity.toFixed(2)}`, inline: true },
             ],
-          ).catch(() => {});
+          ).catch(() => { });
           return;
         }
       } catch (err) {
@@ -1032,9 +1037,9 @@ function isWsErrorMessage(msg: WsMessage): msg is WsErrorMessage {
 async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promise<void> {
   let messages: WsMessage[];
   try {
-    const text   = Buffer.isBuffer(raw) ? raw.toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8');
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : Buffer.from(raw as ArrayBuffer).toString('utf8');
     const parsed = JSON.parse(text) as unknown;
-    messages     = Array.isArray(parsed) ? (parsed as WsMessage[]) : [parsed as WsMessage];
+    messages = Array.isArray(parsed) ? (parsed as WsMessage[]) : [parsed as WsMessage];
   } catch {
     return;
   }
@@ -1058,7 +1063,7 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 function connectWebSocket(symbols: string[]): void {
   const authMessage = JSON.stringify({
     action: 'auth',
-    key:    config.alpaca.keyId,
+    key: config.alpaca.keyId,
     secret: config.alpaca.secretKey,
   });
 
@@ -1092,7 +1097,7 @@ function scheduleReconnect(symbols: string[]): void {
     alertCritical(
       'WebSocket unrecoverable',
       `${MAX_RECONNECT_ATTEMPTS} reconnect attempts exhausted. Bot no longer receiving market data. Manual intervention required.`,
-    ).catch(() => {});
+    ).catch(() => { });
     return;
   }
   reconnectAttempt++;
@@ -1144,14 +1149,14 @@ function scheduleEodReport(): void {
     trader.getAccountEquity()
       .then(async (endEquity) => {
         await sendDailyReport({
-          startEquity:         sessionStartEquity,
+          startEquity: sessionStartEquity,
           endEquity,
-          tradesEntered:       enteredByTier.size,
+          tradesEntered: enteredByTier.size,
           circuitBreakerFired: riskManager.isCircuitBreakerTriggered(),
-          symbols:             [...enteredByTier.keys()],
+          symbols: [...enteredByTier.keys()],
         });
       })
-      .catch(() => {});
+      .catch(() => { });
     scheduleEodReport();
   }, ms);
 }
@@ -1163,9 +1168,9 @@ function scheduleDailyReset(): void {
   setTimeout((): void => {
     log.info('Daily reset 20:00 — purging session state for D+1...');
 
-    fs.unlink(path.resolve(config.paths.sessionState)).catch(() => {});
+    fs.unlink(path.resolve(config.paths.sessionState)).catch(() => { });
 
-    tradingHalted     = false;
+    tradingHalted = false;
     lastEquityCheckMs = 0;
     enteredByTier.clear();
     symbolTier.clear();
@@ -1288,9 +1293,9 @@ async function main(): Promise<void> {
   connectWebSocket(symbols);
 
   const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
-  const satCount  = [...symbolTier.values()].filter(t => t === 'satellite').length;
-  const openCore  = [...enteredByTier.values()].filter(t => t === 'core').length;
-  const slots     = getTimedecaySlotLimits(getESTDate(), openCore);
+  const satCount = [...symbolTier.values()].filter(t => t === 'satellite').length;
+  const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
+  const slots = getTimedecaySlotLimits(getESTDate(), openCore);
   log.info(
     `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
     `slots ${slots.coreMaxPositions} Core / ${slots.satelliteMaxPositions} Satellite`,
@@ -1299,7 +1304,7 @@ async function main(): Promise<void> {
     'Bot started',
     `Monitoring ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
     `Equity: $${sessionStartEquity.toFixed(2)}`,
-  ).catch(() => {});
+  ).catch(() => { });
 
 }
 
@@ -1309,16 +1314,16 @@ async function main(): Promise<void> {
 
 async function gracefulShutdown(signal: string): Promise<void> {
   log.warn(`Signal ${signal} received — saving state and shutting down`);
-  await saveSessionState().catch(() => {});
+  await saveSessionState().catch(() => { });
   process.exit(0);
 }
 
-process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(() => {}); });
-process.on('SIGINT',  () => { gracefulShutdown('SIGINT').catch(() => {}); });
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(() => { }); });
+process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(() => { }); });
 
 main().catch(async (err: unknown) => {
   const message = toErrorMessage(err);
   log.error(`Fatal error at startup: ${message}`);
-  await alertCritical('Fatal startup error', message).catch(() => {});
+  await alertCritical('Fatal startup error', message).catch(() => { });
   process.exit(1);
 });

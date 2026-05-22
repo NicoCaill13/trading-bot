@@ -40,7 +40,8 @@ const config = {
     riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.01),
     atrStopMultiplier: parseFloatEnv('ATR_STOP_MULTIPLIER', 1.5),
     hardStopFloorPct: parseFloatEnv('HARD_STOP_FLOOR_PCT', 0.015),
-    scaleOutTargetPct: parseFloatEnv('SCALE_OUT_TARGET_PCT', 0.016),
+    scaleOutTargetPctCore: parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.05),
+    scaleOutTargetPctSatellite: parseFloatEnv('SCALE_OUT_TARGET_PCT_SATELLITE', 0.07),
     trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.015),
     scaleOutSettlementDelayMs: parseIntEnv('SCALE_OUT_SETTLEMENT_DELAY_MS', 3000),
     eodTightTrailPct: parseFloatEnv('EOD_TIGHT_TRAIL_PCT', 0.005),
@@ -135,8 +136,11 @@ const config = {
   if (r.hardStopFloorPct < 0.005 || r.hardStopFloorPct > 0.1)
     throw new Error(`[SYSTEM] HARD_STOP_FLOOR_PCT out of bounds (0.5%–10%): ${r.hardStopFloorPct}`);
 
-  if (r.scaleOutTargetPct <= r.hardStopFloorPct)
-    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT must be > HARD_STOP_FLOOR_PCT');
+  if (r.scaleOutTargetPctCore <= r.hardStopFloorPct)
+    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT_CORE must be > HARD_STOP_FLOOR_PCT');
+
+  if (r.scaleOutTargetPctSatellite <= r.scaleOutTargetPctCore)
+    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT_SATELLITE must be > SCALE_OUT_TARGET_PCT_CORE');
 
   if (r.dailyProfitTargetPct <= 0 || r.dailyProfitTargetPct > 0.1)
     throw new Error(`[SYSTEM] DAILY_PROFIT_TARGET_PCT out of bounds (0–10%): ${r.dailyProfitTargetPct}`);

@@ -5,7 +5,6 @@ import * as trader from './trader';
 import * as journalManager from './journalManager';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
-import { sendTelegramAlert, formatExitAlert } from './notificationManager';
 import type {
   PortfolioAllocation,
   PortfolioOrigin,
@@ -20,15 +19,13 @@ const log = createLogger('RISK_MANAGER');
 // Session state
 // ---------------------------------------------------------------------------
 
-// Symbols that already triggered scale-out (prevents double execution)
-const scaledOutPositions = new Set<string>();
-
 // Prevents duplicate exit alerts when broker-side stops fill between bar events
-const externalExitNotified = new Set<string>();
+// (tracked in positionManager — re-exported below)
 
-// Starting reference for the daily circuit breaker
+// Starting reference for daily circuit breaker and drawdown kill-switch
 let startOfDayEquity: number | null = null;
 let circuitBreakerTriggered = false;
+let drawdownKillTriggered = false;
 
 // ---------------------------------------------------------------------------
 // 1. Session initialization
@@ -37,8 +34,7 @@ let circuitBreakerTriggered = false;
 export function initDailyBaseline(equity: number): void {
   startOfDayEquity = equity;
   circuitBreakerTriggered = false;
-  scaledOutPositions.clear();
-  externalExitNotified.clear();
+  drawdownKillTriggered = false;
   log.info(`Daily baseline initialized at $${equity.toFixed(2)}`);
 }
 
@@ -48,38 +44,15 @@ export function isCircuitBreakerTriggered(): boolean {
   return circuitBreakerTriggered;
 }
 
+export function isDrawdownKillTriggered(): boolean {
+  return drawdownKillTriggered;
+}
+
 /**
  * Returns true when the position was closed by a broker-side order
  * (stop-loss or trailing stop fill) without a direct placeSellOrder call.
- * Used by index.ts to close the corresponding journal record.
  */
-export function wasExternallyExited(symbol: string): boolean {
-  return externalExitNotified.has(symbol);
-}
-
-/**
- * Returns true when the symbol already had a 50% scale-out executed.
- * Lets index.ts distinguish trailing-stop exit from initial stop-loss exit.
- */
-export function wasScaledOut(symbol: string): boolean {
-  return scaledOutPositions.has(symbol);
-}
-
-/**
- * Restores scale-out state from disk persistence or broker reconciliation.
- * Called at startup when a previous session is detected (crash recovery).
- */
-export function markScaledOut(symbols: string[]): void {
-  for (const symbol of symbols) {
-    scaledOutPositions.add(symbol);
-  }
-  if (symbols.length > 0) {
-    log.info(
-      `Reconciliation: ${symbols.length} symbol(s) marked as scaled-out ` +
-      `(${symbols.join(', ')})`,
-    );
-  }
-}
+export { wasExternallyExited, wasScaledOut, markScaledOut } from './positionManager';
 
 // ---------------------------------------------------------------------------
 // 2. Slot-based capital allocation (CTPO: N equal slots × 20% equity each)
@@ -129,39 +102,20 @@ export async function getPortfolioAllocation(
 // 3. Coherent ATR sizing + hard-stop floor (full slot envelope per trade)
 // ---------------------------------------------------------------------------
 
-/**
- * Computes position size and stop level coherently (CTPO slot equiparity).
- *
- * positionCapital = totalEquity × (1 / maxPositions)   [e.g. $20k on $100k, 5 slots]
- * riskBudget      = positionCapital × riskPerTradePct [1% of slot → ATR distance]
- * stopDistance    = max(ATR × atrStopMultiplier, entryPrice × hardStopFloorPct)
- * qty             = floor(riskBudget / stopDistance), capped to positionCapital notional
- *
- * Core and Satellite (including V2 backfill into a Core time-decay slot) use the
- * same 20% global slot envelope — tier is observability only for sizing.
- */
-export async function computePositionSize(
-  symbol: string,
-  entryPrice: number,
-  _totalCapital: number,
-  tier: SignalTier = 'core',
-  positionTiers: Map<string, SignalTier> = new Map(),
-): Promise<PositionSizeResult> {
+async function fetchAtr5m(symbol: string): Promise<number> {
   const period = config.indicators.atrPeriod;
   const needed = period + 5;
-
   const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - Math.ceil(needed * 1.6) + 1);
+  const start = new Date(end.getTime() - needed * 5 * 60 * 1000 * 2);
 
   const highs: number[] = [];
   const lows: number[] = [];
   const closes: number[] = [];
 
   const iter = alpaca.getBarsV2(symbol, {
-    start: start.toISOString().split('T')[0],
-    end: end.toISOString().split('T')[0],
-    timeframe: '1Day',
+    start: start.toISOString(),
+    end: end.toISOString(),
+    timeframe: '5Min',
     feed: 'iex',
   });
 
@@ -173,7 +127,7 @@ export async function computePositionSize(
 
   if (highs.length < period + 1) {
     throw new Error(
-      `${symbol}: insufficient history for ATR (${highs.length} bars)`,
+      `${symbol}: insufficient 5m history for ATR (${highs.length} bars)`,
     );
   }
 
@@ -181,11 +135,29 @@ export async function computePositionSize(
   const atr = atrValues[atrValues.length - 1];
 
   if (!atr || atr <= 0) {
-    throw new Error(`${symbol}: invalid ATR value (${atr})`);
+    throw new Error(`${symbol}: invalid 5m ATR value (${atr})`);
   }
 
+  return atr;
+}
+
+/**
+ * Computes position size and stop level coherently (CTPO slot equiparity).
+ *
+ * Stop distance uses 5-min ATR × atrStopMultiplier5m (V6 spec: 1.0 × ATR(5m)).
+ * Returned `atr` is the 5-min value used by positionManager for dynamic exits.
+ */
+export async function computePositionSize(
+  symbol: string,
+  entryPrice: number,
+  _totalCapital: number,
+  tier: SignalTier = 'core',
+  positionTiers: Map<string, SignalTier> = new Map(),
+): Promise<PositionSizeResult> {
+  const atr = await fetchAtr5m(symbol);
+
   // Stop coherent with sizing — hard-stop acts as safety floor
-  const atrStopDistance = atr * config.risk.atrStopMultiplier;
+  const atrStopDistance = atr * config.risk.atrStopMultiplier5m;
   const hardFloorDistance = entryPrice * config.risk.hardStopFloorPct;
   const stopDistance = Math.max(atrStopDistance, hardFloorDistance);
 
@@ -213,7 +185,7 @@ export async function computePositionSize(
   const stopLossPrice = entryPrice - stopDistance;
 
   log.info(
-    `${symbol} sizing [${tier}] — ATR:${atr.toFixed(4)} | ` +
+    `${symbol} sizing [${tier}] — ATR(5m):${atr.toFixed(4)} | ` +
     `slot ${(getSlotCapitalShare() * 100).toFixed(0)}% equity ($${positionCapital.toFixed(0)}) | ` +
     `notional $${(qty * entryPrice).toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
     `stopDist:$${stopDistance.toFixed(4)} | qty:${qty} | stopLoss:$${stopLossPrice.toFixed(2)}`,
@@ -252,76 +224,36 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
 }
 
 // ---------------------------------------------------------------------------
-// 5. Active position management (scale-out +3% + trailing stop)
+// 4b. Daily drawdown kill-switch (-1.5% / -$1,500)
 // ---------------------------------------------------------------------------
 
 /**
- * Called on each 1-min WS bar close for held symbols (index.ts — UT1m loop).
- *
- * Tier-specific take-profit targets:
- *   - V1_CORE  (tier 'core')      → +5%  triggers a 50% partial exit
- *   - V2_PLAYMAKER (tier 'satellite') → +7%  triggers a 50% partial exit
- *
- * After the target is hit:
- *   - Cancels the original stop-loss (placed at -ATR distance below entry).
- *   - Sells Math.floor(qty / 2) shares at market (no fractional shares).
- *   - Places a trailing stop on the remainder with a floor above break-even.
- *
- * @param tier - from enteredByTier map in index.ts ('core' | 'satellite')
+ * Halts trading when daily net PnL breaches the drawdown limit.
+ * Liquidates all positions and cancels open orders.
  */
-export async function handlePositionUpdate(
-  symbol: string,
-  currentPrice: number,
-  tier: SignalTier = 'core',
-): Promise<void> {
-  if (scaledOutPositions.has(symbol)) return;
+export async function checkDailyDrawdownKillSwitch(currentEquity: number): Promise<boolean> {
+  if (drawdownKillTriggered || startOfDayEquity === null) return false;
 
-  let position;
-  try {
-    position = await alpaca.getPosition(symbol);
-  } catch {
-    if (!externalExitNotified.has(symbol)) {
-      externalExitNotified.add(symbol);
-      void sendTelegramAlert(
-        formatExitAlert(symbol, 'Stop Loss / Trailing Stop'),
-      );
-    }
-    return;
-  }
+  const dailyPnlDollars = currentEquity - startOfDayEquity;
+  const dailyPnlPct = dailyPnlDollars / startOfDayEquity;
 
-  const entryPrice = parseFloat(position.avg_entry_price);
-  const totalQty = parseInt(position.qty, 10);
-  const unrealizedPct = (currentPrice - entryPrice) / entryPrice;
+  const hitDollarLimit = dailyPnlDollars <= config.risk.dailyDrawdownLimitDollars;
+  const hitPctLimit = dailyPnlPct <= config.risk.dailyDrawdownLimitPct;
 
-  const targetPct = tier === 'satellite'
-    ? config.risk.scaleOutTargetPctSatellite
-    : config.risk.scaleOutTargetPctCore;
+  if (!hitDollarLimit && !hitPctLimit) return false;
 
-  const tierLabel: 'Core' | 'Satellite' = tier === 'satellite' ? 'Satellite' : 'Core';
-
-  if (unrealizedPct >= targetPct) {
-    const sellQty = Math.floor(totalQty / 2);
-    if (sellQty < 1) return;
-
-    try {
-      await trader.executeBreakEvenScaleOut(symbol, sellQty, entryPrice, targetPct, tierLabel);
-      scaledOutPositions.add(symbol);
-
-      // Journal: mark the partial scale-out without closing the record.
-      // The record stays alive for the trailing-stop leg; it will be closed
-      // when the remaining shares exit (wasExternallyExited in index.ts, or
-      // closeAllOpenTrades at hard-close / circuit-breaker).
-      const scaleOutReason = tier === 'satellite' ? 'target-7pct' as const : 'target-5pct' as const;
-      const scaleOutPrice = parseFloat((entryPrice * (1 + targetPct)).toFixed(2));
-      journalManager.recordScaleOut(symbol, scaleOutReason, scaleOutPrice, sellQty);
-    } catch (err) {
-      log.error(`${symbol}: break-even scale-out failed — ${toErrorMessage(err)}`);
-    }
-  }
+  drawdownKillTriggered = true;
+  log.warn(
+    `*** DAILY DRAWDOWN KILL-SWITCH *** ` +
+    `Net PnL $${dailyPnlDollars.toFixed(2)} (${(dailyPnlPct * 100).toFixed(2)}%) — HALTED`,
+  );
+  journalManager.closeAllOpenTrades('daily-drawdown-kill');
+  await trader.liquidateAll('daily-drawdown-kill');
+  return true;
 }
 
 // ---------------------------------------------------------------------------
-// 6. EOD sweep 15:45 EST (tight choke)
+// 5. EOD sweep 15:45 EST (tight choke)
 // ---------------------------------------------------------------------------
 
 export interface SessionDataEntry {
@@ -406,7 +338,7 @@ export async function runEodSweep(
 }
 
 // ---------------------------------------------------------------------------
-// 7. Hard close 15:58 EST
+// 6. Hard close 15:58 EST
 // ---------------------------------------------------------------------------
 
 /**

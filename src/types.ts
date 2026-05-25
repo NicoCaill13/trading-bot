@@ -3,11 +3,15 @@ export type SignalTier = 'core' | 'satellite';
 export type ExitReason =
   | 'target-5pct'
   | 'target-7pct'
+  | 'target-atr'
   | 'stop-loss-initial'
   | 'trailing-stop'
+  | 'rsi-overbought-exit'
+  | 'volume-exhaustion-trailing'
   | 'eod-liquidation'
   | 'hard-close'
   | 'circuit-breaker'
+  | 'daily-drawdown-kill'
   | 'unknown';
 
 export type SpyTrend = 'bullish' | 'bearish' | 'neutral' | 'unknown';
@@ -141,7 +145,7 @@ export interface TradeRecord {
   // Partial exit — populated when a scale-out fires (50% sold at target)
   scale_out_price: number | null;
   scale_out_qty: number | null;
-  scale_out_reason: 'target-5pct' | 'target-7pct' | null;
+  scale_out_reason: 'target-5pct' | 'target-7pct' | 'target-atr' | null;
 
   // Final exit metrics (null until fully closed)
   exit_time: string | null;

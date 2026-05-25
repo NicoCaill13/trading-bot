@@ -19,39 +19,6 @@ Centralise les variables d'environnement (`process.env`) et les constantes math�
 - **Validation :** Utilise une IIFE pour valider la présence et la cohérence des variables au démarrage.
 - **Paramètres :** Max 5 positions, Sizing basé sur 1% du capital avec distance ATR, Target Scale-Out +3%, Stop-Loss plancher -1.5%, Circuit Breaker +1% PnL.
 
-### 📂 `screener.ts` (L'Univers Dynamique Mid-Caps)
-
-Ce module s'exécute pour préparer la watchlist.
-
-- **Univers Dynamique :** Requête l'API Alpaca pour les actifs `tradable` et `marginable` (pas de liste codée en dur).
-- **Filtres de Liquidité & Momentum :** Exclut les penny stocks (Prix < 10$). Ne garde que les actifs avec un Dollar Volume (Prix * Volume) > 50M$.
-- **Critères :** Surperformance face au SPY (Force Relative), Gap Up > 2% (avec clôture > ouverture), Volume Relatif > 2.0.
-
-### 📂 `trader.ts` (Le Routage d'Ordres Avancé)
-
-Gère l'envoi mécanique et asynchrone des ordres.
-
-- **Exécution :** Utilise exclusivement les **Bracket Orders** natifs d'Alpaca (Achat + Stop-Loss + Take-Profit partiel).
-- **Nettoyage :** Implémente des fonctions pour purger la file d'attente locale (`clearQueue`) avant les liquidations globales.
-
-### 📂 `riskManager.ts` (Le Cerveau Quantitatif & Vigile)
-
-Gère le dimensionnement et la protection du capital.
-
-- **Position Sizing (ATR) :** Distance du stop = `max(1.5 * ATR, 1.5% du prix)`. Quantité calculée pour risquer 1% du capital sur cette distance (max 20% d'allocation totale).
-- **Gestion Active :** Scale-Out (vente 50%) à +3% de profit. Placement du reste à Break-Even avec Trailing Stop de 1.5%.
-- **Circuit Breaker (1%) :** Surveille l'équité globale. Si le PnL net atteint +1% sur la journée, liquide tout, annule les ordres et bloque le bot (`tradingHalted = true`).
-- **EOD Tight Choke (15h45 EST) :** Ferme les positions perdantes ou sous le VWAP. Pour les gagnantes, modifie le Trailing Stop à 0.5%.
-- **Hard Close (15h58 EST) :** Liquidation inconditionnelle de toutes les positions restantes.
-
-### 📂 `index.ts` (L'Orchestrateur & WebSockets)
-
-Point d'entrée gérant l'Event Loop et les flux temps réel.
-
-- **Résilience :** Restaure l'état local depuis `session_state.json` et se réconcilie avec le broker (positions ouvertes) au boot.
-- **Filtre de Signal (VWAP + Volume) :** Cassure VWAP à la hausse après 9h45 EST, conditionnée par le volume de la bougie > 1.5x la moyenne des 5 précédentes. **(AUCUN RSI)**.
-- **Debounce & Scoring (10s) :** Les signaux sont stockés temporairement. Un timer de 10s (`flushPendingSignals`) trie les signaux par Momentum Score (Volume \* écart VWAP) et n'exécute que les meilleurs selon les slots disponibles.
-
 ## 2. STANDARDS DE SÉCURITÉ ET DE CODE
 
 - **Asynchronisme pur :** Syntaxe `async/await`. Gestion stricte des Rate Limits Alpaca (throttle des appels).

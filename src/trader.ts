@@ -11,7 +11,7 @@ import {
   humanizeExitReason,
 } from './notificationManager';
 import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
-import type { SignalTier } from './types';
+import type { BarData, SignalTier } from './types';
 
 const log = createLogger('TRADER');
 
@@ -531,4 +531,27 @@ export async function replaceWithTrailingStop(
     `on ${remainingQty} shares`,
   );
   return enqueueOrder(orderParams);
+}
+
+// ---------------------------------------------------------------------------
+// Satellite volume confirmation — break candle must exceed VMA_10 (1-min)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns false when the Satellite break candle lacks volume conviction.
+ * Prevents fakeout entries: buy is only allowed when break bar volume > VMA_10
+ * computed on the preceding 1-min bars (10-bar rolling mean).
+ */
+export function passesSatelliteVolumeConfirmation(
+  breakBar: BarData,
+  oneMinBars: BarData[],
+): boolean {
+  const period = config.risk.volumeConfirmationVmaPeriod;
+  const priorBars = oneMinBars.filter(b => b.timestamp !== breakBar.timestamp);
+  if (priorBars.length < period) return false;
+
+  const vma10 = priorBars.slice(-period).reduce((sum, b) => sum + b.volume, 0) / period;
+  if (vma10 <= 0) return false;
+
+  return breakBar.volume > vma10;
 }

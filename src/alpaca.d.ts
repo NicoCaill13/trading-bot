@@ -96,6 +96,17 @@ declare module '@alpacahq/alpaca-trade-api' {
     adjustment?: string;
   }
 
+  export interface AlpacaCalendarDay {
+    date: string;
+    open: string;
+    close: string;
+  }
+
+  export interface CalendarQueryParams {
+    start?: string;
+    end?: string;
+  }
+
   export default class Alpaca {
     constructor(config: AlpacaClientConfig);
     getAssets(params: { status?: string; asset_class?: string }): Promise<AlpacaAsset[]>;
@@ -114,5 +125,6 @@ declare module '@alpacahq/alpaca-trade-api' {
     createOrder(params: AlpacaOrderParams): Promise<AlpacaOrder>;
     cancelOrder(orderId: string): Promise<void>;
     replaceOrder(orderId: string, params: Partial<AlpacaOrderParams>): Promise<AlpacaOrder>;
+    getCalendar(params?: CalendarQueryParams): Promise<AlpacaCalendarDay[]>;
   }
 }

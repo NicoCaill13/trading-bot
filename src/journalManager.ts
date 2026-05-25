@@ -4,7 +4,7 @@ import config from './config';
 import { createLogger } from './logger';
 import type { TradeRecord, ExitReason, SignalOrigin, SpyTrend } from './types';
 
-type ScaleOutTarget = 'target-5pct' | 'target-7pct';
+type ScaleOutTarget = 'target-5pct' | 'target-7pct' | 'target-atr';
 
 const log = createLogger('JOURNAL');
 
@@ -237,6 +237,10 @@ export async function saveJournal(): Promise<void> {
   } catch (err) {
     log.error(`Journal save failed: ${String(err)}`);
   }
+}
+
+export function hasOpenTrade(symbol: string): boolean {
+  return openRecords.has(symbol);
 }
 
 export function getClosedRecords(): TradeRecord[] {

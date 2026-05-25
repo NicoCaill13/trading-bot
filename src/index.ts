@@ -7,8 +7,10 @@ import { runPremarketScreener } from './premarket_screener';
 import * as signalQueue from './signalQueue';
 import * as trader from './trader';
 import * as riskManager from './riskManager';
+import * as positionManager from './positionManager';
 import * as journalManager from './journalManager';
 import { runPostMortem } from './analyzer';
+import { isTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
@@ -49,6 +51,7 @@ const log = createLogger('SYSTEM');
 let ws: WebSocket | null = null;
 let reconnectAttempt = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
+let wsEnabled = false;
 
 // Set to true when circuit breaker or hard close triggers — blocks new entries
 let tradingHalted = false;
@@ -73,6 +76,11 @@ const v2PersistentSymbols = new Set<string>();
 const pullbackTrackers = new Map<string, PullbackTracker>();
 const ema9ClosePrices = new Map<string, number[]>();
 const EMA9_HISTORY_MAX = 50;
+
+// Rolling 1-min bar history for RSI, VMA_10 and Satellite volume confirmation
+const oneMinBarHistory = new Map<string, BarData[]>();
+const ONE_MIN_HISTORY_MAX = 30;
+const atrAtEntry = new Map<string, number>();
 let isFlushInProgress = false;
 
 // 5-min bars for signal generation (VWAP breakout, ORB, EOD session metrics)
@@ -280,13 +288,17 @@ async function loadWatchlistFromFile(): Promise<Watchlist | null> {
   return data;
 }
 
-async function loadWatchlist(): Promise<string[]> {
+async function loadWatchlist(skipScreener = false): Promise<string[]> {
   symbolTier.clear();
   preMarketGaps.clear();
 
   let data = await loadWatchlistFromFile();
 
   if (!data || data.symbols.length === 0) {
+    if (skipScreener) {
+      log.warn('Watchlist empty — screener skipped (market closed today)');
+      return [];
+    }
     log.info('Watchlist missing or empty — running Core screener...');
     data = await runScreener();
     symbolTier.clear();
@@ -342,6 +354,33 @@ function computeVwap(bars: BarData[]): number | null {
   if (totalVolume === 0) return null;
   const tpv = bars.reduce((sum, b) => sum + ((b.high + b.low + b.close) / 3) * b.volume, 0);
   return tpv / totalVolume;
+}
+
+function pushOneMinBar(symbol: string, bar: BarData): void {
+  let bars = oneMinBarHistory.get(symbol);
+  if (!bars) {
+    bars = [];
+    oneMinBarHistory.set(symbol, bars);
+  }
+
+  const last = bars[bars.length - 1];
+  if (last?.timestamp === bar.timestamp) {
+    bars[bars.length - 1] = bar;
+  } else {
+    bars.push(bar);
+    if (bars.length > ONE_MIN_HISTORY_MAX) {
+      bars.splice(0, bars.length - ONE_MIN_HISTORY_MAX);
+    }
+  }
+}
+
+function closeWebSocket(): void {
+  wsEnabled = false;
+  if (!ws) return;
+  ws.removeAllListeners();
+  ws.close();
+  ws = null;
+  log.info('WebSocket closed cleanly');
 }
 
 function pushEma9Close(symbol: string, close: number): void {
@@ -868,6 +907,17 @@ async function executeSignalsForTier(
   for (const signal of toExecute) {
     const { symbol, barData, score, vwap, tier } = signal;
 
+    if (tier === 'satellite') {
+      const oneMinBars = oneMinBarHistory.get(symbol) ?? [];
+      if (!trader.passesSatelliteVolumeConfirmation(barData, oneMinBars)) {
+        log.info(
+          `${symbol}: Satellite entry blocked — break volume ${Math.round(barData.volume)} ` +
+          `≤ VMA_${config.risk.volumeConfirmationVmaPeriod}`,
+        );
+        continue;
+      }
+    }
+
     log.info(
       `  executing ${symbol.padEnd(6)} [${tier}] | score ${Math.round(score).toLocaleString()} ` +
       `| deviation ${(((barData.close - vwap) / vwap) * 100).toFixed(2)}% ` +
@@ -885,7 +935,7 @@ async function executeSignalsForTier(
         continue;
       }
 
-      const { qty, stopLossPrice } = await riskManager.computePositionSize(
+      const { qty, stopLossPrice, atr } = await riskManager.computePositionSize(
         symbol,
         barData.close,
         settledCash,
@@ -897,6 +947,8 @@ async function executeSignalsForTier(
         log.warn(`${symbol}: position size 0 — ignored`);
         continue;
       }
+
+      atrAtEntry.set(symbol, atr);
 
       const order = await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
       enteredByTier.set(symbol, tier);
@@ -947,7 +999,7 @@ async function flushPendingSignals(): Promise<void> {
 
   isFlushInProgress = true;
   try {
-    if (tradingHalted || riskManager.isCircuitBreakerTriggered()) {
+    if (tradingHalted || riskManager.isCircuitBreakerTriggered() || riskManager.isDrawdownKillTriggered()) {
       log.info(`Flush cancelled: trading halted (${signalQueue.size()} signal(s) dropped)`);
       signalQueue.clear();
       return;
@@ -1050,43 +1102,68 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   }
 
   pushEma9Close(symbol, barData.close);
+  pushOneMinBar(symbol, barData);
   evaluatePullbackState(symbol, barData);
 
-  // UT1m take-profit monitoring: every 1-min close triggers the tier-specific
-  // scale-out check (5% Core / 7% Satellite) for confirmed open positions.
+  // UT1m dynamic exit monitoring for confirmed open positions.
   if (hasEntered(symbol)) {
-    // Track excursions for MFE/MAE before any exit check
     journalManager.updateExcursions(symbol, barData.close);
 
     try {
-      await riskManager.handlePositionUpdate(
+      await positionManager.handlePositionUpdate(
         symbol,
         barData.close,
         enteredByTier.get(symbol) ?? 'core',
+        {
+          bar1m: barData,
+          oneMinBars: oneMinBarHistory.get(symbol) ?? [barData],
+          atrAtEntry: atrAtEntry.get(symbol) ?? null,
+        },
       );
     } catch (err) {
       log.error(`${symbol}: position update error — ${toErrorMessage(err)}`);
     }
 
-    // Detect broker-side stop fills (stop-loss or trailing stop)
-    if (riskManager.wasExternallyExited(symbol)) {
-      const exitReason = riskManager.wasScaledOut(symbol)
+    if (positionManager.consumeSessionExit(symbol)) {
+      enteredByTier.delete(symbol);
+      atrAtEntry.delete(symbol);
+      void saveSessionState();
+    }
+
+    if (positionManager.wasExternallyExited(symbol)) {
+      const exitReason = positionManager.wasScaledOut(symbol)
         ? 'trailing-stop' as const
         : 'stop-loss-initial' as const;
       journalManager.closeTrade(symbol, exitReason, barData.close);
+      atrAtEntry.delete(symbol);
     }
   }
 
-  // Circuit breaker equity check — throttled to 1 REST call/minute max
+  // Circuit breaker / drawdown kill-switch — throttled to 1 REST call/minute max
   if (!tradingHalted) {
     const now = Date.now();
     if (now - lastEquityCheckMs >= EQUITY_CHECK_INTERVAL_MS) {
       lastEquityCheckMs = now;
       try {
         const equity = await trader.getAccountEquity();
+        const drawdownTriggered = await riskManager.checkDailyDrawdownKillSwitch(equity);
+        if (drawdownTriggered) {
+          tradingHalted = true;
+          closeWebSocket();
+          const pnlPct = (((equity - sessionStartEquity) / sessionStartEquity) * 100).toFixed(2);
+          log.info(`Trading halted — daily drawdown ${pnlPct}% reached`);
+          void sendTelegramAlert(
+            formatErrorAlert(
+              `Daily Kill-Switch déclenché — PnL ${pnlPct}%. Trading suspendu.`,
+            ),
+          );
+          return;
+        }
+
         const triggered = await riskManager.checkCircuitBreaker(equity);
         if (triggered) {
           tradingHalted = true;
+          closeWebSocket();
           const pnlPct = (((equity - sessionStartEquity) / sessionStartEquity) * 100).toFixed(2);
           log.info(`Trading halted — daily target +${pnlPct}% reached`);
           alertCritical(
@@ -1172,6 +1249,11 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 }
 
 function connectWebSocket(symbols: string[]): void {
+  if (!wsEnabled) {
+    log.info('WebSocket disabled — market closed or idle mode');
+    return;
+  }
+
   const authMessage = JSON.stringify({
     action: 'auth',
     key: config.alpaca.keyId,
@@ -1204,6 +1286,8 @@ function connectWebSocket(symbols: string[]): void {
 }
 
 function scheduleReconnect(symbols: string[]): void {
+  if (!wsEnabled) return;
+
   if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
     log.error('Maximum reconnect attempts reached — giving up');
     alertCritical(
@@ -1233,12 +1317,17 @@ function scheduleEodSweep(): void {
   const ms = msUntilESTTime(config.session.eodSweepHour, config.session.eodSweepMinute);
   log.info(`EOD sweep 15:45 scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    // Block new entries from 15:45 onwards
-    tradingHalted = true;
-    riskManager.runEodSweep(sessionData).catch((err: unknown) => {
-      log.error(`EOD sweep error: ${toErrorMessage(err)}`);
+    void isTradingDay().then(tradingToday => {
+      if (!tradingToday) {
+        scheduleEodSweep();
+        return;
+      }
+      tradingHalted = true;
+      riskManager.runEodSweep(sessionData).catch((err: unknown) => {
+        log.error(`EOD sweep error: ${toErrorMessage(err)}`);
+      });
+      scheduleEodSweep();
     });
-    scheduleEodSweep();
   }, ms);
 }
 
@@ -1246,10 +1335,18 @@ function scheduleHardClose(): void {
   const ms = msUntilESTTime(config.session.hardCloseHour, config.session.hardCloseMinute);
   log.info(`Hard close 15:58 scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    riskManager.runHardClose().catch((err: unknown) => {
-      log.error(`Hard close error: ${toErrorMessage(err)}`);
+    void isTradingDay().then(tradingToday => {
+      if (!tradingToday) {
+        scheduleHardClose();
+        return;
+      }
+      riskManager.runHardClose()
+        .then(() => closeWebSocket())
+        .catch((err: unknown) => {
+          log.error(`Hard close error: ${toErrorMessage(err)}`);
+        });
+      scheduleHardClose();
     });
-    scheduleHardClose();
   }, ms);
 }
 
@@ -1257,31 +1354,51 @@ function scheduleHardClose(): void {
 // Daily lifecycle — three independent crons
 // ---------------------------------------------------------------------------
 
-// 16:05 EST: market fully closed → send EOD report + V5 post-mortem (state untouched)
+// 16:00 EST: V6 post-mortem analysis (skipped when no trades closed)
+function schedulePostMortem(): void {
+  const ms = msUntilESTTime(config.session.postMortemHour, config.session.postMortemMinute);
+  log.info(`Post-mortem 16:00 scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
+  setTimeout((): void => {
+    void isTradingDay().then(tradingToday => {
+      if (!tradingToday) {
+        log.info('Post-mortem skipped — market closed today');
+        schedulePostMortem();
+        return;
+      }
+      log.info('Running V6 post-mortem analysis...');
+      runPostMortem().catch((err: unknown) => {
+        log.error(`Post-mortem analysis failed: ${toErrorMessage(err)}`);
+      });
+      schedulePostMortem();
+    });
+  }, ms);
+}
+
+// 16:05 EST: market fully closed → send EOD report (state untouched)
 function scheduleEodReport(): void {
   const ms = msUntilESTTime(config.session.eodReportHour, config.session.eodReportMinute);
   log.info(`EOD report scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    log.info('Sending EOD report...');
-    trader.getAccountEquity()
-      .then(async (endEquity) => {
-        await sendDailyReport({
-          startEquity: sessionStartEquity,
-          endEquity,
-          tradesEntered: enteredByTier.size,
-          circuitBreakerFired: riskManager.isCircuitBreakerTriggered(),
-          symbols: [...enteredByTier.keys()],
-        });
-      })
-      .catch(() => { });
+    void isTradingDay().then(tradingToday => {
+      if (!tradingToday) {
+        scheduleEodReport();
+        return;
+      }
+      log.info('Sending EOD report...');
+      trader.getAccountEquity()
+        .then(async (endEquity) => {
+          await sendDailyReport({
+            startEquity: sessionStartEquity,
+            endEquity,
+            tradesEntered: enteredByTier.size,
+            circuitBreakerFired: riskManager.isCircuitBreakerTriggered(),
+            symbols: [...enteredByTier.keys()],
+          });
+        })
+        .catch(() => { });
 
-    // V5 post-mortem analysis
-    log.info('Running V5 post-mortem analysis...');
-    runPostMortem().catch((err: unknown) => {
-      log.error(`Post-mortem analysis failed: ${toErrorMessage(err)}`);
+      scheduleEodReport();
     });
-
-    scheduleEodReport();
   }, ms);
 }
 
@@ -1305,8 +1422,11 @@ function scheduleDailyReset(): void {
     pullbackTrackers.clear();
     ema9ClosePrices.clear();
     journalManager.reset();
+    positionManager.resetSessionState();
     isFlushInProgress = false;
     monitoredSymbols = [];
+    oneMinBarHistory.clear();
+    atrAtEntry.clear();
     signalQueue.clear();
     if (signalFlushTimer) {
       clearTimeout(signalFlushTimer);
@@ -1326,8 +1446,19 @@ function scheduleDailyReset(): void {
         log.warn('Daily reset: cannot read equity — baseline not updated');
       });
 
-    runScreener()
-      .then(async watchlist => {
+    void (async () => {
+      // Run screener only after a trading session (Mon–Fri close).
+      // Checking "tomorrow" would skip Friday 20:00 (tomorrow = Saturday).
+      const tradingToday = await isTradingDay();
+
+      if (!tradingToday) {
+        log.info('Market closed today — Core screener skipped');
+        closeWebSocket();
+        return;
+      }
+
+      try {
+        const watchlist = await runScreener();
         symbolTier.clear();
         preMarketGaps.clear();
         for (const s of watchlist.symbols) {
@@ -1337,21 +1468,12 @@ function scheduleDailyReset(): void {
         monitoredSymbols = newSymbols;
         ensureV2SymbolsMonitored();
         log.info(`Core screener done — ${newSymbols.length} symbol(s) ready for next session`);
-        if (newSymbols.length > 0) {
-          if (ws) {
-            ws.removeAllListeners();
-            ws.close();
-            ws = null;
-          }
-          reconnectAttempt = 0;
-          connectWebSocket(newSymbols);
-        } else {
-          log.warn('Screener returned 0 symbols — WebSocket not reconnected');
-        }
-      })
-      .catch((err: unknown) => {
+        closeWebSocket();
+        log.info('Post-session screener done — WebSocket remains closed until next trading day boot');
+      } catch (err: unknown) {
         log.error(`Post-session screener failed: ${toErrorMessage(err)}`);
-      });
+      }
+    })();
 
     scheduleDailyReset();
   }, ms);
@@ -1362,12 +1484,23 @@ function scheduleMarketOpenAlert(): void {
   const ms = msUntilESTTime(config.session.marketOpenHour, config.session.marketOpenMinute);
   log.info(`Market open alert 09:30 scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
-    const slots = getTimedecaySlotLimits(getESTDate(), openCore);
-    void sendTelegramAlert(
-      formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
-    );
-    scheduleMarketOpenAlert();
+      void isTradingDay().then(tradingToday => {
+      if (!tradingToday) {
+        scheduleMarketOpenAlert();
+        return;
+      }
+      wsEnabled = true;
+      reconnectAttempt = 0;
+      if (monitoredSymbols.length > 0 && !ws) {
+        connectWebSocket(monitoredSymbols);
+      }
+      const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
+      const slots = getTimedecaySlotLimits(getESTDate(), openCore);
+      void sendTelegramAlert(
+        formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
+      );
+      scheduleMarketOpenAlert();
+    });
   }, ms);
 }
 
@@ -1376,24 +1509,30 @@ function schedulePreMarketReconciliation(): void {
   const ms = msUntilESTTime(config.session.preMarketHour, config.session.preMarketMinute);
   log.info(`Pre-market reconciliation scheduled in ${Math.round(ms / 1000 / 60)} minutes`);
   setTimeout((): void => {
-    log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
-    reconcileStateFromBroker()
-      .then(() => runPremarketScreener())
-      .then(watchlist => {
+    void isTradingDay().then(async tradingToday => {
+      if (!tradingToday) {
+        log.info('Pre-market skipped — market closed today');
+        schedulePreMarketReconciliation();
+        return;
+      }
+      log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
+      try {
+        await reconcileStateFromBroker();
+        const watchlist = await runPremarketScreener();
         const v2Symbols = extractV2Symbols(watchlist);
         const newSymbols = applyV2WatchlistSymbols(v2Symbols);
         log.info(
           `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
           `${newSymbols.length} new WebSocket subscription(s)`,
         );
-        if (ws && newSymbols.length > 0) {
+        if (wsEnabled && ws && newSymbols.length > 0) {
           ws.send(buildSubscribeMessage(newSymbols));
         }
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         log.error(`Pre-market routine error: ${toErrorMessage(err)}`);
-      });
-    schedulePreMarketReconciliation();
+      }
+      schedulePreMarketReconciliation();
+    });
   }, ms);
 }
 
@@ -1404,20 +1543,30 @@ function schedulePreMarketReconciliation(): void {
 async function main(): Promise<void> {
   log.info('Initializing trading bot...');
 
-  const symbols = await loadWatchlist();
+  const tradingToday = await isTradingDay();
+  const symbols = await loadWatchlist(!tradingToday);
   monitoredSymbols = symbols;
 
-  // Always arm all crons — they must fire even on empty-watchlist days
   scheduleEodSweep();
   scheduleHardClose();
   scheduleEodReport();
+  schedulePostMortem();
   scheduleDailyReset();
   schedulePreMarketReconciliation();
   scheduleMarketOpenAlert();
 
+  if (!tradingToday) {
+    wsEnabled = false;
+    log.warn(
+      'Market closed today (weekend/holiday) — idle mode. ' +
+      'WebSocket disabled, crons armed for next trading day.',
+    );
+    return;
+  }
+
+  wsEnabled = true;
+
   if (symbols.length === 0) {
-    // No symbols today: keep process alive so the 20:00 screener can populate the
-    // watchlist and reconnect the WebSocket for the next session.
     log.warn('Empty watchlist — no trades today. Waiting for 20:00 screener...');
     return;
   }

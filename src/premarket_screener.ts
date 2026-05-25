@@ -4,7 +4,7 @@ import { getDynamicUniverse } from './screener';
 import { registerSatelliteWatchlist } from './signalQueue';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
-import { mergeV2IntoWatchlist } from './watchlistIO';
+import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
@@ -140,12 +140,29 @@ export async function runPremarketScreener(): Promise<Watchlist> {
   }
 
   const gapCandidates = await scanGapCandidates(universe);
+
+  const existingWatchlist = await readWatchlist();
+  const coreSymbols = new Set(
+    (existingWatchlist?.symbols ?? [])
+      .filter(s => getSymbolOrigin(s) === 'V1_CORE')
+      .map(s => s.symbol),
+  );
+
+  const dedupedCandidates = gapCandidates.filter(c => {
+    if (coreSymbols.has(c.symbol)) {
+      log.info(`${c.symbol}: rejected — already in Core watchlist (V1_CORE priority)`);
+      return false;
+    }
+    return true;
+  });
+
   log.info(
-    `${gapCandidates.length} V2 candidate(s) from ${universe.length} symbols ` +
+    `${dedupedCandidates.length} V2 candidate(s) from ${universe.length} symbols ` +
+    `(${gapCandidates.length - dedupedCandidates.length} deduped vs Core) ` +
     `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%)`,
   );
 
-  const v2Symbols = toWatchlistEntries(gapCandidates);
+  const v2Symbols = toWatchlistEntries(dedupedCandidates);
 
   v2Symbols.forEach(s => {
     log.info(

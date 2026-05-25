@@ -38,13 +38,19 @@ export async function mergeV2IntoWatchlist(
 ): Promise<Watchlist> {
   const existing = await readWatchlist();
   const v1Symbols = (existing?.symbols ?? []).filter(s => !isV2Symbol(s));
+  const coreSymbolSet = new Set(v1Symbols.map(s => s.symbol));
+
+  const dedupedV2 = v2Symbols.filter(s => {
+    if (coreSymbolSet.has(s.symbol)) return false;
+    return true;
+  });
 
   const watchlist: Watchlist = {
     generatedAt: new Date().toISOString(),
     benchmarkReturn: existing?.benchmarkReturn ?? null,
-    universeSize: existing?.universeSize ?? v2Symbols.length,
+    universeSize: existing?.universeSize ?? dedupedV2.length,
     liquidFiltered: existing?.liquidFiltered ?? 0,
-    symbols: [...v1Symbols, ...v2Symbols],
+    symbols: [...v1Symbols, ...dedupedV2],
   };
 
   await writeWatchlist(watchlist);

@@ -116,6 +116,9 @@ export function humanizeExitReason(reason: string): string {
     'eod-no-session-data': 'EOD Sweep (données session manquantes)',
     'hard-close-15h58': 'Hard Close 15h58',
     'circuit-breaker-daily-target': 'Circuit Breaker (+1% PnL)',
+    'daily-drawdown-kill': 'Daily Kill-Switch (-1.5% PnL)',
+    'RSI_OVERBOUGHT_EXIT': 'Smart Exit RSI (surachat)',
+    'VOLUME_EXHAUSTION_TRAILING': 'Smart Exit Volume Exhaustion',
   };
   return labels[reason] ?? reason;
 }

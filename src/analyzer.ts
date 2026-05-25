@@ -117,9 +117,6 @@ export async function runPostMortem(): Promise<void> {
 
   if (records.length === 0) {
     log.info('No closed trades today — post-mortem skipped');
-    await sendTelegramAlert(
-      '📊 <b>[ANALYSE V5]</b> Aucun trade clôturé aujourd\'hui.',
-    );
     return;
   }
 
@@ -151,7 +148,7 @@ export async function runPostMortem(): Promise<void> {
   );
 
   const message =
-    `📊 <b>[ANALYSE V5]</b> Win Rate: ${winRate.toFixed(0)}% | ` +
+    `📊 <b>[ANALYSE V6]</b> Win Rate: ${winRate.toFixed(0)}% | ` +
     `Meilleur setup: ${bestSetupDesc}\n` +
     `📈 Avg Win: +${avgWinPct.toFixed(2)}% | Avg Loss: -${avgLossPct.toFixed(2)}%\n` +
     `💼 Trades: ${records.length} (${winners.length}W/${losers.length}L) | ` +

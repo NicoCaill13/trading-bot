@@ -99,6 +99,24 @@ const config = {
     pullbackSupportPct: parseFloatEnv('PULLBACK_SUPPORT_PCT', 0.002),
     // Marketable limit: ask × multiplier (default +0.1% slippage cap).
     marketableLimitVwapMultiplier: parseFloatEnv('MARKETABLE_LIMIT_VWAP_MULTIPLIER', 1.001),
+    // Anti-chase guard: max % the live ask may sit above the signal bar close
+    // before the entry is abandoned. Prevents buying the top of a vertical spike
+    // when the price ran away during the signal-batch debounce window.
+    maxEntryChasePct: parseFloatEnv('MAX_ENTRY_CHASE_PCT', 1.0),
+    // Entry-timing filter: skip entries when the 1-min RSI is already overbought
+    // (chasing exhaustion). Distinct from the smart-exit RSI threshold.
+    maxEntryRsi: parseFloatEnv('MAX_ENTRY_RSI', 75),
+    entryRsiPeriod: parseIntEnv('ENTRY_RSI_PERIOD', 14),
+  },
+
+  fibonacci: {
+    // Percentage distance from price to a Fibonacci level below which we consider
+    // the price "near" that level (e.g. 1.5 means within 1.5% of the level price).
+    proximityTolerancePct: parseFloatEnv('FIB_PROXIMITY_TOLERANCE_PCT', 1.5),
+    // When true, entries are blocked if price is not within proximityTolerancePct
+    // of any Fibonacci retracement level derived from the current session range.
+    // Set FIB_BLOCK_IF_NOT_NEAR=false to revert to observatory-only mode.
+    blockEntryIfNotNear: process.env.FIB_BLOCK_IF_NOT_NEAR !== 'false',
   },
 
   indicators: {
@@ -164,6 +182,13 @@ const config = {
 
   if (r.dailyProfitTargetPct <= 0 || r.dailyProfitTargetPct > 0.1)
     throw new Error(`[SYSTEM] DAILY_PROFIT_TARGET_PCT out of bounds (0–10%): ${r.dailyProfitTargetPct}`);
+
+  const e = config.entry;
+  if (e.maxEntryChasePct < 0 || e.maxEntryChasePct > 10)
+    throw new Error(`[SYSTEM] MAX_ENTRY_CHASE_PCT out of bounds (0–10%): ${e.maxEntryChasePct}`);
+
+  if (e.maxEntryRsi < 50 || e.maxEntryRsi > 100)
+    throw new Error(`[SYSTEM] MAX_ENTRY_RSI out of bounds (50–100): ${e.maxEntryRsi}`);
 
   const p = config.portfolio;
   const shareSum = p.coreRiskShare + p.satelliteRiskShare;

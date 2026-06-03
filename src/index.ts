@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import WebSocket from 'ws';
+import { RSI } from 'technicalindicators';
 import config, { getTimedecaySlotLimits } from './config';
 import { runScreener } from './screener';
 import { runPremarketScreener } from './premarket_screener';
@@ -9,11 +10,12 @@ import * as trader from './trader';
 import * as riskManager from './riskManager';
 import * as positionManager from './positionManager';
 import * as journalManager from './journalManager';
+import * as feedbackEngine from './feedbackEngine';
 import { runPostMortem } from './analyzer';
 import { isTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
-import { getESTDate, toErrorMessage } from './utils';
+import { getESTDate, isNonRetryableOrderError, toErrorMessage } from './utils';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
 import {
   sendTelegramAlert,
@@ -21,6 +23,12 @@ import {
   formatErrorAlert,
 } from './notificationManager';
 import { extractV2Symbols, readWatchlist } from './watchlistIO';
+import {
+  computeFibLevels,
+  deriveFibLevelsFromBars,
+  evaluateFibProximity,
+  formatFibLog,
+} from './fibonacci';
 import type {
   BarData,
   PendingSignal,
@@ -414,6 +422,19 @@ function computeSMA20ForSymbol(symbol: string): number | null {
 }
 
 /**
+ * 1-min RSI from the rolling bar history — entry-timing filter to avoid buying
+ * into momentum exhaustion. Returns null when history is too short (fail-open).
+ */
+function computeEntryRsi(symbol: string): number | null {
+  const period = config.entry.entryRsiPeriod;
+  const bars = oneMinBarHistory.get(symbol);
+  if (!bars || bars.length < period + 1) return null;
+
+  const values = RSI.calculate({ period, values: bars.map(b => b.close) });
+  return values[values.length - 1] ?? null;
+}
+
+/**
  * Determines SPY 5-min trend at signal execution time.
  * Uses the in-memory 5-min bars if SPY is monitored; falls back to a REST call.
  */
@@ -729,10 +750,20 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
   state.triggered = true;
   orbState.set(symbol, state);
 
+  const orbFibLevels = state.low < state.high
+    ? computeFibLevels(state.low, latestBar.high)
+    : null;
+
+  const orbFibProx = orbFibLevels
+    ? evaluateFibProximity(latestBar.close, orbFibLevels, config.fibonacci.proximityTolerancePct)
+    : null;
+
   log.info(
     `${symbol}: Satellite ORB signal — ` +
     `ORB high $${state.high.toFixed(2)} | close $${latestBar.close.toFixed(2)} | ` +
-    `break ${(orbDeviation * 100).toFixed(2)}% | score ${Math.round(momentumScore).toLocaleString()} → queued`,
+    `break ${(orbDeviation * 100).toFixed(2)}% | score ${Math.round(momentumScore).toLocaleString()}` +
+    (orbFibProx ? ` | ${formatFibLog(orbFibProx)}` : '') +
+    ` → queued`,
   );
 
   queuePendingSignal({
@@ -742,6 +773,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
     barData: latestBar,
     vwap,
     avgVolume,
+    fibLevels: orbFibLevels,
   });
 }
 
@@ -792,6 +824,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
     tier,
     score: momentumScore,
     avgVolume,
+    fibLevels: null,
   });
 
   log.info(
@@ -829,12 +862,20 @@ function evaluatePullbackState(symbol: string, bar1m: BarData): void {
     const distSupport = Math.min(distVwap, distEma);
 
     if (distSupport <= supportThreshold) {
+      const sessionBars = signalBars5m.get(symbol) ?? [];
+      tracker.fibLevels = deriveFibLevelsFromBars(sessionBars, tracker.localHigh);
       tracker.state = 'TRIGGERED';
       tracker.prevClose = bar1m.close;
+
+      const fibProx = tracker.fibLevels
+        ? evaluateFibProximity(bar1m.close, tracker.fibLevels, config.fibonacci.proximityTolerancePct)
+        : null;
+
       log.info(
         `${symbol}: pullback support touched — awaiting tick up | ` +
         `close $${bar1m.close.toFixed(2)} | VWAP $${vwap.toFixed(2)}` +
-        (ema9 !== null ? ` | EMA9 $${ema9.toFixed(2)}` : ''),
+        (ema9 !== null ? ` | EMA9 $${ema9.toFixed(2)}` : '') +
+        (fibProx ? ` | ${formatFibLog(fibProx)}` : ' | Fib N/A'),
       );
     }
     return;
@@ -854,6 +895,7 @@ function evaluatePullbackState(symbol: string, bar1m: BarData): void {
         barData: bar1m,
         vwap,
         avgVolume: tracker.avgVolume,
+        fibLevels: tracker.fibLevels,
       });
       return;
     }
@@ -935,9 +977,26 @@ async function executeSignalsForTier(
         continue;
       }
 
+      // Live ask resolved up front: every entry guard (anti-chase, VWAP distance,
+      // Fibonacci, stop sizing) must judge the price we will actually pay, not the
+      // stale signal bar close. The signal-batch debounce can let fast movers run
+      // several % between signal and submission — that gap was the root cause of the
+      // catastrophic fills (e.g. validated near VWAP at $28, filled at $32).
+      const referencePrice = await trader.getEntryReferencePrice(symbol, barData.close);
+
+      const chasePct = ((referencePrice - barData.close) / barData.close) * 100;
+      if (chasePct > config.entry.maxEntryChasePct) {
+        log.warn(
+          `${symbol}: entry blocked by anti-chase — live ask $${referencePrice.toFixed(2)} ` +
+          `is ${chasePct.toFixed(2)}% above signal $${barData.close.toFixed(2)} ` +
+          `(cap ${config.entry.maxEntryChasePct}%)`,
+        );
+        continue;
+      }
+
       const { qty, stopLossPrice, atr } = await riskManager.computePositionSize(
         symbol,
-        barData.close,
+        referencePrice,
         settledCash,
         tier,
         enteredByTier,
@@ -948,9 +1007,96 @@ async function executeSignalsForTier(
         continue;
       }
 
+      const screenerData = screenerDataMap.get(symbol);
+      const spyTrend = await fetchSpyTrend5m();
+      const filters = feedbackEngine.getFilters();
+
+      const vwapDist = ((referencePrice - vwap) / vwap) * 100;
+      if (vwapDist > filters.maxVwapEntryDistancePct) {
+        log.warn(
+          `${symbol}: entry blocked by FeedbackEngine — VWAP dist ` +
+          `${vwapDist.toFixed(2)}% > cap ${filters.maxVwapEntryDistancePct.toFixed(2)}%`,
+        );
+        continue;
+      }
+
+      const entryRsi = computeEntryRsi(symbol);
+      if (entryRsi !== null && entryRsi > config.entry.maxEntryRsi) {
+        log.warn(
+          `${symbol}: entry blocked — 1-min RSI ${entryRsi.toFixed(1)} ` +
+          `> cap ${config.entry.maxEntryRsi} (momentum exhaustion)`,
+        );
+        continue;
+      }
+
+      const gapRaw = screenerData?.gapUp ?? screenerData?.preMarketGapPct ?? null;
+      const gapPct = gapRaw !== null
+        ? (gapRaw <= 1 ? gapRaw * 100 : gapRaw)
+        : null;
+      if (
+        filters.maxGapPctForEntry !== null &&
+        gapPct !== null &&
+        gapPct > filters.maxGapPctForEntry
+      ) {
+        log.warn(
+          `${symbol}: entry blocked by FeedbackEngine — gap ${gapPct.toFixed(1)}% ` +
+          `> cap ${filters.maxGapPctForEntry}%`,
+        );
+        continue;
+      }
+
+      const origin = screenerData?.origin ?? 'V1_CORE';
+      if (filters.blockV1WhenSpyBearish && origin === 'V1_CORE' && spyTrend === 'bearish') {
+        log.warn(
+          `${symbol}: V1_CORE entry blocked by FeedbackEngine — SPY bearish + historical pattern`,
+        );
+        continue;
+      }
+
+      if (filters.atrStopTooWideWarning) {
+        log.warn(
+          `${symbol}: ATR stop historically too wide — consider tightening ATR_STOP_MULTIPLIER`,
+        );
+      }
+
+      // Fibonacci retracement check — recomputed at execution time against current price
+      let fibLevelAtEntry: number | null = null;
+      let fibLevelNameAtEntry: import('./types').FibLevelName | null = null;
+
+      if (signal.fibLevels) {
+        const fibProx = evaluateFibProximity(
+          referencePrice,
+          signal.fibLevels,
+          config.fibonacci.proximityTolerancePct,
+        );
+        log.info(
+          `${symbol}: ${formatFibLog(fibProx)} | range $${signal.fibLevels.swingLow.toFixed(2)}–$${signal.fibLevels.swingHigh.toFixed(2)}`,
+        );
+        if (config.fibonacci.blockEntryIfNotNear && !fibProx.isNearSupport) {
+          log.warn(
+            `${symbol}: entry blocked by Fibonacci — $${referencePrice.toFixed(2)} is ` +
+            `${fibProx.distancePct.toFixed(2)}% from nearest ${fibProx.nearestName}% level ` +
+            `(tolerance: ${config.fibonacci.proximityTolerancePct}%)`,
+          );
+          continue;
+        }
+        fibLevelAtEntry = fibProx.nearestLevel;
+        fibLevelNameAtEntry = fibProx.nearestName;
+      } else {
+        log.info(`${symbol}: Fibonacci levels unavailable — check skipped`);
+      }
+
       atrAtEntry.set(symbol, atr);
 
-      const order = await trader.placeBracketOrder(symbol, qty, vwap, barData.close, stopLossPrice, tier);
+      const order = await trader.placeBracketOrder(
+        symbol,
+        qty,
+        vwap,
+        referencePrice,
+        stopLossPrice,
+        tier,
+        referencePrice,
+      );
       enteredByTier.set(symbol, tier);
 
       // Prefer the actual submitted limit price over the stale bar close (can diverge by
@@ -958,11 +1104,9 @@ async function executeSignalsForTier(
       const submittedLimitPrice =
         order.limit_price !== undefined && order.limit_price !== ''
           ? parseFloat(order.limit_price)
-          : barData.close;
+          : referencePrice;
 
       // Open journal record — capture all pre-trade and entry context
-      const screenerData = screenerDataMap.get(symbol);
-      const spyTrend = await fetchSpyTrend5m();
       journalManager.openTrade(symbol, {
         origin: screenerData?.origin ?? 'V1_CORE',
         alpha_vs_spy: screenerData?.relativeReturn ?? null,
@@ -974,13 +1118,20 @@ async function executeSignalsForTier(
         ema9_at_entry: computeEMA9(symbol),
         sma20_at_entry: computeSMA20ForSymbol(symbol),
         spy_trend_5m: spyTrend,
+        fib_level_at_entry: fibLevelAtEntry,
+        fib_level_name_at_entry: fibLevelNameAtEntry,
       });
 
       executed.push(symbol);
       await saveSessionState();
     } catch (err) {
-      log.error(`${symbol}: order failed — ${toErrorMessage(err)}`);
-      void sendTelegramAlert(formatErrorAlert(`${symbol}: ${toErrorMessage(err)}`));
+      const msg = toErrorMessage(err);
+      log.error(`${symbol}: order failed — ${msg}`);
+      if (isNonRetryableOrderError(msg)) {
+        signalQueue.remove([symbol]);
+        log.warn(`${symbol}: non-retryable order failure — dropped from queue`);
+      }
+      void sendTelegramAlert(formatErrorAlert(`${symbol}: ${msg}`));
     }
   }
 
@@ -1546,6 +1697,8 @@ async function main(): Promise<void> {
   const tradingToday = await isTradingDay();
   const symbols = await loadWatchlist(!tradingToday);
   monitoredSymbols = symbols;
+
+  await feedbackEngine.init(config.paths.journal);
 
   scheduleEodSweep();
   scheduleHardClose();

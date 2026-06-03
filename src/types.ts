@@ -1,5 +1,28 @@
 export type SignalTier = 'core' | 'satellite';
 
+// ---------------------------------------------------------------------------
+// Fibonacci retracement types
+// ---------------------------------------------------------------------------
+
+export type FibLevelName = '23.6' | '38.2' | '50.0' | '61.8' | '78.6';
+
+export interface FibLevels {
+  swingLow: number;
+  swingHigh: number;
+  level_236: number;
+  level_382: number;
+  level_500: number;
+  level_618: number;
+  level_786: number;
+}
+
+export interface FibProximity {
+  nearestLevel: number;
+  nearestName: FibLevelName;
+  distancePct: number;
+  isNearSupport: boolean;
+}
+
 export type ExitReason =
   | 'target-5pct'
   | 'target-7pct'
@@ -63,6 +86,7 @@ export interface PullbackTracker {
   tier: SignalTier;
   score: number;
   avgVolume: number;
+  fibLevels: FibLevels | null;
 }
 
 export interface PendingSignal {
@@ -72,6 +96,7 @@ export interface PendingSignal {
   barData: BarData;
   vwap: number;
   avgVolume: number;
+  fibLevels: FibLevels | null;
 }
 
 export interface WatchlistSymbol {
@@ -124,6 +149,14 @@ export interface EnteredSymbolEntry {
   tier: SignalTier;
 }
 
+export interface AdaptiveFilters {
+  maxVwapEntryDistancePct: number;
+  maxGapPctForEntry: number | null;
+  blockV1WhenSpyBearish: boolean;
+  atrStopTooWideWarning: boolean;
+  computedAt: string | null;
+}
+
 export interface TradeRecord {
   // Pre-trade context (Screener Data)
   symbol: string;
@@ -146,6 +179,10 @@ export interface TradeRecord {
   scale_out_price: number | null;
   scale_out_qty: number | null;
   scale_out_reason: 'target-5pct' | 'target-7pct' | 'target-atr' | null;
+
+  // Fibonacci context at entry — nearest retracement level and its name
+  fib_level_at_entry: number | null;
+  fib_level_name_at_entry: FibLevelName | null;
 
   // Final exit metrics (null until fully closed)
   exit_time: string | null;

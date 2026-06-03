@@ -2,7 +2,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import config from './config';
 import { createLogger } from './logger';
-import type { TradeRecord, ExitReason, SignalOrigin, SpyTrend } from './types';
+import * as feedbackEngine from './feedbackEngine';
+import type { TradeRecord, ExitReason, SignalOrigin, SpyTrend, FibLevelName } from './types';
 
 type ScaleOutTarget = 'target-5pct' | 'target-7pct' | 'target-atr';
 
@@ -34,6 +35,8 @@ export interface OpenTradeParams {
   ema9_at_entry: number | null;
   sma20_at_entry: number | null;
   spy_trend_5m: SpyTrend;
+  fib_level_at_entry: number | null;
+  fib_level_name_at_entry: FibLevelName | null;
 }
 
 /**
@@ -64,6 +67,8 @@ export function openTrade(symbol: string, params: OpenTradeParams): void {
     sma20_at_entry: params.sma20_at_entry,
     distance_to_sma20_percent,
     spy_trend_5m: params.spy_trend_5m,
+    fib_level_at_entry: params.fib_level_at_entry,
+    fib_level_name_at_entry: params.fib_level_name_at_entry,
     scale_out_price: null,
     scale_out_qty: null,
     scale_out_reason: null,
@@ -234,6 +239,10 @@ export async function saveJournal(): Promise<void> {
       `Journal saved — ${toAdd.length} new record(s), ` +
       `${existing.length + toAdd.length} total`,
     );
+
+    feedbackEngine.refresh(JOURNAL_PATH).catch((err: unknown) => {
+      log.warn(`FeedbackEngine refresh failed: ${String(err)}`);
+    });
   } catch (err) {
     log.error(`Journal save failed: ${String(err)}`);
   }
@@ -241,6 +250,10 @@ export async function saveJournal(): Promise<void> {
 
 export function hasOpenTrade(symbol: string): boolean {
   return openRecords.has(symbol);
+}
+
+export function getEntryPrice(symbol: string): number | null {
+  return openRecords.get(symbol)?.entry_price ?? null;
 }
 
 export function getClosedRecords(): TradeRecord[] {

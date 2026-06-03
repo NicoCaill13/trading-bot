@@ -359,6 +359,18 @@ function resolveAskPrice(snap: AlpacaSnapshot): number | null {
 }
 
 /**
+ * Public live-ask resolver — used by the entry pipeline to validate guards
+ * (anti-chase, VWAP distance, Fibonacci, stop sizing) against the price we will
+ * actually pay, not the stale signal bar close.
+ */
+export async function getEntryReferencePrice(
+  symbol: string,
+  fallbackPrice: number,
+): Promise<number> {
+  return fetchLiveAskPrice(symbol, fallbackPrice);
+}
+
+/**
  * Fetches the live ask price for a symbol.
  * Falls back to signalPrice when the snapshot call fails.
  */
@@ -397,6 +409,7 @@ export async function placeBracketOrder(
   signalPrice: number,
   stopLossPrice: number,
   tier: SignalTier = 'core',
+  prefetchedAskPrice?: number,
 ): Promise<AlpacaOrder> {
   if (tier === 'core' && isInBlackoutPeriod()) {
     throw new Error(`Blackout active — Core order ${symbol} blocked until 09:45 EST`);
@@ -407,7 +420,12 @@ export async function placeBracketOrder(
 
   // Fetch live ask price at submission time — bar close can be 0-5 min stale + 10s debounce.
   // Using a stale price produces a non-marketable limit (422) when price runs up.
-  const liveAskPrice = await fetchLiveAskPrice(symbol, signalPrice);
+  // When the caller already resolved the live ask (entry guards), reuse it to keep
+  // the validated price and the submitted limit perfectly consistent.
+  const liveAskPrice =
+    prefetchedAskPrice !== undefined && prefetchedAskPrice > 0
+      ? prefetchedAskPrice
+      : await fetchLiveAskPrice(symbol, signalPrice);
 
   const [settledCash, positions] = await Promise.all([
     getSettledCash(),

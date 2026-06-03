@@ -102,11 +102,15 @@ export async function getPortfolioAllocation(
 // 3. Coherent ATR sizing + hard-stop floor (full slot envelope per trade)
 // ---------------------------------------------------------------------------
 
+/** Calendar days of 5m history — prior sessions included for ATR warmup at the open. */
+const ATR_5M_LOOKBACK_DAYS = 7;
+
 async function fetchAtr5m(symbol: string): Promise<number> {
   const period = config.indicators.atrPeriod;
-  const needed = period + 5;
+  const minBars = period + 1;
   const end = new Date();
-  const start = new Date(end.getTime() - needed * 5 * 60 * 1000 * 2);
+  const start = new Date();
+  start.setDate(start.getDate() - ATR_5M_LOOKBACK_DAYS);
 
   const highs: number[] = [];
   const lows: number[] = [];
@@ -125,9 +129,9 @@ async function fetchAtr5m(symbol: string): Promise<number> {
     closes.push(bar.ClosePrice);
   }
 
-  if (highs.length < period + 1) {
+  if (highs.length < minBars) {
     throw new Error(
-      `${symbol}: insufficient 5m history for ATR (${highs.length} bars)`,
+      `${symbol}: insufficient 5m history for ATR (${highs.length}/${minBars} bars)`,
     );
   }
 

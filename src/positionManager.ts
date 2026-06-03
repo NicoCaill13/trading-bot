@@ -184,7 +184,12 @@ export async function handlePositionUpdate(
     return;
   }
 
-  const entryPrice = parseFloat(position.avg_entry_price);
+  // Journal entry_price (limit price submitted) is the single source of truth for
+  // profitability guards — avoids a split-referential bug where avg_entry_price
+  // (actual broker fill) diverges from the limit and causes smart-exit conditions
+  // to fire on positions that are in fact at a loss relative to the intended entry.
+  const entryPrice =
+    journalManager.getEntryPrice(symbol) ?? parseFloat(position.avg_entry_price);
   const totalQty = parseInt(position.qty, 10);
   if (totalQty <= 0) return;
 

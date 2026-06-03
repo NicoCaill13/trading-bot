@@ -2,6 +2,16 @@ export function getESTDate(): Date {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
 }
 
+/** Order failures that must not be retried on the next flush (blackout defer loop). */
+export function isNonRetryableOrderError(message: string): boolean {
+  return (
+    message.includes('insufficient 5m history for ATR') ||
+    message.includes('invalid 5m ATR value') ||
+    message.includes('no slots available') ||
+    message.includes('slot envelope insufficient')
+  );
+}
+
 export function toErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   // Axios / SDK errors expose response.data or response.status

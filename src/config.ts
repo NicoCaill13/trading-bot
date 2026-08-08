@@ -88,6 +88,10 @@ const config = {
     minFloatShares: parseIntEnv('MIN_FLOAT_SHARES', 10_000_000),
     maxFloatShares: parseIntEnv('MAX_FLOAT_SHARES', 500_000_000),
     allowedExchanges: ['NYSE', 'NASDAQ'] as readonly string[],
+    // Weinstein Phase 2 (spec §2) — SMA 150/200 + slope over N weeks (~5 sessions/week)
+    sma150Period: parseIntEnv('SMA_150_PERIOD', 150),
+    sma200Period: parseIntEnv('SMA_200_PERIOD', 200),
+    sma150SlopeWeeks: parseIntEnv('SMA_150_SLOPE_WEEKS', 8),
   },
 
   portfolio: {
@@ -262,6 +266,21 @@ const config = {
   if (s.allowedExchanges.length === 0) {
     throw new Error('[SYSTEM] screener.allowedExchanges must not be empty');
   }
+  if (s.sma150Period < 1) {
+    throw new Error(`[SYSTEM] SMA_150_PERIOD must be >= 1: ${s.sma150Period}`);
+  }
+  if (s.sma200Period < 1) {
+    throw new Error(`[SYSTEM] SMA_200_PERIOD must be >= 1: ${s.sma200Period}`);
+  }
+  if (s.sma200Period < s.sma150Period) {
+    throw new Error(
+      `[SYSTEM] SMA_200_PERIOD must be >= SMA_150_PERIOD: ` +
+      `${s.sma200Period} < ${s.sma150Period}`,
+    );
+  }
+  if (s.sma150SlopeWeeks < 1) {
+    throw new Error(`[SYSTEM] SMA_150_SLOPE_WEEKS must be >= 1: ${s.sma150SlopeWeeks}`);
+  }
 
   const pm = config.premarket;
   if (pm.minPreMarketShareVolume <= 0) {
@@ -290,6 +309,11 @@ export function getPortfolioSlotLimits(): {
   }
 
   return { coreMaxPositions: core, satelliteMaxPositions: satellite };
+}
+
+/** Trading sessions approximating N calendar weeks (5 sessions/week). */
+export function getSma150SlopeLookbackBars(): number {
+  return config.screener.sma150SlopeWeeks * 5;
 }
 
 /**

@@ -135,6 +135,12 @@ export interface WatchlistSymbol {
   floatShares?: number;
   /** Alpaca asset exchange (e.g. NYSE, NASDAQ). */
   exchange?: string;
+  /** Weinstein Phase 2 — SMA 150 daily. */
+  sma150?: number;
+  /** Weinstein Phase 2 — SMA 200 daily. */
+  sma200?: number;
+  /** SMA150[t] - SMA150[t-8w]; non-negative required. */
+  sma150Slope?: number;
 }
 
 export interface Watchlist {

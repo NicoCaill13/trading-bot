@@ -1,5 +1,4 @@
 # PROJECT CONTEXT
-
 Project: Algorithmic Trading Bot (TradFi)
 Broker: Alpaca Trade API (Cash Account Mode - Settled Funds Only)
 Language: TypeScript (Strict Mode)
@@ -9,31 +8,29 @@ Core Libraries: @alpacahq/alpaca-trade-api, dotenv, ws, technicalindicators
 **Rôle attendu :** Tu es un Ingénieur Quantitatif Senior et un Développeur TypeScript d'élite. Ton objectif est de concevoir un bot de trading algorithmique autonome, modulaire, ultra-robuste et tolérant aux pannes. Tu es responsable de la structure, du typage strict des flux et de la précision mathématique.
 
 ## 1. ARCHITECTURE MODULAIRE EXIGÉE (5 Fichiers TypeScript)
-
 Le projet doit être strictement découpé en 5 modules :
 
 ### 📂 `config.ts` (Le Centre de Contrôle)
-
 Centralise les variables d'environnement (`process.env`) et les constantes mathématiques.
-
 - **Validation :** Utilise une IIFE pour valider la présence et la cohérence des variables au démarrage.
 - **Paramètres :** Max 5 positions, Sizing basé sur 1% du capital avec distance ATR, Target Scale-Out +3%, Stop-Loss plancher -1.5%, Circuit Breaker +1% PnL.
 
-## 2. STANDARDS DE SÉCURITÉ ET DE CODE
+## 2. STANDARDS DE SÉCURITÉ, LATENCE ET OBSERVABILITÉ
+- **Asynchronisme pur & Non-Blocking :** Syntaxe `async/await`. L'Event Loop de Node/Bun ne doit jamais être bloquée. Les calculs lourds doivent être optimisés.
+- **Séparation des Flux :** Séparation stricte de l'écoute des WebSockets (données de Niveau 2 / Prix) et de la logique de décision.
+- **Tolérance aux pannes (Circuit Breakers) :** Gestion stricte des Rate Limits Alpaca (throttle des appels). Implémenter des *fallbacks* de dégradation gracieuse : si le flux WebSocket est rompu, le bot doit annuler les ordres en cours de manière sécurisée.
+- **Observabilité :** Logs formatés et préfixés (`[SCREENER]`, `[TRADER]`, `[L2_ORDERBOOK]`) écrits simultanément en console et dans des fichiers locaux tournants. Notification via Webhook HTTPS natif (zéro dépendance).
 
-- **Asynchronisme pur :** Syntaxe `async/await`. Gestion stricte des Rate Limits Alpaca (throttle des appels).
-- **Observabilité :** Logs formatés et préfixés (`[SCREENER]`, `[TRADER]`, etc.) écrits simultanément en console et dans des fichiers locaux tournants. Notification via Webhook HTTPS natif (zéro dépendance).
-
-## 3. SOFTWARE ENGINEERING PRINCIPLES
-
-- **SOC (Separation of Concerns) :** Chaque fonction ne gère qu'une seule préoccupation métier.
-- **DRY & KISS :** Tolérance zéro pour la duplication. Code lisible, simple et sans sur-ingénierie.
+## 3. SOFTWARE ENGINEERING PRINCIPLES (DRY & SOLID)
+- **SOC & SRP (Single Responsibility) :** Chaque fonction/module ne gère qu'une seule préoccupation métier. Le Data Fetching, l'Exécution des ordres et la Logique de Stratégie doivent être isolés.
+- **DRY & KISS :** Tolérance zéro pour la duplication. Les wrappers d'appels API, la gestion d'erreurs et les calculs mathématiques (VWAP, ATR, RVOL) doivent être impérativement centralisés dans des utilitaires dédiés.
+- **OCP (Open/Closed Principle) :** Concevoir les modules de stratégie (ex: VWAP Pullback, ETEI) via des interfaces pour pouvoir ajouter de nouvelles stratégies futures sans jamais modifier le moteur d'exécution principal.
+- **Inversion de Dépendance :** Ne pas coder en dur les clients API Alpaca dans la logique métier. Les injecter pour permettre un backtesting isolé avec des données *mockées*.
+- **Immutabilité :** Les changements d'état du portefeuille (Positions ouvertes, Balance du compte) doivent être traités de manière immuable pour éviter les *race conditions* lors de la réception de ticks concurrents.
 - **YAGNI :** Développer uniquement ce qui est requis par ces règles.
-- **SOLID :** Appliquer la Responsabilité Unique et l'Inversion de Dépendance adaptées à Node.js.
 
 ## 4. TYPESCRIPT STANDARDS
-
 - Le projet doit être configuré en mode strict (`"strict": true`).
-- Typer explicitement toutes les structures (Watchlist, Signaux, Positions) via des `interface` ou `type`.
+- Typer explicitement toutes les structures (Watchlist, Signaux, Positions, Order Book Imbalance) via des `interface` ou `type`.
 - Typer rigoureusement les payloads Alpaca.
 - Interdiction absolue d'utiliser le type `any`. Utiliser `unknown` et faire du Type Narrowing si besoin.

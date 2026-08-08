@@ -77,8 +77,17 @@ const config = {
     watchlistMaxSize: parseIntEnv('WATCHLIST_MAX_SIZE', 50),
     relativeStrengthLookbackDays: 20,
     volumeAverageDays: 14,
-    minClosePrice: parseFloatEnv('MIN_CLOSE_PRICE', 10),
-    minDollarVolume: parseFloatEnv('MIN_DOLLAR_VOLUME', 50_000_000),
+    // V7 liquidity defaults (spec §1) — previously 10 / 50M
+    minClosePrice: parseFloatEnv('MIN_CLOSE_PRICE', 5),
+    minDollarVolume: parseFloatEnv('MIN_DOLLAR_VOLUME', 20_000_000),
+    minAdrPct: parseFloatEnv('MIN_ADR_PCT', 4.0),
+    adrLookbackDays: parseIntEnv('ADR_LOOKBACK_DAYS', 14),
+    // Float gate requires an external provider (Alpaca assets are unreliable for float).
+    // Leave FLOAT_FILTER_ENABLED=false until Polygon/FMP/IEX Cloud is wired.
+    floatFilterEnabled: process.env.FLOAT_FILTER_ENABLED === 'true',
+    minFloatShares: parseIntEnv('MIN_FLOAT_SHARES', 10_000_000),
+    maxFloatShares: parseIntEnv('MAX_FLOAT_SHARES', 500_000_000),
+    allowedExchanges: ['NYSE', 'NASDAQ'] as readonly string[],
   },
 
   portfolio: {
@@ -90,7 +99,8 @@ const config = {
 
   premarket: {
     minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.04),
-    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 100_000),
+    // Share volume summed on 1Min bars in EST [04:00, 09:30) — previously 100k
+    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 10),
   },
 
@@ -225,6 +235,42 @@ const config = {
       `[SYSTEM] Core + Satellite slots (${slots.coreMaxPositions + slots.satelliteMaxPositions}) ` +
       `exceed MAX_POSITIONS (${r.maxPositions})`,
     );
+  }
+
+  const s = config.screener;
+  if (s.minClosePrice <= 0) {
+    throw new Error(`[SYSTEM] MIN_CLOSE_PRICE must be > 0: ${s.minClosePrice}`);
+  }
+  if (s.minDollarVolume <= 0) {
+    throw new Error(`[SYSTEM] MIN_DOLLAR_VOLUME must be > 0: ${s.minDollarVolume}`);
+  }
+  if (s.minAdrPct <= 0) {
+    throw new Error(`[SYSTEM] MIN_ADR_PCT must be > 0: ${s.minAdrPct}`);
+  }
+  if (s.adrLookbackDays < 1) {
+    throw new Error(`[SYSTEM] ADR_LOOKBACK_DAYS must be >= 1: ${s.adrLookbackDays}`);
+  }
+  if (s.minFloatShares <= 0 || s.maxFloatShares <= 0) {
+    throw new Error('[SYSTEM] MIN_FLOAT_SHARES and MAX_FLOAT_SHARES must be > 0');
+  }
+  if (s.minFloatShares >= s.maxFloatShares) {
+    throw new Error(
+      `[SYSTEM] MIN_FLOAT_SHARES must be < MAX_FLOAT_SHARES: ` +
+      `${s.minFloatShares} >= ${s.maxFloatShares}`,
+    );
+  }
+  if (s.allowedExchanges.length === 0) {
+    throw new Error('[SYSTEM] screener.allowedExchanges must not be empty');
+  }
+
+  const pm = config.premarket;
+  if (pm.minPreMarketShareVolume <= 0) {
+    throw new Error(
+      `[SYSTEM] PREMARKET_MIN_SHARE_VOLUME must be > 0: ${pm.minPreMarketShareVolume}`,
+    );
+  }
+  if (pm.minGapUpPct <= 0) {
+    throw new Error(`[SYSTEM] PREMARKET_MIN_GAP_UP_PCT must be > 0: ${pm.minGapUpPct}`);
   }
 }());
 

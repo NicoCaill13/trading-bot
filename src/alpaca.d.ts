@@ -12,6 +12,8 @@ declare module '@alpacahq/alpaca-trade-api' {
     marginable: boolean;
     status: string;
     class: string;
+    /** Venue code from Alpaca (e.g. NYSE, NASDAQ, ARCA). */
+    exchange: string;
   }
 
   // Matches the real SDK AlpacaBar (PascalCase — entityv2.d.ts)

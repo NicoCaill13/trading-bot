@@ -18,11 +18,13 @@ import {
   assessWeinsteinPhase2,
   passesWeinsteinGate,
 } from './weinstein';
-import type { Watchlist, WatchlistSymbol } from './types';
+import { detectReversalPatterns } from './patterns/reversal';
+import type { Watchlist, WatchlistSymbol, ReversalPatternSignal } from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SCREENER');
 const weinsteinLog = createLogger('WEINSTEIN');
+const patternLog = createLogger('PATTERN');
 const floatProvider = createFloatProvider();
 
 const BENCHMARK = 'SPY';
@@ -341,6 +343,41 @@ async function analyzeSymbol(
       `| slope ${weinstein.sma150Slope.toFixed(4)}`,
     );
 
+    let reversalPattern: WatchlistSymbol['reversalPattern'];
+    let reversalDetail: ReversalPatternSignal | undefined;
+    if (config.screener.patternFilterEnabled) {
+      const lookback = Math.min(config.screener.patternLookbackBars, bars.length);
+      const slice = bars.slice(-lookback);
+      const ohlcv = slice.map(b => ({
+        high: b.HighPrice,
+        low: b.LowPrice,
+        close: b.ClosePrice,
+        volume: b.Volume,
+      }));
+      const signal = detectReversalPatterns(ohlcv, {
+        pivotLeft: config.screener.patternPivotLeft,
+        pivotRight: config.screener.patternPivotRight,
+        eteiBreakoutRvol: config.screener.eteiBreakoutRvol,
+        springReclaimRvol: config.screener.springReclaimRvol,
+        springSupportTolerancePct: config.screener.springSupportTolerancePct,
+        rvolAvgDays: config.screener.patternRvolAvgDays,
+      });
+      if (signal) {
+        reversalPattern = signal.pattern;
+        reversalDetail = signal;
+        const pivots = signal.pivots.map(p => p.price.toFixed(2)).join('/');
+        patternLog.info(
+          `${ticker} PASS — ${signal.pattern} pivots ${pivots}` +
+          (signal.neckline !== undefined ? ` neckline $${signal.neckline.toFixed(2)}` : '') +
+          (signal.support !== undefined ? ` support $${signal.support.toFixed(2)}` : '') +
+          (signal.breakoutRvol !== undefined ? ` rvol ${signal.breakoutRvol.toFixed(2)}x` : '') +
+          (signal.reclaimRvol !== undefined ? ` rvol ${signal.reclaimRvol.toFixed(2)}x` : ''),
+        );
+      } else {
+        patternLog.info(`${ticker} — no reversal pattern in lookback ${lookback}`);
+      }
+    }
+
     const symbolReturn = computeReturn(bars.slice(-lookbackDays));
     const relativeVolume = computeRelativeVolume(bars, config.screener.volumeAverageDays);
     const gapUp = computeGapUp(bars);
@@ -409,6 +446,8 @@ async function analyzeSymbol(
       sma150: weinstein.sma150,
       sma200: weinstein.sma200,
       sma150Slope: weinstein.sma150Slope,
+      reversalPattern,
+      reversalDetail,
     };
   } catch (err) {
     log.warn(`${ticker}: analysis error — ${toErrorMessage(err)}`);
@@ -511,6 +550,7 @@ export async function runScreener(): Promise<Watchlist> {
       `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
       `| ADR: ${(s.adrPct ?? 0).toFixed(2)}% ` +
       `| SMA150: $${(s.sma150 ?? 0).toFixed(2)} slope: ${(s.sma150Slope ?? 0).toFixed(3)} ` +
+      `| pattern: ${s.reversalPattern ?? '-'} ` +
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
       `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
       (s.exchange ? ` | exch: ${s.exchange}` : ''),

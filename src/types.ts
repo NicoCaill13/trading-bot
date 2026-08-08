@@ -114,6 +114,24 @@ export type LiquidityRejectReason =
   | 'gap'
   | 'missing_price';
 
+/** Daily reversal structures (spec §3.A). */
+export type ReversalPattern = 'ETEI' | 'DOUBLE_BOTTOM_SPRING';
+
+export interface PivotPoint {
+  index: number;
+  price: number;
+  volume: number;
+}
+
+export interface ReversalPatternSignal {
+  pattern: ReversalPattern;
+  neckline?: number;
+  support?: number;
+  breakoutRvol?: number;
+  reclaimRvol?: number;
+  pivots: PivotPoint[];
+}
+
 export interface WatchlistSymbol {
   symbol: string;
   origin: SignalOrigin;
@@ -141,6 +159,9 @@ export interface WatchlistSymbol {
   sma200?: number;
   /** SMA150[t] - SMA150[t-8w]; non-negative required. */
   sma150Slope?: number;
+  /** Soft annotate: ETEI or Spring when detected post-Weinstein. */
+  reversalPattern?: ReversalPattern;
+  reversalDetail?: ReversalPatternSignal;
 }
 
 export interface Watchlist {

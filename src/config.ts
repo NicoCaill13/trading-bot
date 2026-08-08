@@ -92,6 +92,15 @@ const config = {
     sma150Period: parseIntEnv('SMA_150_PERIOD', 150),
     sma200Period: parseIntEnv('SMA_200_PERIOD', 200),
     sma150SlopeWeeks: parseIntEnv('SMA_150_SLOPE_WEEKS', 8),
+    // Reversal patterns (§3.A) — soft annotate post-Weinstein (no hard reject)
+    patternFilterEnabled: process.env.PATTERN_FILTER_ENABLED !== 'false',
+    patternLookbackBars: parseIntEnv('PATTERN_LOOKBACK_BARS', 90),
+    patternPivotLeft: parseIntEnv('PATTERN_PIVOT_LEFT', 3),
+    patternPivotRight: parseIntEnv('PATTERN_PIVOT_RIGHT', 3),
+    eteiBreakoutRvol: parseFloatEnv('ETEI_BREAKOUT_RVOL', 1.5),
+    springReclaimRvol: parseFloatEnv('SPRING_RECLAIM_RVOL', 1.5),
+    springSupportTolerancePct: parseFloatEnv('SPRING_SUPPORT_TOLERANCE_PCT', 0.005),
+    patternRvolAvgDays: parseIntEnv('PATTERN_RVOL_AVG_DAYS', 14),
   },
 
   portfolio: {
@@ -280,6 +289,29 @@ const config = {
   }
   if (s.sma150SlopeWeeks < 1) {
     throw new Error(`[SYSTEM] SMA_150_SLOPE_WEEKS must be >= 1: ${s.sma150SlopeWeeks}`);
+  }
+  if (s.patternPivotLeft < 1 || s.patternPivotRight < 1) {
+    throw new Error('[SYSTEM] PATTERN_PIVOT_LEFT/RIGHT must be >= 1');
+  }
+  const minPatternLookback = s.patternPivotLeft + s.patternPivotRight + 5;
+  if (s.patternLookbackBars < minPatternLookback) {
+    throw new Error(
+      `[SYSTEM] PATTERN_LOOKBACK_BARS must be >= ${minPatternLookback}: ${s.patternLookbackBars}`,
+    );
+  }
+  if (s.eteiBreakoutRvol <= 0) {
+    throw new Error(`[SYSTEM] ETEI_BREAKOUT_RVOL must be > 0: ${s.eteiBreakoutRvol}`);
+  }
+  if (s.springReclaimRvol <= 0) {
+    throw new Error(`[SYSTEM] SPRING_RECLAIM_RVOL must be > 0: ${s.springReclaimRvol}`);
+  }
+  if (s.springSupportTolerancePct <= 0 || s.springSupportTolerancePct > 0.05) {
+    throw new Error(
+      `[SYSTEM] SPRING_SUPPORT_TOLERANCE_PCT out of bounds (0–5%]: ${s.springSupportTolerancePct}`,
+    );
+  }
+  if (s.patternRvolAvgDays < 1) {
+    throw new Error(`[SYSTEM] PATTERN_RVOL_AVG_DAYS must be >= 1: ${s.patternRvolAvgDays}`);
   }
 
   const pm = config.premarket;

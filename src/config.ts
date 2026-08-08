@@ -36,8 +36,13 @@ const config = {
 
   risk: {
     maxPositions: parseIntEnv('MAX_POSITIONS', 5),
+    // Deprecated for sizing (V7 uses riskPerTradePct). Kept for portfolio share helpers / observability.
     maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.20),
     riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.01),
+    minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
+    atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.015),
+    atrTrailMultiplier: parseFloatEnv('ATR_TRAIL_MULTIPLIER', 2),
+    timeStopMinutes: parseIntEnv('TIME_STOP_MINUTES', 45),
     atrStopMultiplier: parseFloatEnv('ATR_STOP_MULTIPLIER', 1.5),
     hardStopFloorPct: parseFloatEnv('HARD_STOP_FLOOR_PCT', 0.015),
     scaleOutTargetPctCore: parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.05),
@@ -133,7 +138,7 @@ const config = {
     eodSweepHour: 15,
     eodSweepMinute: 45,
     hardCloseHour: 15,
-    hardCloseMinute: 58,
+    hardCloseMinute: 55,
     eodReportHour: 16,
     eodReportMinute: 5,
     postMortemHour: 16,
@@ -167,6 +172,18 @@ const config = {
 
   if (r.riskPerTradePct <= 0 || r.riskPerTradePct > 0.05)
     throw new Error(`[SYSTEM] RISK_PER_TRADE_PCT must be between 0 and 5%: ${r.riskPerTradePct}`);
+
+  if (r.minRiskRewardRatio < 1 || r.minRiskRewardRatio > 10)
+    throw new Error(`[SYSTEM] MIN_RISK_REWARD_RATIO out of bounds (1–10): ${r.minRiskRewardRatio}`);
+
+  if (r.atrTrailTriggerPct <= 0 || r.atrTrailTriggerPct > 0.1)
+    throw new Error(`[SYSTEM] ATR_TRAIL_TRIGGER_PCT out of bounds (0–10%): ${r.atrTrailTriggerPct}`);
+
+  if (r.atrTrailMultiplier < 1 || r.atrTrailMultiplier > 5)
+    throw new Error(`[SYSTEM] ATR_TRAIL_MULTIPLIER out of bounds (1–5): ${r.atrTrailMultiplier}`);
+
+  if (r.timeStopMinutes < 5 || r.timeStopMinutes > 240)
+    throw new Error(`[SYSTEM] TIME_STOP_MINUTES out of bounds (5–240): ${r.timeStopMinutes}`);
 
   if (r.maxPositions < 1 || r.maxPositions > 20)
     throw new Error(`[SYSTEM] MAX_POSITIONS must be between 1 and 20: ${r.maxPositions}`);
@@ -267,8 +284,9 @@ export function getTimedecaySlotLimits(
 }
 
 /**
- * CTPO slot equiparity: each position consumes exactly 1/maxPositions of total equity.
- * Core and Satellite use the same envelope — tier is for routing/observability only.
+ * @deprecated V7 sizes by riskPerTradePct (1% equity / stop distance), not CTPO slots.
+ * Retained for observability / legacy callers that still reason in equal slot shares.
+ * Position count remains capped by maxPositions.
  */
 export function getSlotCapitalShare(): number {
   return 1 / config.risk.maxPositions;

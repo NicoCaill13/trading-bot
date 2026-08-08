@@ -399,15 +399,16 @@ function computeMarketableLimitPrice(askPrice: number): number {
 }
 
 /**
- * Bracket order on entry: aggressive marketable limit + stop-loss.
+ * Bracket order on entry: aggressive marketable limit + stop-loss + take-profit (R:R).
  * Core entries respect opening blackout; Satellite (ORB) may enter during blackout.
  */
 export async function placeBracketOrder(
   symbol: string,
   qty: number,
-  vwap: number,
+  _vwap: number,
   signalPrice: number,
   stopLossPrice: number,
+  takeProfitPrice: number,
   tier: SignalTier = 'core',
   prefetchedAskPrice?: number,
 ): Promise<AlpacaOrder> {
@@ -452,11 +453,7 @@ export async function placeBracketOrder(
     );
   }
 
-  // order_class 'oto' (One-Triggers-Other): when the entry fills, the stop-loss
-  // child order is automatically placed. Take-profit is handled manually by
-  // handlePositionUpdate (+3% scale-out + trailing stop) — no take_profit leg needed.
-  // 'bracket' requires BOTH stop_loss and take_profit; using it without take_profit
-  // causes an unconditional 422.
+  // order_class 'bracket': entry + stop_loss + take_profit (V7 R:R objective).
   const orderParams: AlpacaOrderParams = {
     symbol,
     qty: String(qty),
@@ -464,16 +461,19 @@ export async function placeBracketOrder(
     type: 'limit',
     time_in_force: 'day',
     limit_price: String(limitPrice),
-    order_class: 'oto',
+    order_class: 'bracket',
     stop_loss: {
       stop_price: String(parseFloat(stopLossPrice.toFixed(2))),
+    },
+    take_profit: {
+      limit_price: String(parseFloat(takeProfitPrice.toFixed(2))),
     },
   };
 
   log.info(
-    `Marketable limit entry [${tier}] — ${symbol} qty:${qty} ` +
+    `Bracket entry [${tier}] — ${symbol} qty:${qty} ` +
     `limit:$${limitPrice.toFixed(2)} (ask $${liveAskPrice.toFixed(2)} × ${config.entry.marketableLimitVwapMultiplier}) ` +
-    `stop-loss:$${stopLossPrice.toFixed(2)}`,
+    `stop-loss:$${stopLossPrice.toFixed(2)} take-profit:$${takeProfitPrice.toFixed(2)}`,
   );
 
   const order = await enqueueOrder(orderParams);
@@ -546,6 +546,47 @@ export async function replaceWithTrailingStop(
 
   log.info(
     `Trailing stop activated — ${symbol} ${(trailPercent * 100).toFixed(2)}% ` +
+    `on ${remainingQty} shares`,
+  );
+  return enqueueOrder(orderParams);
+}
+
+/**
+ * Cancels open orders, then places a dollar trailing stop (Alpaca trail_price).
+ * Used for V7 ATR trail: trailDollars = atrTrailMultiplier × ATR_5m.
+ */
+export async function replaceWithAtrTrailingStop(
+  symbol: string,
+  trailDollars: number,
+): Promise<AlpacaOrder | null> {
+  if (trailDollars <= 0) {
+    throw new Error(`${symbol}: ATR trail dollars must be > 0 (got ${trailDollars})`);
+  }
+
+  await cancelOrdersForSymbol(symbol);
+
+  let position: AlpacaPosition;
+  try {
+    position = await alpaca.getPosition(symbol);
+  } catch {
+    log.info(`${symbol}: no position found for ATR trailing stop`);
+    return null;
+  }
+
+  const remainingQty = parseInt(position.qty, 10);
+  if (remainingQty <= 0) return null;
+
+  const orderParams: AlpacaOrderParams = {
+    symbol,
+    qty: String(remainingQty),
+    side: 'sell',
+    type: 'trailing_stop',
+    time_in_force: 'gtc',
+    trail_price: String(parseFloat(trailDollars.toFixed(2))),
+  };
+
+  log.info(
+    `ATR trailing stop activated — ${symbol} trail_price:$${trailDollars.toFixed(2)} ` +
     `on ${remainingQty} shares`,
   );
   return enqueueOrder(orderParams);

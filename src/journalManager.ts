@@ -256,6 +256,15 @@ export function getEntryPrice(symbol: string): number | null {
   return openRecords.get(symbol)?.entry_price ?? null;
 }
 
+export function getEntryTime(symbol: string): string | null {
+  return openRecords.get(symbol)?.entry_time ?? null;
+}
+
+/** MFE as percentage points (e.g. 1.5 means +1.5%). */
+export function getMfePercent(symbol: string): number | null {
+  return openRecords.get(symbol)?.mfe_percent ?? null;
+}
+
 export function getClosedRecords(): TradeRecord[] {
   return [...closedRecords];
 }

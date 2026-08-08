@@ -971,8 +971,8 @@ async function executeSignalsForTier(
       const allocation = await riskManager.getPortfolioAllocation(tier, enteredByTier);
       if (!allocation.canOpen) {
         log.warn(
-          `${symbol}: ${tier} bucket capital exhausted ` +
-          `($${allocation.deployed.toFixed(0)}/$${allocation.maxCapital.toFixed(0)}) — skipped`,
+          `${symbol}: no open slots ` +
+          `(deployed $${allocation.deployed.toFixed(0)} / equity $${allocation.totalCapital.toFixed(0)}) — skipped`,
         );
         continue;
       }
@@ -994,7 +994,7 @@ async function executeSignalsForTier(
         continue;
       }
 
-      const { qty, stopLossPrice, atr } = await riskManager.computePositionSize(
+      const { qty, stopLossPrice, takeProfitPrice, atr } = await riskManager.computePositionSize(
         symbol,
         referencePrice,
         settledCash,
@@ -1094,6 +1094,7 @@ async function executeSignalsForTier(
         vwap,
         referencePrice,
         stopLossPrice,
+        takeProfitPrice,
         tier,
         referencePrice,
       );

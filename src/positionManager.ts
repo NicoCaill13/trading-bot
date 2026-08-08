@@ -3,10 +3,12 @@ import alpaca from './alpacaClient';
 import config from './config';
 import * as trader from './trader';
 import * as journalManager from './journalManager';
+import { fetchAtr5m } from './atr5m';
 import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
 import { sendTelegramAlert, formatExitAlert } from './notificationManager';
-import type { BarData, SignalTier } from './types';
+import { shouldActivateAtrTrail, shouldTriggerTimeStop } from './exitPredicates';
+import type { BarData, ExitReason, SignalTier } from './types';
 import type { AlpacaPosition } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('POSITION_MANAGER');
@@ -15,6 +17,7 @@ const scaledOutPositions = new Set<string>();
 const volumeExhaustionStreak = new Map<string, number>();
 const volumeExhaustionTrailApplied = new Set<string>();
 const afternoonTrailApplied = new Set<string>();
+const atrTrailApplied = new Set<string>();
 const externalExitNotified = new Set<string>();
 const sessionExitedSymbols = new Set<string>();
 
@@ -49,6 +52,7 @@ export function resetSessionState(): void {
   volumeExhaustionStreak.clear();
   volumeExhaustionTrailApplied.clear();
   afternoonTrailApplied.clear();
+  atrTrailApplied.clear();
   externalExitNotified.clear();
   sessionExitedSymbols.clear();
 }
@@ -120,7 +124,7 @@ function resolveEffectiveTargetPct(
 async function executeFullMarketExit(
   symbol: string,
   position: AlpacaPosition,
-  exitReason: 'rsi-overbought-exit',
+  exitReason: ExitReason,
   logReason: string,
 ): Promise<boolean> {
   const qty = parseInt(position.qty, 10);
@@ -162,9 +166,29 @@ async function applyTightTrailing(
   }
 }
 
+async function applyAtrTrailing(symbol: string, atrHint: number | null): Promise<void> {
+  if (atrTrailApplied.has(symbol)) return;
+
+  try {
+    const atr = atrHint !== null && atrHint > 0
+      ? atrHint
+      : await fetchAtr5m(symbol);
+    const trailDollars = atr * config.risk.atrTrailMultiplier;
+    await trader.replaceWithAtrTrailingStop(symbol, trailDollars);
+    atrTrailApplied.add(symbol);
+    log.info(
+      `${symbol}: ATR trail activated — ${config.risk.atrTrailMultiplier}×ATR(5m)=` +
+      `$${trailDollars.toFixed(2)} (MFE ≥ ${(config.risk.atrTrailTriggerPct * 100).toFixed(1)}%)`,
+    );
+    void sendTelegramAlert(formatExitAlert(symbol, 'ATR Trailing Stop'));
+  } catch (err) {
+    log.error(`${symbol}: ATR trail failed — ${toErrorMessage(err)}`);
+  }
+}
+
 /**
- * Dynamic exit engine — evaluated on each 1-min bar close before fixed TP targets.
- * Order: Smart Exit RSI → Volume Exhaustion → Time-Decay afternoon trail → ATR/Fixed TP scale-out.
+ * Dynamic exit engine — evaluated on each 1-min bar close.
+ * Order: Time-stop → ATR trail (+1.5% MFE) → RSI / volume → legacy scale-out.
  */
 export async function handlePositionUpdate(
   symbol: string,
@@ -197,7 +221,31 @@ export async function handlePositionUpdate(
   const estNow = getESTDate();
   const { bar1m, oneMinBars, atrAtEntry } = context;
 
-  // C — RSI Overbought (full exit)
+  // 1 — Time-stop: stagnation >= N minutes without positive MFE
+  const entryTime = journalManager.getEntryTime(symbol);
+  const mfePercent = journalManager.getMfePercent(symbol);
+  if (
+    entryTime !== null &&
+    shouldTriggerTimeStop(
+      entryTime,
+      Date.now(),
+      mfePercent,
+      config.risk.timeStopMinutes,
+    )
+  ) {
+    await executeFullMarketExit(symbol, position, 'time-stop', 'time-stop');
+    return;
+  }
+
+  // 2 — ATR trailing stop once MFE / unrealized >= trigger (default +1.5%)
+  if (
+    shouldActivateAtrTrail(unrealizedPct, config.risk.atrTrailTriggerPct) &&
+    !atrTrailApplied.has(symbol)
+  ) {
+    await applyAtrTrailing(symbol, atrAtEntry);
+  }
+
+  // 3 — RSI Overbought (full exit)
   if (unrealizedPct > config.risk.smartExitMinPnlPct) {
     const closes = oneMinBars.map(b => b.close);
     const rsi = computeRsi(closes);
@@ -207,7 +255,7 @@ export async function handlePositionUpdate(
     }
   }
 
-  // D — Volume Exhaustion (hyper-tight trailing)
+  // 4 — Volume Exhaustion (hyper-tight trailing)
   if (unrealizedPct > config.risk.volumeExhaustionMinPnlPct) {
     const vma10 = computeVma10(oneMinBars.slice(0, -1));
     if (vma10 !== null && vma10 > 0) {
@@ -231,9 +279,9 @@ export async function handlePositionUpdate(
     volumeExhaustionStreak.set(symbol, 0);
   }
 
-  if (scaledOutPositions.has(symbol)) return;
+  if (scaledOutPositions.has(symbol) || atrTrailApplied.has(symbol)) return;
 
-  // B — Afternoon time-decay: no fixed TP, trail once PnL > +1.5%
+  // 5 — Afternoon time-decay: no fixed TP, trail once PnL > +1.5% (legacy secondary)
   const decayWindow = resolveTimeDecayWindow(estNow);
   if (
     decayWindow === 'afternoon' &&
@@ -248,7 +296,7 @@ export async function handlePositionUpdate(
     return;
   }
 
-  // A — ATR dynamic TP (with time-decay halving) then fixed 5%/7% fallback
+  // 6 — Legacy ATR / fixed 5%/7% scale-out (secondary to V7 bracket TP + ATR trail)
   const atr = atrAtEntry;
   if (atr === null || atr <= 0) return;
 
@@ -283,4 +331,3 @@ export async function handlePositionUpdate(
     log.error(`${symbol}: dynamic scale-out failed — ${toErrorMessage(err)}`);
   }
 }
-

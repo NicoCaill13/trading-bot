@@ -82,6 +82,7 @@ declare module '@alpacahq/alpaca-trade-api' {
     stop_price?: string;
     limit_price?: string;
     trail_percent?: string;
+    trail_price?: string;
     order_class?: string;
     stop_loss?: { stop_price: string };
     take_profit?: { limit_price: string };

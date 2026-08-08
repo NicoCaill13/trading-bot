@@ -31,6 +31,7 @@ export type ExitReason =
   | 'trailing-stop'
   | 'rsi-overbought-exit'
   | 'volume-exhaustion-trailing'
+  | 'time-stop'
   | 'eod-liquidation'
   | 'hard-close'
   | 'circuit-breaker'
@@ -141,6 +142,7 @@ export interface OrbState {
 export interface PositionSizeResult {
   qty: number;
   stopLossPrice: number;
+  takeProfitPrice: number;
   atr: number;
 }
 

@@ -114,7 +114,9 @@ export function humanizeExitReason(reason: string): string {
   const labels: Record<string, string> = {
     'eod-liquidation': 'EOD Sweep (sous VWAP / perte)',
     'eod-no-session-data': 'EOD Sweep (données session manquantes)',
+    'hard-close-15h55': 'Hard Close 15h55',
     'hard-close-15h58': 'Hard Close 15h58',
+    'time-stop': 'Time-Stop (stagnation 45m)',
     'circuit-breaker-daily-target': 'Circuit Breaker (+1% PnL)',
     'daily-drawdown-kill': 'Daily Kill-Switch (-1.5% PnL)',
     'RSI_OVERBOUGHT_EXIT': 'Smart Exit RSI (surachat)',

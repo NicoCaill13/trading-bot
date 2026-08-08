@@ -131,6 +131,9 @@ Les paramètres de stratégie sont **optionnels** ; les valeurs par défaut sont
 | `FLOAT_FILTER_ENABLED` | `false` | Active le filtre float (provider externe requis) |
 | `MIN_FLOAT_SHARES` | `10000000` | Float min (si filtre actif) |
 | `MAX_FLOAT_SHARES` | `500000000` | Float max (si filtre actif) |
+| `SMA_150_PERIOD` | `150` | SMA 150 daily (Weinstein Phase 2) |
+| `SMA_200_PERIOD` | `200` | SMA 200 daily |
+| `SMA_150_SLOPE_WEEKS` | `8` | Fenêtre pente SMA150 (`× 5` sessions) ; accept si slope ≥ 0 |
 
 Univers restreint aux exchanges **NYSE** et **NASDAQ**. Le float n’est pas fourni de façon fiable par Alpaca : laisser `FLOAT_FILTER_ENABLED=false` tant qu’un provider (Polygon / FMP / IEX Cloud) n’est pas branché derrière `src/floatProvider.ts`.
 
@@ -216,7 +219,7 @@ Exécuté automatiquement si `data/watchlist.json` est absent, manuellement via 
 
 1. **Univers dynamique** : actifs US `active`, `tradable`, `marginable`, exchanges **NYSE** / **NASDAQ**.
 2. **Pré-filtre liquidité** (snapshots) : clôture ≥ **5 $**, dollar volume ≥ **20 M$**.
-3. **Analyse journalière** : ADR 14j > **4 %**, force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×** (float optionnel via `FLOAT_FILTER_ENABLED`).
+3. **Analyse journalière** : ADR 14j > **4 %**, Weinstein Phase 2 (close > SMA150 & SMA200, pente SMA150 8 semaines ≥ 0), force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×** (float optionnel via `FLOAT_FILTER_ENABLED`).
 4. Tri par alpha, export des **50** meilleurs → `data/watchlist.json` (`source: core`).
 
 ---
@@ -352,6 +355,7 @@ trading-bot/
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation
 │   ├── screener.ts           # Screener Core (V1)
 │   ├── screenerMath.ts       # Pure liquidity / ADR gates
+│   ├── weinstein.ts          # Pure Weinstein Phase 2 (SMA 150/200 + slope)
 │   ├── premarket_screener.ts # Screener Satellite (V2) → signalQueue
 │   ├── floatProvider.ts      # Float port (disabled until external vendor)
 │   ├── signalQueue.ts        # Files prioritaires Core / Satellite

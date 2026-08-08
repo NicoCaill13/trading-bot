@@ -1,6 +1,6 @@
 import path from 'path';
 import alpaca from './alpacaClient';
-import config from './config';
+import config, { getSma150SlopeLookbackBars } from './config';
 import { createFloatProvider, isFloatFilterActive } from './floatProvider';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
@@ -14,15 +14,29 @@ import {
   passesDollarVolume,
   passesFloatGate,
 } from './screenerMath';
+import {
+  assessWeinsteinPhase2,
+  passesWeinsteinGate,
+} from './weinstein';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SCREENER');
+const weinsteinLog = createLogger('WEINSTEIN');
 const floatProvider = createFloatProvider();
 
 const BENCHMARK = 'SPY';
 const SNAPSHOT_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 5;
+
+function dailyBarsNeeded(lookbackDays: number): number {
+  const slopeBars = getSma150SlopeLookbackBars();
+  return Math.max(
+    lookbackDays + config.screener.volumeAverageDays + 2,
+    config.screener.adrLookbackDays,
+    config.screener.sma200Period + slopeBars,
+  );
+}
 
 export interface UniverseAsset {
   symbol: string;
@@ -225,10 +239,7 @@ async function analyzeSymbol(
   }
 
   try {
-    const needed = Math.max(
-      lookbackDays + config.screener.volumeAverageDays + 2,
-      config.screener.adrLookbackDays,
-    );
+    const needed = dailyBarsNeeded(lookbackDays);
     const bars = await fetchDailyBars(ticker, needed);
 
     if (bars.length < needed) {
@@ -297,6 +308,39 @@ async function analyzeSymbol(
       floatShares = float;
     }
 
+    const closes = bars.map(b => b.ClosePrice);
+    const weinstein = assessWeinsteinPhase2(closes, {
+      sma150Period: config.screener.sma150Period,
+      sma200Period: config.screener.sma200Period,
+      slopeLookbackBars: getSma150SlopeLookbackBars(),
+    });
+    if (weinstein === null) {
+      weinsteinLog.info(
+        `${ticker} REJECTED — insufficient history for SMA150/200 + slope ` +
+        `(need ${config.screener.sma200Period + getSma150SlopeLookbackBars()} closes)`,
+      );
+      return null;
+    }
+    if (!passesWeinsteinGate(weinstein)) {
+      const reasons: string[] = [];
+      if (!weinstein.priceAboveSmas) {
+        reasons.push(
+          `close $${weinstein.lastClose.toFixed(2)} <= SMA150 $${weinstein.sma150.toFixed(2)} ` +
+          `or SMA200 $${weinstein.sma200.toFixed(2)}`,
+        );
+      }
+      if (!weinstein.slopeNonNegative) {
+        reasons.push(`SMA150 slope ${weinstein.sma150Slope.toFixed(4)} < 0`);
+      }
+      weinsteinLog.info(`${ticker} REJECTED — ${reasons.join('; ')}`);
+      return null;
+    }
+    weinsteinLog.info(
+      `${ticker} PASS — close $${weinstein.lastClose.toFixed(2)} ` +
+      `> SMA150 $${weinstein.sma150.toFixed(2)} & SMA200 $${weinstein.sma200.toFixed(2)} ` +
+      `| slope ${weinstein.sma150Slope.toFixed(4)}`,
+    );
+
     const symbolReturn = computeReturn(bars.slice(-lookbackDays));
     const relativeVolume = computeRelativeVolume(bars, config.screener.volumeAverageDays);
     const gapUp = computeGapUp(bars);
@@ -362,6 +406,9 @@ async function analyzeSymbol(
       adrPct,
       floatShares,
       exchange,
+      sma150: weinstein.sma150,
+      sma200: weinstein.sma200,
+      sma150Slope: weinstein.sma150Slope,
     };
   } catch (err) {
     log.warn(`${ticker}: analysis error — ${toErrorMessage(err)}`);
@@ -396,10 +443,7 @@ async function throttledMap<T, R>(
 
 async function computeBenchmarkReturn(lookbackDays: number): Promise<number | null> {
   log.info(`Fetching benchmark data for ${BENCHMARK}...`);
-  const needed = Math.max(
-    lookbackDays + config.screener.volumeAverageDays + 2,
-    config.screener.adrLookbackDays,
-  );
+  const needed = dailyBarsNeeded(lookbackDays);
   const bars = await fetchDailyBars(BENCHMARK, needed);
   return computeReturn(bars.slice(-lookbackDays));
 }
@@ -466,6 +510,7 @@ export async function runScreener(): Promise<Watchlist> {
       `  ${s.symbol.padEnd(6)} | alpha: ${((s.relativeReturn ?? 0) * 100).toFixed(2)}% ` +
       `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
       `| ADR: ${(s.adrPct ?? 0).toFixed(2)}% ` +
+      `| SMA150: $${(s.sma150 ?? 0).toFixed(2)} slope: ${(s.sma150Slope ?? 0).toFixed(3)} ` +
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
       `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
       (s.exchange ? ` | exch: ${s.exchange}` : ''),

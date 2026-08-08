@@ -100,6 +100,20 @@ export interface PendingSignal {
   fibLevels: FibLevels | null;
 }
 
+/** Motifs de rejet liquidité / univers (logs screener). */
+export type LiquidityRejectReason =
+  | 'exchange'
+  | 'price'
+  | 'dollar_volume'
+  | 'no_bar'
+  | 'missing_ticker'
+  | 'adr'
+  | 'float'
+  | 'insufficient_history'
+  | 'premarket_volume'
+  | 'gap'
+  | 'missing_price';
+
 export interface WatchlistSymbol {
   symbol: string;
   origin: SignalOrigin;
@@ -115,6 +129,12 @@ export interface WatchlistSymbol {
   lastOpen?: number;
   preMarketGapPct?: number;
   catalystScore?: number;
+  /** Average Daily Range % over screener.adrLookbackDays (Core). */
+  adrPct?: number;
+  /** Free float shares when float filter provider is available. */
+  floatShares?: number;
+  /** Alpaca asset exchange (e.g. NYSE, NASDAQ). */
+  exchange?: string;
 }
 
 export interface Watchlist {

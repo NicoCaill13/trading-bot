@@ -1,25 +1,39 @@
-import fs from 'fs/promises';
 import path from 'path';
 import alpaca from './alpacaClient';
 import config from './config';
+import { createFloatProvider, isFloatFilterActive } from './floatProvider';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
+import {
+  computeAdrPct,
+  isAllowedExchange,
+  passesAdrGate,
+  passesClosePrice,
+  passesDollarVolume,
+  passesFloatGate,
+} from './screenerMath';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SCREENER');
+const floatProvider = createFloatProvider();
 
 const BENCHMARK = 'SPY';
 const SNAPSHOT_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 5;
 
+export interface UniverseAsset {
+  symbol: string;
+  exchange: string;
+}
+
 // ---------------------------------------------------------------------------
 // 1. Dynamic universe
 // ---------------------------------------------------------------------------
 
-export async function getDynamicUniverse(): Promise<string[]> {
+export async function getDynamicUniverseAssets(): Promise<UniverseAsset[]> {
   log.info('Fetching dynamic universe from Alpaca...');
 
   const assets = await alpaca.getAssets({
@@ -27,19 +41,40 @@ export async function getDynamicUniverse(): Promise<string[]> {
     asset_class: 'us_equity',
   });
 
-  const filtered = assets.filter(
-    a => a.tradable &&
-      a.marginable &&
-      !a.symbol.includes('.') &&
-      !a.symbol.includes('/'),
-  );
+  let rejectedExchange = 0;
+  let rejectedDirty = 0;
+  let rejectedNotTradable = 0;
+
+  const filtered: UniverseAsset[] = [];
+
+  for (const a of assets) {
+    if (!a.tradable || !a.marginable) {
+      rejectedNotTradable++;
+      continue;
+    }
+    if (a.symbol.includes('.') || a.symbol.includes('/')) {
+      rejectedDirty++;
+      continue;
+    }
+    if (!isAllowedExchange(a.exchange ?? '', config.screener.allowedExchanges)) {
+      rejectedExchange++;
+      continue;
+    }
+    filtered.push({ symbol: a.symbol, exchange: a.exchange });
+  }
 
   log.info(
     `Raw universe: ${assets.length} assets | ` +
-    `${filtered.length} after filtering (tradable + marginable + clean symbol)`,
+    `${filtered.length} after filtering (tradable + marginable + clean + exchange) | ` +
+    `rejects exchange=${rejectedExchange} dirty=${rejectedDirty} not_tradable=${rejectedNotTradable}`,
   );
 
-  return filtered.map(a => a.symbol);
+  return filtered;
+}
+
+export async function getDynamicUniverse(): Promise<string[]> {
+  const assets = await getDynamicUniverseAssets();
+  return assets.map(a => a.symbol);
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +89,10 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
   );
 
   const qualified: string[] = [];
+  let rejectedPrice = 0;
+  let rejectedDv = 0;
+  let rejectedNoBar = 0;
+  let rejectedMissingTicker = 0;
 
   for (let i = 0; i < symbols.length; i += SNAPSHOT_BATCH_SIZE) {
     const batch = symbols.slice(i, i + SNAPSHOT_BATCH_SIZE);
@@ -66,13 +105,22 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
       for (const snap of snapshots) {
         // DailyBar preferred; fall back to PrevDailyBar when market is closed
         const bar = snap.DailyBar ?? snap.PrevDailyBar;
-        if (!bar) continue;
+        if (!bar) {
+          rejectedNoBar++;
+          continue;
+        }
 
         const close = bar.ClosePrice;
         const volume = bar.Volume;
 
-        if (close < config.screener.minClosePrice) continue;
-        if (close * volume < config.screener.minDollarVolume) continue;
+        if (!passesClosePrice(close, config.screener.minClosePrice)) {
+          rejectedPrice++;
+          continue;
+        }
+        if (!passesDollarVolume(close, volume, config.screener.minDollarVolume)) {
+          rejectedDv++;
+          continue;
+        }
 
         // SDK may expose ticker as Symbol (typed) or symbol (JSON camelCase)
         const ticker =
@@ -81,6 +129,7 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
           bar.Symbol ??
           (bar as { symbol?: string }).symbol;
         if (!ticker) {
+          rejectedMissingTicker++;
           log.warn('Snapshot skipped — missing ticker on snapshot/bar payload');
           continue;
         }
@@ -98,7 +147,11 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
     }
   }
 
-  log.info(`Pre-filter done: ${qualified.length}/${symbols.length} symbols retained`);
+  log.info(
+    `Pre-filter done: ${qualified.length}/${symbols.length} retained | ` +
+    `rejects price=${rejectedPrice} dollar_volume=${rejectedDv} ` +
+    `no_bar=${rejectedNoBar} missing_ticker=${rejectedMissingTicker}`,
+  );
 
   return qualified;
 }
@@ -161,6 +214,7 @@ async function analyzeSymbol(
   symbol: string,
   benchmarkReturn: number,
   lookbackDays: number,
+  exchange: string | undefined,
 ): Promise<WatchlistSymbol | null> {
   const ticker =
     typeof symbol === 'string' && symbol.trim().length > 0 ? symbol.trim() : null;
@@ -171,7 +225,10 @@ async function analyzeSymbol(
   }
 
   try {
-    const needed = lookbackDays + config.screener.volumeAverageDays + 2;
+    const needed = Math.max(
+      lookbackDays + config.screener.volumeAverageDays + 2,
+      config.screener.adrLookbackDays,
+    );
     const bars = await fetchDailyBars(ticker, needed);
 
     if (bars.length < needed) {
@@ -187,7 +244,7 @@ async function analyzeSymbol(
     const lastVolume = lastBar.Volume;
 
     // Double liquidity check on actual historical data
-    if (lastClose < config.screener.minClosePrice) {
+    if (!passesClosePrice(lastClose, config.screener.minClosePrice)) {
       log.info(
         `${ticker} REJECTED — price $${lastClose.toFixed(2)} ` +
         `below $${config.screener.minClosePrice} floor`,
@@ -196,12 +253,48 @@ async function analyzeSymbol(
     }
 
     const dv = lastClose * lastVolume;
-    if (dv < config.screener.minDollarVolume) {
+    if (!passesDollarVolume(lastClose, lastVolume, config.screener.minDollarVolume)) {
       log.info(
-        `${symbol.padEnd(6)} REJECTED — dollar volume $${(dv / 1_000_000).toFixed(1)}M ` +
+        `${ticker} REJECTED — dollar volume $${(dv / 1_000_000).toFixed(1)}M ` +
         `below $${(config.screener.minDollarVolume / 1_000_000).toFixed(0)}M threshold`,
       );
       return null;
+    }
+
+    const adrPct = computeAdrPct(
+      bars.map(b => ({ high: b.HighPrice, low: b.LowPrice, close: b.ClosePrice })),
+      config.screener.adrLookbackDays,
+    );
+    if (adrPct === null) {
+      log.info(
+        `${ticker} REJECTED — ADR unavailable ` +
+        `(need ${config.screener.adrLookbackDays} daily bars)`,
+      );
+      return null;
+    }
+    if (!passesAdrGate(adrPct, config.screener.minAdrPct)) {
+      log.info(
+        `${ticker} REJECTED — ADR ${adrPct.toFixed(2)}% ` +
+        `<= ${config.screener.minAdrPct.toFixed(1)}% floor`,
+      );
+      return null;
+    }
+
+    let floatShares: number | undefined;
+    if (isFloatFilterActive()) {
+      const float = await floatProvider.getFloatShares(ticker);
+      if (float === null) {
+        log.info(`${ticker} REJECTED — float unavailable (provider returned null)`);
+        return null;
+      }
+      if (!passesFloatGate(float, config.screener.minFloatShares, config.screener.maxFloatShares)) {
+        log.info(
+          `${ticker} REJECTED — float ${float} outside ` +
+          `[${config.screener.minFloatShares}, ${config.screener.maxFloatShares}]`,
+        );
+        return null;
+      }
+      floatShares = float;
     }
 
     const symbolReturn = computeReturn(bars.slice(-lookbackDays));
@@ -266,6 +359,9 @@ async function analyzeSymbol(
       dollarVolume: lastClose * lastVolume,
       lastClose,
       lastOpen: lastBar.OpenPrice,
+      adrPct,
+      floatShares,
+      exchange,
     };
   } catch (err) {
     log.warn(`${ticker}: analysis error — ${toErrorMessage(err)}`);
@@ -300,7 +396,10 @@ async function throttledMap<T, R>(
 
 async function computeBenchmarkReturn(lookbackDays: number): Promise<number | null> {
   log.info(`Fetching benchmark data for ${BENCHMARK}...`);
-  const needed = lookbackDays + config.screener.volumeAverageDays + 2;
+  const needed = Math.max(
+    lookbackDays + config.screener.volumeAverageDays + 2,
+    config.screener.adrLookbackDays,
+  );
   const bars = await fetchDailyBars(BENCHMARK, needed);
   return computeReturn(bars.slice(-lookbackDays));
 }
@@ -313,7 +412,9 @@ export async function runScreener(): Promise<Watchlist> {
   log.info('Starting post-session screening...');
   const lookbackDays = config.screener.relativeStrengthLookbackDays;
 
-  const rawUniverse = await getDynamicUniverse();
+  const universeAssets = await getDynamicUniverseAssets();
+  const exchangeBySymbol = new Map(universeAssets.map(a => [a.symbol, a.exchange]));
+  const rawUniverse = universeAssets.map(a => a.symbol);
 
   const liquidUniverse = await preFilterByLiquidity(rawUniverse);
 
@@ -347,7 +448,7 @@ export async function runScreener(): Promise<Watchlist> {
   log.info(`Full analysis on ${liquidUniverse.length} qualified symbols...`);
   const candidates = await throttledMap(
     liquidUniverse,
-    symbol => analyzeSymbol(symbol, benchmarkReturn, lookbackDays),
+    symbol => analyzeSymbol(symbol, benchmarkReturn, lookbackDays, exchangeBySymbol.get(symbol)),
     ANALYSIS_CONCURRENCY,
   );
 
@@ -364,8 +465,10 @@ export async function runScreener(): Promise<Watchlist> {
     log.info(
       `  ${s.symbol.padEnd(6)} | alpha: ${((s.relativeReturn ?? 0) * 100).toFixed(2)}% ` +
       `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
+      `| ADR: ${(s.adrPct ?? 0).toFixed(2)}% ` +
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
-      `| close: $${(s.lastClose ?? 0).toFixed(2)}`,
+      `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
+      (s.exchange ? ` | exch: ${s.exchange}` : ''),
     );
   });
 

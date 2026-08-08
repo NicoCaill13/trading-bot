@@ -3,15 +3,17 @@ import config from './config';
 import { getDynamicUniverse } from './screener';
 import { registerSatelliteWatchlist } from './signalQueue';
 import { createLogger } from './logger';
-import { toErrorMessage } from './utils';
+import { getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
 import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
+import { passesClosePrice, sumShareVolume } from './screenerMath';
 import type { Watchlist, WatchlistSymbol } from './types';
-import type { AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
+import type { AlpacaBar, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('PREMARKET_SCREENER');
 
 const SNAPSHOT_BATCH_SIZE = 100;
+const VOLUME_FETCH_CONCURRENCY = 5;
 
 interface GapCandidate {
   symbol: string;
@@ -19,6 +21,13 @@ interface GapCandidate {
   preMarketPrice: number;
   previousClose: number;
   preMarketShareVolume: number;
+}
+
+interface SnapshotGapHit {
+  symbol: string;
+  preMarketGapPct: number;
+  preMarketPrice: number;
+  previousClose: number;
 }
 
 function resolveSnapshotTicker(snap: AlpacaSnapshot): string | null {
@@ -47,23 +56,66 @@ function extractPreviousClose(snap: AlpacaSnapshot): number | null {
   return null;
 }
 
-/** Cumulative share volume for the current session (includes pre-market). */
-function extractPreMarketShareVolume(snap: AlpacaSnapshot): number {
-  const dailyVolume = snap.DailyBar?.Volume;
-  if (dailyVolume !== undefined && dailyVolume > 0) return dailyVolume;
-  return 0;
+/** EST pre-market share volume window: [04:00, 09:30). */
+async function fetchPremarketShareVolume(symbol: string): Promise<number> {
+  const estDay = getESTDate();
+  const start = nyWallTimeToUtc(estDay, 4, 0);
+  const end = nyWallTimeToUtc(estDay, 9, 30);
+
+  const bars: AlpacaBar[] = [];
+  const iter = alpaca.getBarsV2(symbol, {
+    start: start.toISOString(),
+    end: end.toISOString(),
+    timeframe: '1Min',
+    feed: 'iex',
+  });
+
+  for await (const bar of iter) {
+    // Exclude the 09:30 bar if the API returns an inclusive end boundary.
+    const ts = new Date(bar.Timestamp).getTime();
+    if (ts >= end.getTime()) continue;
+    if (ts < start.getTime()) continue;
+    bars.push(bar);
+  }
+
+  return sumShareVolume(bars.map(b => ({ volume: b.Volume })));
 }
 
+async function throttledMap<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+    if (i + concurrency < items.length) {
+      await new Promise(r => setTimeout(r, 350));
+    }
+  }
+  return results;
+}
+
+/**
+ * Phase 1: snapshot scan for price + gap only (cheap).
+ * Phase 2: 1Min bar volume sum in EST [04:00, 09:30) for gap hits only.
+ */
 async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
-  const candidates: GapCandidate[] = [];
+  const gapHits: SnapshotGapHit[] = [];
   const minGap = config.premarket.minGapUpPct;
   const minClose = config.screener.minClosePrice;
   const minShares = config.premarket.minPreMarketShareVolume;
 
+  let rejectedMissingPrice = 0;
+  let rejectedPrice = 0;
+  let rejectedGap = 0;
+
   log.info(
     `Snapshot scan on ${universe.length} tradable symbols ` +
     `(close ≥ $${minClose}, gap ≥ ${(minGap * 100).toFixed(1)}%, ` +
-    `pre-market vol ≥ ${(minShares / 1000).toFixed(0)}k shares)...`,
+    `then pre-market vol ≥ ${(minShares / 1000).toFixed(0)}k shares before 09:30 EST)...`,
   );
 
   for (let i = 0; i < universe.length; i += SNAPSHOT_BATCH_SIZE) {
@@ -78,22 +130,27 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
 
         const previousClose = extractPreviousClose(snap);
         const preMarketPrice = extractPreMarketPrice(snap);
-        if (previousClose === null || preMarketPrice === null) continue;
+        if (previousClose === null || preMarketPrice === null) {
+          rejectedMissingPrice++;
+          continue;
+        }
 
-        if (previousClose < minClose) continue;
+        if (!passesClosePrice(previousClose, minClose)) {
+          rejectedPrice++;
+          continue;
+        }
 
         const gap = (preMarketPrice - previousClose) / previousClose;
-        if (gap < minGap) continue;
+        if (gap < minGap) {
+          rejectedGap++;
+          continue;
+        }
 
-        const preMarketShareVolume = extractPreMarketShareVolume(snap);
-        if (preMarketShareVolume < minShares) continue;
-
-        candidates.push({
+        gapHits.push({
           symbol: ticker,
           preMarketGapPct: gap,
           preMarketPrice,
           previousClose,
-          preMarketShareVolume,
         });
       }
     } catch (err) {
@@ -108,7 +165,35 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
     }
   }
 
-  return candidates;
+  log.info(
+    `Snapshot phase: ${gapHits.length} gap hits | ` +
+    `rejects price=${rejectedPrice} gap=${rejectedGap} missing_price=${rejectedMissingPrice}`,
+  );
+
+  const volumeResults = await throttledMap(
+    gapHits,
+    async (hit): Promise<GapCandidate | null> => {
+      try {
+        const preMarketShareVolume = await fetchPremarketShareVolume(hit.symbol);
+        if (preMarketShareVolume < minShares) {
+          log.info(
+            `${hit.symbol} REJECTED — premarket volume ${preMarketShareVolume} ` +
+            `below ${minShares} (EST 04:00–09:30)`,
+          );
+          return null;
+        }
+        return { ...hit, preMarketShareVolume };
+      } catch (err) {
+        log.warn(
+          `${hit.symbol} REJECTED — premarket volume fetch failed: ${toErrorMessage(err)}`,
+        );
+        return null;
+      }
+    },
+    VOLUME_FETCH_CONCURRENCY,
+  );
+
+  return volumeResults.filter((c): c is GapCandidate => c !== null);
 }
 
 function toWatchlistEntries(candidates: GapCandidate[]): WatchlistSymbol[] {

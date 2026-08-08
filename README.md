@@ -124,15 +124,22 @@ Les paramètres de stratégie sont **optionnels** ; les valeurs par défaut sont
 | `MIN_RELATIVE_VOLUME` | `2.0` | Volume relatif min |
 | `MIN_GAP_UP_PCT` | `0.02` | Gap up min (+2 %) |
 | `WATCHLIST_MAX_SIZE` | `50` | Taille max watchlist Core |
+| `MIN_CLOSE_PRICE` | `5` | Prix min (close) |
+| `MIN_DOLLAR_VOLUME` | `20000000` | Dollar volume min (`close × volume`) |
+| `MIN_ADR_PCT` | `4.0` | ADR 14j min (`mean((H-L)/C)×100`) ; reject si `≤` |
+| `ADR_LOOKBACK_DAYS` | `14` | Fenêtre ADR |
+| `FLOAT_FILTER_ENABLED` | `false` | Active le filtre float (provider externe requis) |
+| `MIN_FLOAT_SHARES` | `10000000` | Float min (si filtre actif) |
+| `MAX_FLOAT_SHARES` | `500000000` | Float max (si filtre actif) |
 
-Filtres fixes dans `config.ts` : prix min **10 $**, dollar volume min **50 M$**.
+Univers restreint aux exchanges **NYSE** et **NASDAQ**. Le float n’est pas fourni de façon fiable par Alpaca : laisser `FLOAT_FILTER_ENABLED=false` tant qu’un provider (Polygon / FMP / IEX Cloud) n’est pas branché derrière `src/floatProvider.ts`.
 
 ### Screener Satellite (V2)
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `PREMARKET_MIN_GAP_UP_PCT` | `0.04` | Gap pré-market min (+4 %) |
-| `PREMARKET_MIN_DOLLAR_VOLUME` | `2000000` | Dollar volume pré-market min (2 M$) |
+| `PREMARKET_MIN_SHARE_VOLUME` | `300000` | Volume shares pré-market min (somme 1Min EST 04:00–09:30) |
 | `PREMARKET_WATCHLIST_MAX_SIZE` | `10` | Top-N symboles Satellite |
 
 ### Entrée intraday
@@ -207,9 +214,9 @@ npx tsc --noEmit
 
 Exécuté automatiquement si `data/watchlist.json` est absent, manuellement via `npm run screener`, ou au reset journalier **20h00**.
 
-1. **Univers dynamique** : actifs US `active`, `tradable`, `marginable`.
-2. **Pré-filtre liquidité** (snapshots) : clôture ≥ **10 $**, dollar volume ≥ **50 M$**.
-3. **Analyse journalière** : force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×**.
+1. **Univers dynamique** : actifs US `active`, `tradable`, `marginable`, exchanges **NYSE** / **NASDAQ**.
+2. **Pré-filtre liquidité** (snapshots) : clôture ≥ **5 $**, dollar volume ≥ **20 M$**.
+3. **Analyse journalière** : ADR 14j > **4 %**, force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×** (float optionnel via `FLOAT_FILTER_ENABLED`).
 4. Tri par alpha, export des **50** meilleurs → `data/watchlist.json` (`source: core`).
 
 ---
@@ -218,11 +225,10 @@ Exécuté automatiquement si `data/watchlist.json` est absent, manuellement via 
 
 Exécuté automatiquement à **09h15** (après réconciliation broker) ou via `npm run premarket-screener`.
 
-1. Même univers / pré-filtre liquidité que le Core.
-2. **Snapshots** : gap instantané `(prix pré-market − clôture veille) / clôture veille` ≥ **+4 %**.
-3. **Catalyst Score** : `gap × (DV pré-market / DV moyen 14j)`.
-4. Filtre DV pré-market ≥ **2 M$** (bougies SIP 04h00–09h15).
-5. Top **10** → `data/watchlist_v2.json` (`source: satellite`).
+1. Même univers NYSE/NASDAQ que le Core.
+2. **Snapshots** : gap instantané `(prix pré-market − clôture veille) / clôture veille` ≥ **+4 %**, previous close ≥ **5 $**.
+3. **Volume pré-market** : somme des bars **1Min** EST **[04:00, 09:30)** ≥ **300k** shares.
+4. Top **10** → merge `watchlist.json` (`origin: V2_PLAYMAKER`).
 
 ---
 
@@ -345,7 +351,9 @@ trading-bot/
 │   ├── index.ts              # Orchestrateur, WebSocket, VWAP / ORB, flush dual-bucket
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation
 │   ├── screener.ts           # Screener Core (V1)
+│   ├── screenerMath.ts       # Pure liquidity / ADR gates
 │   ├── premarket_screener.ts # Screener Satellite (V2) → signalQueue
+│   ├── floatProvider.ts      # Float port (disabled until external vendor)
 │   ├── signalQueue.ts        # Files prioritaires Core / Satellite
 │   ├── trader.ts             # Ordres & file d'attente
 │   ├── riskManager.ts        # Risque par tier & EOD

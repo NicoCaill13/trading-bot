@@ -76,7 +76,7 @@ export interface SessionBarData {
   lastBarLow: number;
 }
 
-/** Pullback state machine phase (V3). */
+/** Pullback state machine phase (V3 Satellite tick-up; Core stays on TRACKING until 5m confirm). */
 export type SignalState = 'TRACKING_PULLBACK' | 'TRIGGERED';
 
 export interface PullbackTracker {
@@ -88,6 +88,10 @@ export interface PullbackTracker {
   score: number;
   avgVolume: number;
   fibLevels: FibLevels | null;
+  /** Volumes of N bars ending at VWAP breakout (dry-up impulse baseline). */
+  impulseVolumes: number[];
+  /** Volumes of 5m bars after breakout while tracking pullback. */
+  pullbackVolumes: number[];
 }
 
 export interface PendingSignal {

@@ -140,8 +140,21 @@ const config = {
     signalBatchWindowMs: parseIntEnv('SIGNAL_BATCH_WINDOW_MS', 10000),
     tradeDuringLunch: process.env.TRADE_DURING_LUNCH === 'true',
     orbWindowBars: parseIntEnv('ORB_WINDOW_BARS', 1),
-    minRvolForPullback: parseFloatEnv('MIN_RVOL_FOR_PULLBACK', 1.2),
+    // V7 Core VWAP pullback: green 5m confirmation RVOL (was 1.2 legacy).
+    minRvolForPullback: parseFloatEnv('MIN_RVOL_FOR_PULLBACK', 1.5),
+    // Legacy V3 proximity (0.2%) — Satellite tick-up path only; Core uses vwapProximityPct.
     pullbackSupportPct: parseFloatEnv('PULLBACK_SUPPORT_PCT', 0.002),
+    // V7 Core: |price - vwap| / vwap <= 0.1%.
+    vwapProximityPct: parseFloatEnv('VWAP_PROXIMITY_PCT', 0.001),
+    // V7 Core entry window EST [start, end).
+    entryWindowStartHour: parseIntEnv('ENTRY_WINDOW_START_HOUR', 10),
+    entryWindowStartMinute: parseIntEnv('ENTRY_WINDOW_START_MINUTE', 0),
+    entryWindowEndHour: parseIntEnv('ENTRY_WINDOW_END_HOUR', 11),
+    entryWindowEndMinute: parseIntEnv('ENTRY_WINDOW_END_MINUTE', 30),
+    // Pullback avg volume must be < ratio × impulse avg volume.
+    pullbackDryUpRatio: parseFloatEnv('PULLBACK_DRY_UP_RATIO', 0.70),
+    // N bars ending at VWAP breakout used as impulse baseline for dry-up.
+    pullbackImpulseBars: parseIntEnv('PULLBACK_IMPULSE_BARS', 5),
     // Marketable limit: ask × multiplier (default +0.1% slippage cap).
     marketableLimitVwapMultiplier: parseFloatEnv('MARKETABLE_LIMIT_VWAP_MULTIPLIER', 1.001),
     // Anti-chase guard: max % the live ask may sit above the signal bar close
@@ -246,6 +259,38 @@ const config = {
 
   if (e.maxEntryRsi < 50 || e.maxEntryRsi > 100)
     throw new Error(`[SYSTEM] MAX_ENTRY_RSI out of bounds (50–100): ${e.maxEntryRsi}`);
+
+  if (e.vwapProximityPct <= 0 || e.vwapProximityPct > 0.05) {
+    throw new Error(
+      `[SYSTEM] VWAP_PROXIMITY_PCT out of bounds (0–5%]: ${e.vwapProximityPct}`,
+    );
+  }
+  if (e.minRvolForPullback <= 0) {
+    throw new Error(`[SYSTEM] MIN_RVOL_FOR_PULLBACK must be > 0: ${e.minRvolForPullback}`);
+  }
+  if (e.pullbackDryUpRatio <= 0 || e.pullbackDryUpRatio > 1) {
+    throw new Error(
+      `[SYSTEM] PULLBACK_DRY_UP_RATIO out of bounds (0–1]: ${e.pullbackDryUpRatio}`,
+    );
+  }
+  if (e.pullbackImpulseBars < 1) {
+    throw new Error(`[SYSTEM] PULLBACK_IMPULSE_BARS must be >= 1: ${e.pullbackImpulseBars}`);
+  }
+  const entryStartMins = e.entryWindowStartHour * 60 + e.entryWindowStartMinute;
+  const entryEndMins = e.entryWindowEndHour * 60 + e.entryWindowEndMinute;
+  if (
+    e.entryWindowStartHour < 0 || e.entryWindowStartHour > 23 ||
+    e.entryWindowEndHour < 0 || e.entryWindowEndHour > 23 ||
+    e.entryWindowStartMinute < 0 || e.entryWindowStartMinute > 59 ||
+    e.entryWindowEndMinute < 0 || e.entryWindowEndMinute > 59
+  ) {
+    throw new Error('[SYSTEM] ENTRY_WINDOW_* hour/minute out of bounds');
+  }
+  if (entryStartMins >= entryEndMins) {
+    throw new Error(
+      `[SYSTEM] ENTRY_WINDOW start must be < end: ${entryStartMins} >= ${entryEndMins}`,
+    );
+  }
 
   const p = config.portfolio;
   const shareSum = p.coreRiskShare + p.satelliteRiskShare;

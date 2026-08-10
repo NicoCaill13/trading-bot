@@ -132,6 +132,19 @@ export interface ReversalPatternSignal {
   pivots: PivotPoint[];
 }
 
+/** Daily continuation structures (spec §3.B). */
+export type ContinuationPattern = 'BULL_FLAG' | 'CUP_HANDLE' | 'FLAT_BASE';
+
+export interface ContinuationPatternSignal {
+  pattern: ContinuationPattern;
+  impulsePct?: number;
+  flagHigh?: number;
+  rim?: number;
+  atrCompressionRatio?: number;
+  breakoutRvol?: number;
+  pivots: PivotPoint[];
+}
+
 export interface WatchlistSymbol {
   symbol: string;
   origin: SignalOrigin;
@@ -162,6 +175,9 @@ export interface WatchlistSymbol {
   /** Soft annotate: ETEI or Spring when detected post-Weinstein. */
   reversalPattern?: ReversalPattern;
   reversalDetail?: ReversalPatternSignal;
+  /** Soft annotate: Bull Flag / Cup&Handle / Flat Base post-Weinstein. */
+  continuationPattern?: ContinuationPattern;
+  continuationDetail?: ContinuationPatternSignal;
 }
 
 export interface Watchlist {

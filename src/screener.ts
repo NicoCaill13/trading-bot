@@ -19,7 +19,13 @@ import {
   passesWeinsteinGate,
 } from './weinstein';
 import { detectReversalPatterns } from './patterns/reversal';
-import type { Watchlist, WatchlistSymbol, ReversalPatternSignal } from './types';
+import { detectContinuationPatterns } from './patterns/continuation';
+import type {
+  Watchlist,
+  WatchlistSymbol,
+  ReversalPatternSignal,
+  ContinuationPatternSignal,
+} from './types';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SCREENER');
@@ -345,6 +351,8 @@ async function analyzeSymbol(
 
     let reversalPattern: WatchlistSymbol['reversalPattern'];
     let reversalDetail: ReversalPatternSignal | undefined;
+    let continuationPattern: WatchlistSymbol['continuationPattern'];
+    let continuationDetail: ContinuationPatternSignal | undefined;
     if (config.screener.patternFilterEnabled) {
       const lookback = Math.min(config.screener.patternLookbackBars, bars.length);
       const slice = bars.slice(-lookback);
@@ -354,7 +362,7 @@ async function analyzeSymbol(
         close: b.ClosePrice,
         volume: b.Volume,
       }));
-      const signal = detectReversalPatterns(ohlcv, {
+      const reversalSignal = detectReversalPatterns(ohlcv, {
         pivotLeft: config.screener.patternPivotLeft,
         pivotRight: config.screener.patternPivotRight,
         eteiBreakoutRvol: config.screener.eteiBreakoutRvol,
@@ -362,19 +370,62 @@ async function analyzeSymbol(
         springSupportTolerancePct: config.screener.springSupportTolerancePct,
         rvolAvgDays: config.screener.patternRvolAvgDays,
       });
-      if (signal) {
-        reversalPattern = signal.pattern;
-        reversalDetail = signal;
-        const pivots = signal.pivots.map(p => p.price.toFixed(2)).join('/');
+      if (reversalSignal) {
+        reversalPattern = reversalSignal.pattern;
+        reversalDetail = reversalSignal;
+        const pivots = reversalSignal.pivots.map(p => p.price.toFixed(2)).join('/');
         patternLog.info(
-          `${ticker} PASS — ${signal.pattern} pivots ${pivots}` +
-          (signal.neckline !== undefined ? ` neckline $${signal.neckline.toFixed(2)}` : '') +
-          (signal.support !== undefined ? ` support $${signal.support.toFixed(2)}` : '') +
-          (signal.breakoutRvol !== undefined ? ` rvol ${signal.breakoutRvol.toFixed(2)}x` : '') +
-          (signal.reclaimRvol !== undefined ? ` rvol ${signal.reclaimRvol.toFixed(2)}x` : ''),
+          `${ticker} PASS — ${reversalSignal.pattern} pivots ${pivots}` +
+          (reversalSignal.neckline !== undefined ? ` neckline $${reversalSignal.neckline.toFixed(2)}` : '') +
+          (reversalSignal.support !== undefined ? ` support $${reversalSignal.support.toFixed(2)}` : '') +
+          (reversalSignal.breakoutRvol !== undefined ? ` rvol ${reversalSignal.breakoutRvol.toFixed(2)}x` : '') +
+          (reversalSignal.reclaimRvol !== undefined ? ` rvol ${reversalSignal.reclaimRvol.toFixed(2)}x` : ''),
         );
       } else {
         patternLog.info(`${ticker} — no reversal pattern in lookback ${lookback}`);
+      }
+
+      const continuationSignal = detectContinuationPatterns(ohlcv, {
+        rvolAvgDays: config.screener.patternRvolAvgDays,
+        bullFlagImpulseMinPct: config.screener.bullFlagImpulseMinPct,
+        bullFlagImpulseMaxBars: config.screener.bullFlagImpulseMaxBars,
+        bullFlagMinBars: config.screener.bullFlagMinBars,
+        bullFlagMaxBars: config.screener.bullFlagMaxBars,
+        bullFlagVolDryUpRatio: config.screener.bullFlagVolDryUpRatio,
+        bullFlagBreakoutRvol: config.screener.bullFlagBreakoutRvol,
+        cupMinBars: config.screener.cupMinBars,
+        cupMaxBars: config.screener.cupMaxBars,
+        cupMaxDepthPct: config.screener.cupMaxDepthPct,
+        handleMaxRetracePct: config.screener.handleMaxRetracePct,
+        handleMaxBars: config.screener.handleMaxBars,
+        flatBaseBars: config.screener.flatBaseBars,
+        flatBaseAtrShort: config.screener.flatBaseAtrShort,
+        flatBaseAtrRef: config.screener.flatBaseAtrRef,
+        flatBaseAtrCompressionRatio: config.screener.flatBaseAtrCompressionRatio,
+      });
+      if (continuationSignal) {
+        continuationPattern = continuationSignal.pattern;
+        continuationDetail = continuationSignal;
+        patternLog.info(
+          `${ticker} PASS — ${continuationSignal.pattern}` +
+          (continuationSignal.impulsePct !== undefined
+            ? ` impulse ${(continuationSignal.impulsePct * 100).toFixed(1)}%`
+            : '') +
+          (continuationSignal.flagHigh !== undefined
+            ? ` flagHigh $${continuationSignal.flagHigh.toFixed(2)}`
+            : '') +
+          (continuationSignal.rim !== undefined
+            ? ` rim $${continuationSignal.rim.toFixed(2)}`
+            : '') +
+          (continuationSignal.atrCompressionRatio !== undefined
+            ? ` atrRatio ${continuationSignal.atrCompressionRatio.toFixed(2)}`
+            : '') +
+          (continuationSignal.breakoutRvol !== undefined
+            ? ` rvol ${continuationSignal.breakoutRvol.toFixed(2)}x`
+            : ''),
+        );
+      } else {
+        patternLog.info(`${ticker} — no continuation pattern in lookback ${lookback}`);
       }
     }
 
@@ -448,6 +499,8 @@ async function analyzeSymbol(
       sma150Slope: weinstein.sma150Slope,
       reversalPattern,
       reversalDetail,
+      continuationPattern,
+      continuationDetail,
     };
   } catch (err) {
     log.warn(`${ticker}: analysis error — ${toErrorMessage(err)}`);
@@ -550,7 +603,7 @@ export async function runScreener(): Promise<Watchlist> {
       `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
       `| ADR: ${(s.adrPct ?? 0).toFixed(2)}% ` +
       `| SMA150: $${(s.sma150 ?? 0).toFixed(2)} slope: ${(s.sma150Slope ?? 0).toFixed(3)} ` +
-      `| pattern: ${s.reversalPattern ?? '-'} ` +
+      `| pattern: ${s.reversalPattern ?? '-'} / ${s.continuationPattern ?? '-'} ` +
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
       `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
       (s.exchange ? ` | exch: ${s.exchange}` : ''),

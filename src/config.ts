@@ -94,13 +94,30 @@ const config = {
     sma150SlopeWeeks: parseIntEnv('SMA_150_SLOPE_WEEKS', 8),
     // Reversal patterns (§3.A) — soft annotate post-Weinstein (no hard reject)
     patternFilterEnabled: process.env.PATTERN_FILTER_ENABLED !== 'false',
-    patternLookbackBars: parseIntEnv('PATTERN_LOOKBACK_BARS', 90),
+    // Bumped to 120 to cover cup/flat lookbacks (was 90 for reversal-only).
+    patternLookbackBars: parseIntEnv('PATTERN_LOOKBACK_BARS', 120),
     patternPivotLeft: parseIntEnv('PATTERN_PIVOT_LEFT', 3),
     patternPivotRight: parseIntEnv('PATTERN_PIVOT_RIGHT', 3),
     eteiBreakoutRvol: parseFloatEnv('ETEI_BREAKOUT_RVOL', 1.5),
     springReclaimRvol: parseFloatEnv('SPRING_RECLAIM_RVOL', 1.5),
     springSupportTolerancePct: parseFloatEnv('SPRING_SUPPORT_TOLERANCE_PCT', 0.005),
     patternRvolAvgDays: parseIntEnv('PATTERN_RVOL_AVG_DAYS', 14),
+    // Continuation patterns (§3.B)
+    bullFlagImpulseMinPct: parseFloatEnv('BULL_FLAG_IMPULSE_MIN_PCT', 0.08),
+    bullFlagImpulseMaxBars: parseIntEnv('BULL_FLAG_IMPULSE_MAX_BARS', 10),
+    bullFlagMinBars: parseIntEnv('BULL_FLAG_MIN_BARS', 3),
+    bullFlagMaxBars: parseIntEnv('BULL_FLAG_MAX_BARS', 15),
+    bullFlagVolDryUpRatio: parseFloatEnv('BULL_FLAG_VOL_DRY_UP_RATIO', 0.60),
+    bullFlagBreakoutRvol: parseFloatEnv('BULL_FLAG_BREAKOUT_RVOL', 1.5),
+    cupMinBars: parseIntEnv('CUP_MIN_BARS', 20),
+    cupMaxBars: parseIntEnv('CUP_MAX_BARS', 65),
+    cupMaxDepthPct: parseFloatEnv('CUP_MAX_DEPTH_PCT', 0.35),
+    handleMaxRetracePct: parseFloatEnv('HANDLE_MAX_RETRACE_PCT', 0.15),
+    handleMaxBars: parseIntEnv('HANDLE_MAX_BARS', 15),
+    flatBaseBars: parseIntEnv('FLAT_BASE_BARS', 30),
+    flatBaseAtrShort: parseIntEnv('FLAT_BASE_ATR_SHORT', 20),
+    flatBaseAtrRef: parseIntEnv('FLAT_BASE_ATR_REF', 50),
+    flatBaseAtrCompressionRatio: parseFloatEnv('FLAT_BASE_ATR_COMPRESSION_RATIO', 0.70),
   },
 
   portfolio: {
@@ -293,7 +310,11 @@ const config = {
   if (s.patternPivotLeft < 1 || s.patternPivotRight < 1) {
     throw new Error('[SYSTEM] PATTERN_PIVOT_LEFT/RIGHT must be >= 1');
   }
-  const minPatternLookback = s.patternPivotLeft + s.patternPivotRight + 5;
+  const minPatternLookback = Math.max(
+    s.patternPivotLeft + s.patternPivotRight + 5,
+    s.flatBaseBars + s.flatBaseAtrRef,
+    s.cupMinBars + s.handleMaxBars,
+  );
   if (s.patternLookbackBars < minPatternLookback) {
     throw new Error(
       `[SYSTEM] PATTERN_LOOKBACK_BARS must be >= ${minPatternLookback}: ${s.patternLookbackBars}`,
@@ -312,6 +333,50 @@ const config = {
   }
   if (s.patternRvolAvgDays < 1) {
     throw new Error(`[SYSTEM] PATTERN_RVOL_AVG_DAYS must be >= 1: ${s.patternRvolAvgDays}`);
+  }
+  if (s.bullFlagImpulseMinPct <= 0 || s.bullFlagImpulseMinPct > 1) {
+    throw new Error(
+      `[SYSTEM] BULL_FLAG_IMPULSE_MIN_PCT out of bounds (0–1]: ${s.bullFlagImpulseMinPct}`,
+    );
+  }
+  if (s.bullFlagImpulseMaxBars < 2) {
+    throw new Error(`[SYSTEM] BULL_FLAG_IMPULSE_MAX_BARS must be >= 2`);
+  }
+  if (s.bullFlagMinBars < 1 || s.bullFlagMaxBars < s.bullFlagMinBars) {
+    throw new Error('[SYSTEM] BULL_FLAG_MIN/MAX_BARS invalid');
+  }
+  if (s.bullFlagVolDryUpRatio <= 0 || s.bullFlagVolDryUpRatio > 1) {
+    throw new Error(
+      `[SYSTEM] BULL_FLAG_VOL_DRY_UP_RATIO out of bounds (0–1]: ${s.bullFlagVolDryUpRatio}`,
+    );
+  }
+  if (s.bullFlagBreakoutRvol <= 0) {
+    throw new Error(`[SYSTEM] BULL_FLAG_BREAKOUT_RVOL must be > 0`);
+  }
+  if (s.cupMinBars < 5 || s.cupMaxBars < s.cupMinBars) {
+    throw new Error('[SYSTEM] CUP_MIN/MAX_BARS invalid');
+  }
+  if (s.cupMaxDepthPct <= 0 || s.cupMaxDepthPct > 1) {
+    throw new Error(`[SYSTEM] CUP_MAX_DEPTH_PCT out of bounds (0–1]: ${s.cupMaxDepthPct}`);
+  }
+  if (s.handleMaxRetracePct <= 0 || s.handleMaxRetracePct > 0.15) {
+    throw new Error(
+      `[SYSTEM] HANDLE_MAX_RETRACE_PCT out of bounds (0–15%]: ${s.handleMaxRetracePct}`,
+    );
+  }
+  if (s.handleMaxBars < 1) {
+    throw new Error('[SYSTEM] HANDLE_MAX_BARS must be >= 1');
+  }
+  if (s.flatBaseBars < 5) {
+    throw new Error('[SYSTEM] FLAT_BASE_BARS must be >= 5');
+  }
+  if (s.flatBaseAtrShort < 2 || s.flatBaseAtrRef < s.flatBaseAtrShort) {
+    throw new Error('[SYSTEM] FLAT_BASE_ATR_SHORT/REF invalid');
+  }
+  if (s.flatBaseAtrCompressionRatio <= 0 || s.flatBaseAtrCompressionRatio > 1) {
+    throw new Error(
+      `[SYSTEM] FLAT_BASE_ATR_COMPRESSION_RATIO out of bounds (0–1]: ${s.flatBaseAtrCompressionRatio}`,
+    );
   }
 
   const pm = config.premarket;

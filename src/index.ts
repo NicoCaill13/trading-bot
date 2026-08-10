@@ -42,6 +42,10 @@ import {
 import { resolveRiskDollarsAtEntry } from './expectancy';
 import { createMarketDataBus } from './marketDataBus';
 import { assessQuoteForWall } from './orderBook';
+import {
+  getEffectiveRiskPerTradePct,
+  runMorningRegimeAssessment,
+} from './regimeModel';
 import type {
   BarData,
   PendingSignal,
@@ -1301,7 +1305,7 @@ async function executeSignalsForTier(
           Math.max(0, referencePrice - stopLossPrice),
           qty,
           allocation.totalCapital,
-          config.risk.riskPerTradePct,
+          getEffectiveRiskPerTradePct(),
         ),
       });
 
@@ -1933,6 +1937,7 @@ function schedulePreMarketReconciliation(): void {
       log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
       try {
         await reconcileStateFromBroker();
+        await runMorningRegimeAssessment();
         const watchlist = await runPremarketScreener();
         const v2Symbols = extractV2Symbols(watchlist);
         const newSymbols = applyV2WatchlistSymbols(v2Symbols);

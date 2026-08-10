@@ -46,7 +46,7 @@ const config = {
     maxPositions: parseIntEnv('MAX_POSITIONS', 5),
     // Deprecated for sizing (V7 uses riskPerTradePct). Kept for portfolio share helpers / observability.
     maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.20),
-    riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.01),
+    riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.05),
     minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
     atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.015),
     atrTrailMultiplier: parseFloatEnv('ATR_TRAIL_MULTIPLIER', 2),
@@ -230,6 +230,22 @@ const config = {
     fastTrigger: process.env.L2_FAST_TRIGGER === 'true',
     topN: parseIntEnv('L2_TOP_N', 5),
     imbalanceThreshold: parseFloatEnv('L2_IMBALANCE_THRESHOLD', 0.65),
+  },
+
+  // Morning regime model (#9) — heuristic classifier + VIX volatility scaling
+  regime: {
+    enabled: process.env.REGIME_MODEL_ENABLED === 'true',
+    // Log prediction without changing risk / R:R (paper shadow mode)
+    shadow: process.env.REGIME_MODEL_SHADOW === 'true',
+    vixRiskHalveThreshold: parseFloatEnv('VIX_RISK_HALVE_THRESHOLD', 25),
+    choppyRr: parseFloatEnv('CHOPPY_RR', 1.5),
+    // Heuristic CHOPPY: SPY ADR% >= floor AND VIX >= min (missing features → UNKNOWN)
+    choppySpyAdrPct: parseFloatEnv('CHOPPY_SPY_ADR_PCT', 1.2),
+    choppyVixMin: parseFloatEnv('CHOPPY_VIX_MIN', 18),
+    // Yahoo chart URL for ^VIX (external; graceful null on failure)
+    vixYahooUrl:
+      process.env.VIX_YAHOO_URL ??
+      'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d',
   },
 
   paths: {
@@ -486,6 +502,26 @@ const config = {
       `[SYSTEM] L2_IMBALANCE_THRESHOLD out of bounds (0–1]: ${l2.imbalanceThreshold}`,
     );
   }
+
+  const rg = config.regime;
+  if (rg.vixRiskHalveThreshold < 10 || rg.vixRiskHalveThreshold > 80) {
+    throw new Error(
+      `[SYSTEM] VIX_RISK_HALVE_THRESHOLD out of bounds (10–80]: ${rg.vixRiskHalveThreshold}`,
+    );
+  }
+  if (rg.choppyRr < 1 || rg.choppyRr > config.risk.minRiskRewardRatio) {
+    throw new Error(
+      `[SYSTEM] CHOPPY_RR must be in [1, MIN_RISK_REWARD_RATIO]: ${rg.choppyRr}`,
+    );
+  }
+  if (rg.choppySpyAdrPct <= 0) {
+    throw new Error(`[SYSTEM] CHOPPY_SPY_ADR_PCT must be > 0: ${rg.choppySpyAdrPct}`);
+  }
+  if (rg.choppyVixMin < 0 || rg.choppyVixMin > rg.vixRiskHalveThreshold) {
+    throw new Error(
+      `[SYSTEM] CHOPPY_VIX_MIN must be in [0, VIX_RISK_HALVE_THRESHOLD]: ${rg.choppyVixMin}`,
+    );
+  }
 }());
 
 export function getPortfolioSlotLimits(): {
@@ -549,7 +585,7 @@ export function getTimedecaySlotLimits(
 }
 
 /**
- * @deprecated V7 sizes by riskPerTradePct (1% equity / stop distance), not CTPO slots.
+ * @deprecated V7 sizes by riskPerTradePct (equity % / stop distance), not CTPO slots.
  * Retained for observability / legacy callers that still reason in equal slot shares.
  * Position count remains capped by maxPositions.
  */

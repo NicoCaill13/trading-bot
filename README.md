@@ -53,8 +53,8 @@ Deux buckets coexistent sur la même session (même WebSocket, même risk manage
 
 | Bucket | Source | Rôle | Risque par trade | Slots (défaut, `MAX_POSITIONS=5`) |
 |--------|--------|------|------------------|-----------------------------------|
-| **Core (80 %)** | `screener.ts` (V1) | Continuation momentum, force relative, gap tenu (UT1D) | `RISK_PER_TRADE_PCT × 0,80` → **0,8 %** equity | **4** |
-| **Satellite (20 %)** | `premarket_screener.ts` (V2) | News plays, gap pré-market, catalyseurs du jour | `RISK_PER_TRADE_PCT × 0,20` → **0,2 %** equity | **1** |
+| **Core (80 %)** | `screener.ts` (V1) | Continuation momentum, force relative, gap tenu (UT1D) | `RISK_PER_TRADE_PCT × 0,80` → **4 %** equity | **4** |
+| **Satellite (20 %)** | `premarket_screener.ts` (V2) | News plays, gap pré-market, catalyseurs du jour | `RISK_PER_TRADE_PCT × 0,20` → **1 %** equity | **1** |
 
 - Les signaux sont classés et exécutés **par bucket** (pas de classement global Core vs Satellite).
 - Un symbole présent dans les deux watchlists est traité en **Satellite** (priorité V2).
@@ -110,7 +110,7 @@ Les paramètres de stratégie sont **optionnels** ; les valeurs par défaut sont
 |----------|--------|-------------|
 | `MAX_POSITIONS` | `5` | Nombre max de positions simultanées (tous buckets) |
 | `MAX_POSITION_PCT` | `0.20` | Plafond nominal global (réparti par tier) |
-| `RISK_PER_TRADE_PCT` | `0.01` | Risque de base par trade (1 %), avant part Core/Satellite |
+| `RISK_PER_TRADE_PCT` | `0.05` | Risque de base par trade (5 %), avant part Core/Satellite ; halved si VIX > seuil régime |
 | `CORE_RISK_SHARE` | `0.80` | Part du risque allouée au bucket Core |
 | `SATELLITE_RISK_SHARE` | `0.20` | Part du risque allouée au bucket Satellite |
 | `CORE_MAX_POSITIONS` | `0` | Slots Core (0 = auto : `floor(MAX_POSITIONS × 0,80)`) |
@@ -308,7 +308,7 @@ qty            = min(qty, floor(min(perTradeCap, bucketAvailable) / prix))
 bucketAvailable = maxCapital(tier) - deployed(tier)   // 20 % ou 80 % equity
 ```
 
-Exemple (défauts) : Core **0,8 %** equity à risque, Satellite **0,2 %**.
+Exemple (défauts) : Core **4 %** equity à risque, Satellite **1 %** (base `RISK_PER_TRADE_PCT=5 %`).
 
 **Gestion active en position** :
 
@@ -389,12 +389,37 @@ Logs `[L2]` : imbalance, mid, top bid/ask, `wall=YES/no`. Path Core nominal : dr
 
 ---
 
-### 9. Résilience et réconciliation
+### 9. Régimes de marché — volatility scaling (matin 09h15)
+
+Feature flag **`REGIME_MODEL_ENABLED=false`** par défaut. Job dans le cron pré-market (après réconciliation broker).
+
+**Runtime :** classifieur **heuristique** déterministe derrière le port `RegimeClassifier` (pas de Python / XGBoost en prod). Surface prête pour un futur modèle ONNX offline.
+
+| Feature | Source |
+|---------|--------|
+| VIX last | Yahoo `^VIX` (HTTPS natif) — échec → `null` |
+| SPY ADR 14j | Alpaca daily bars |
+| Volume PM global (proxy) | Somme shares 1Min SPY+QQQ EST `[04:00, 09:30)` |
+
+| Régime / condition | Effet |
+|--------------------|--------|
+| `UNKNOWN` / features manquantes | Risk **5 %**, R:R **1:2** (nominal) |
+| `CHOPPY` | R:R forcé **1:1.5** |
+| `VIX > 25` | Risk **2.5 %** (÷2), indépendant du label |
+| `REGIME_MODEL_SHADOW=true` | Log `[REGIME]` sans appliquer le scaling |
+
+`riskManager` consomme uniquement `getEffectiveRiskPerTradePct` / `getMinRiskRewardRatio` (DIP — zéro couplage modèle → broker).
+
+**Retrain offline (hors scope runtime) :** exporter features journalières + labels post-session ; entraîner RF/XGBoost → exporter ONNX ; brancher un `OnnxRegimeClassifier` sur le même port. Pas de retrain online intraday.
+
+---
+
+### 10. Résilience et réconciliation
 
 - Au boot : `data/session_state.json` → symboles entrés avec **tier** (`core` | `satellite`).
 - Format legacy (`string[]`) toujours accepté → tier `core` par défaut.
 - Réconciliation broker : positions ouvertes + trailing stops (évite double scale-out).
-- **09h15** : réconciliation + screener Satellite + abonnement WebSocket aux nouveaux symboles.
+- **09h15** : réconciliation + **régime matin** + screener Satellite + abonnement WebSocket aux nouveaux symboles.
 - Reset **20h00** : purge état, screener Core, reconnexion WebSocket.
 - Rapport **16h05** : bilan PnL journalier + expectancy E_R (session / 20 / 50) + scénario.
 
@@ -451,6 +476,7 @@ trading-bot/
 │   ├── marketDataBus.ts      # Bus market data (WS producer / strategy consumer)
 │   ├── replayEngine.ts       # Replay offline + slippage (purs)
 │   ├── orderBook.ts          # Imbalance / wall L2 (quotes)
+│   ├── regimeModel.ts        # Régime matin + VIX scaling (ports DIP)
 │   ├── scripts/replay.ts     # CLI npm run replay
 │   ├── analyzer.ts           # Post-mortem KPIs + expectancy
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation

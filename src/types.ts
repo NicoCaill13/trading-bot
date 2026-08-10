@@ -378,3 +378,32 @@ export interface ImbalanceSignal {
   topAsk: OrderBookLevel | null;
   assessedAt: number;
 }
+
+/** Morning market regime label (heuristic / future ONNX classifier). */
+export type MarketRegime = 'TRENDING' | 'CHOPPY' | 'UNKNOWN';
+
+export interface RegimeFeatures {
+  vixLast: number | null;
+  spyAdr14d: number | null;
+  /** Proxy: sum of SPY+QQQ 1Min share volume in EST [04:00, 09:30). */
+  premarketGlobalVolumeProxy: number | null;
+}
+
+export interface RegimeSnapshot {
+  regime: MarketRegime;
+  features: RegimeFeatures;
+  effectiveRiskPerTradePct: number;
+  minRiskRewardRatio: number;
+  predictedAt: string;
+  /** False when REGIME_MODEL_SHADOW or model disabled — sizing stays nominal. */
+  applied: boolean;
+}
+
+/**
+ * Injected risk/TP scaler consumed by riskManager (DIP — no broker coupling).
+ */
+export interface RegimeRiskScaler {
+  getEffectiveRiskPerTradePct(): number;
+  getMinRiskRewardRatio(): number;
+  getRegime(): MarketRegime;
+}

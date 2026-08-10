@@ -11,6 +11,10 @@ import {
   computeTakeProfitPrice,
   passesMinRiskReward,
 } from './riskSizing';
+import {
+  getEffectiveRiskPerTradePct,
+  getMinRiskRewardRatio,
+} from './regimeModel';
 import type {
   PortfolioAllocation,
   PortfolioOrigin,
@@ -71,7 +75,8 @@ function resolvePositionMarketValue(pos: AlpacaPosition): number {
 
 /**
  * Slot availability gate only. V7 position size is computed from riskPerTradePct
- * (1% equity / stop distance), not from an equal CTPO capital envelope.
+ * (equity % / stop distance), not from an equal CTPO capital envelope.
+ * Effective risk may be scaled by the morning regime model (VIX / CHOPPY).
  */
 export async function getPortfolioAllocation(
   origin: PortfolioOrigin,
@@ -89,7 +94,7 @@ export async function getPortfolioAllocation(
   const slotsUsed = positions.length;
   const slotsAvailable = config.risk.maxPositions - slotsUsed;
   const canOpen = slotsAvailable > 0;
-  const riskBudget = totalCapital * config.risk.riskPerTradePct;
+  const riskBudget = totalCapital * getEffectiveRiskPerTradePct();
 
   return {
     origin,
@@ -106,8 +111,9 @@ export async function getPortfolioAllocation(
 // ---------------------------------------------------------------------------
 
 /**
- * Computes position size from 1% equity risk and stop distance.
+ * Computes position size from equity risk % and stop distance.
  * Take-profit is set at minRiskRewardRatio × stop distance (default 1:2).
+ * Risk % and R:R come from RegimeRiskScaler when the morning model is applied.
  *
  * @param settledCash - cash available to cap notional (cash account)
  */
@@ -134,9 +140,12 @@ export async function computePositionSize(
   }
 
   const totalEquity = allocation.totalCapital;
+  const riskPct = getEffectiveRiskPerTradePct();
+  const minRr = getMinRiskRewardRatio();
+
   let qty = computeRiskBasedQty(
     totalEquity,
-    config.risk.riskPerTradePct,
+    riskPct,
     entryPrice,
     stopLossPrice,
   );
@@ -145,7 +154,7 @@ export async function computePositionSize(
   if (qty < 1) {
     throw new Error(
       `${symbol}: risk sizing insufficient — ` +
-      `equity $${totalEquity.toFixed(2)} × ${(config.risk.riskPerTradePct * 100).toFixed(1)}% ` +
+      `equity $${totalEquity.toFixed(2)} × ${(riskPct * 100).toFixed(1)}% ` +
       `/ stopDist $${stopDistance.toFixed(4)} (settled cash $${settledCash.toFixed(2)})`,
     );
   }
@@ -153,7 +162,7 @@ export async function computePositionSize(
   const takeProfitPrice = computeTakeProfitPrice(
     entryPrice,
     stopLossPrice,
-    config.risk.minRiskRewardRatio,
+    minRr,
   );
 
   if (
@@ -161,27 +170,27 @@ export async function computePositionSize(
       entryPrice,
       stopLossPrice,
       takeProfitPrice,
-      config.risk.minRiskRewardRatio,
+      minRr,
     )
   ) {
     log.warn(
       `${symbol}: R:R gate failed — entry $${entryPrice.toFixed(2)} ` +
       `stop $${stopLossPrice.toFixed(2)} tp $${takeProfitPrice.toFixed(2)} ` +
-      `(min ${config.risk.minRiskRewardRatio}:1)`,
+      `(min ${minRr}:1)`,
     );
     throw new Error(
-      `${symbol}: R:R below minimum ${config.risk.minRiskRewardRatio}:1 — signal rejected`,
+      `${symbol}: R:R below minimum ${minRr}:1 — signal rejected`,
     );
   }
 
   log.info(
     `${symbol} sizing [${tier}] — ATR(5m):${atr.toFixed(4)} | ` +
-    `risk ${(config.risk.riskPerTradePct * 100).toFixed(1)}% equity ` +
-    `($${(totalEquity * config.risk.riskPerTradePct).toFixed(0)}) | ` +
+    `risk ${(riskPct * 100).toFixed(1)}% equity ` +
+    `($${(totalEquity * riskPct).toFixed(0)}) | ` +
     `notional $${(qty * entryPrice).toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
     `stopDist:$${stopDistance.toFixed(4)} | qty:${qty} | ` +
     `stopLoss:$${stopLossPrice.toFixed(2)} | takeProfit:$${takeProfitPrice.toFixed(2)} ` +
-    `(R:R ${config.risk.minRiskRewardRatio}:1)`,
+    `(R:R ${minRr}:1)`,
   );
 
   return { qty, stopLossPrice, takeProfitPrice, atr };

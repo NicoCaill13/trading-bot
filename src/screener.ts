@@ -20,6 +20,8 @@ import {
 } from './weinstein';
 import { detectReversalPatterns } from './patterns/reversal';
 import { detectContinuationPatterns } from './patterns/continuation';
+import { createNewsProvider } from './newsProvider';
+import { filterWatchlistByBullishCatalyst } from './sentiment';
 import type {
   Watchlist,
   WatchlistSymbol,
@@ -32,6 +34,7 @@ const log = createLogger('SCREENER');
 const weinsteinLog = createLogger('WEINSTEIN');
 const patternLog = createLogger('PATTERN');
 const floatProvider = createFloatProvider();
+const newsProvider = createNewsProvider();
 
 const BENCHMARK = 'SPY';
 const SNAPSHOT_BATCH_SIZE = 100;
@@ -589,15 +592,26 @@ export async function runScreener(): Promise<Watchlist> {
   );
 
   const filtered = (candidates.filter(Boolean) as WatchlistSymbol[])
-    .sort((a, b) => (b.relativeReturn ?? 0) - (a.relativeReturn ?? 0))
-    .slice(0, config.screener.watchlistMaxSize);
+    .sort((a, b) => (b.relativeReturn ?? 0) - (a.relativeReturn ?? 0));
+
+  // When catalyst gate is on, score a wider alpha pool then hard-filter; else top-N only.
+  const poolSize = config.sentiment.enabled
+    ? Math.min(filtered.length, Math.max(config.screener.watchlistMaxSize * 3, 75))
+    : config.screener.watchlistMaxSize;
+  const pool = filtered.slice(0, poolSize);
+  const withCatalyst = await filterWatchlistByBullishCatalyst(pool, newsProvider);
+  const retained = withCatalyst.slice(0, config.screener.watchlistMaxSize);
 
   log.info(
-    `${filtered.length} symbols retained from ${liquidUniverse.length} analyzed ` +
-    `(initial universe: ${rawUniverse.length})`,
+    `${retained.length} symbols retained from ${liquidUniverse.length} analyzed ` +
+    `(initial universe: ${rawUniverse.length}` +
+    (config.sentiment.enabled
+      ? `; catalyst gate ${withCatalyst.length}/${pool.length}`
+      : '') +
+    `)`,
   );
 
-  filtered.forEach(s => {
+  retained.forEach(s => {
     log.info(
       `  ${s.symbol.padEnd(6)} | alpha: ${((s.relativeReturn ?? 0) * 100).toFixed(2)}% ` +
       `| gap: ${((s.gapUp ?? 0) * 100).toFixed(2)}% | rvol: ${(s.relativeVolume ?? 0).toFixed(2)}x ` +
@@ -606,7 +620,8 @@ export async function runScreener(): Promise<Watchlist> {
       `| pattern: ${s.reversalPattern ?? '-'} / ${s.continuationPattern ?? '-'} ` +
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
       `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
-      (s.exchange ? ` | exch: ${s.exchange}` : ''),
+      (s.exchange ? ` | exch: ${s.exchange}` : '') +
+      (s.sentiment ? ` | sent: ${s.sentiment}` : ''),
     );
   });
 
@@ -618,13 +633,13 @@ export async function runScreener(): Promise<Watchlist> {
     benchmarkReturn,
     universeSize: rawUniverse.length,
     liquidFiltered: liquidUniverse.length,
-    symbols: [...filtered, ...v2Symbols],
+    symbols: [...retained, ...v2Symbols],
   };
 
   await writeWatchlist(watchlist);
   log.info(
     `Watchlist saved: ${path.resolve(config.paths.watchlist)} ` +
-    `(${filtered.length} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER preserved)`,
+    `(${retained.length} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER preserved)`,
   );
 
   void notifyWatchlistSaved(watchlist);

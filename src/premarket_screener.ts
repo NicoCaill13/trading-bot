@@ -7,10 +7,13 @@ import { getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
 import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
 import { passesClosePrice, sumShareVolume } from './screenerMath';
+import { createNewsProvider } from './newsProvider';
+import { filterWatchlistByBullishCatalyst } from './sentiment';
 import type { Watchlist, WatchlistSymbol } from './types';
 import type { AlpacaBar, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('PREMARKET_SCREENER');
+const newsProvider = createNewsProvider();
 
 const SNAPSHOT_BATCH_SIZE = 100;
 const VOLUME_FETCH_CONCURRENCY = 5;
@@ -199,7 +202,6 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
 function toWatchlistEntries(candidates: GapCandidate[]): WatchlistSymbol[] {
   return candidates
     .sort((a, b) => b.preMarketGapPct - a.preMarketGapPct)
-    .slice(0, config.premarket.watchlistMaxSize)
     .map(c => ({
       symbol: c.symbol,
       origin: 'V2_PLAYMAKER' as const,
@@ -247,12 +249,19 @@ export async function runPremarketScreener(): Promise<Watchlist> {
     `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%)`,
   );
 
-  const v2Symbols = toWatchlistEntries(dedupedCandidates);
+  const ranked = toWatchlistEntries(dedupedCandidates);
+  const poolSize = config.sentiment.enabled
+    ? Math.min(ranked.length, Math.max(config.premarket.watchlistMaxSize * 3, 30))
+    : config.premarket.watchlistMaxSize;
+  const v2SymbolsRaw = ranked.slice(0, poolSize);
+  const withCatalyst = await filterWatchlistByBullishCatalyst(v2SymbolsRaw, newsProvider);
+  const v2Symbols = withCatalyst.slice(0, config.premarket.watchlistMaxSize);
 
   v2Symbols.forEach(s => {
     log.info(
       `  ${s.symbol.padEnd(6)} | gap ${((s.preMarketGapPct ?? 0) * 100).toFixed(2)}% ` +
-      `| close $${(s.lastClose ?? 0).toFixed(2)}`,
+      `| close $${(s.lastClose ?? 0).toFixed(2)}` +
+      (s.sentiment ? ` | sent: ${s.sentiment}` : ''),
     );
   });
 
@@ -261,7 +270,11 @@ export async function runPremarketScreener(): Promise<Watchlist> {
 
   log.info(
     `${v2Symbols.length} V2_PLAYMAKER symbol(s) merged into watchlist.json ` +
-    `(${watchlist.symbols.length} total)`,
+    `(${watchlist.symbols.length} total` +
+    (config.sentiment.enabled
+      ? `; catalyst ${withCatalyst.length}/${v2SymbolsRaw.length}`
+      : '') +
+    `)`,
   );
 
   void notifyWatchlistSaved(watchlist);

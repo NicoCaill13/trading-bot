@@ -248,6 +248,14 @@ const config = {
       'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d',
   },
 
+  // News catalyst / sentiment gate (#21) — Alpaca News + lexicon classifier
+  sentiment: {
+    enabled: process.env.SENTIMENT_FILTER_ENABLED === 'true',
+    lookbackHours: parseIntEnv('SENTIMENT_LOOKBACK_HOURS', 48),
+    maxHeadlinesPerSymbol: parseIntEnv('SENTIMENT_MAX_HEADLINES', 25),
+    fetchConcurrency: parseIntEnv('SENTIMENT_FETCH_CONCURRENCY', 5),
+  },
+
   paths: {
     watchlist: './data/watchlist.json',
     watchlistV2: './data/watchlist_v2.json',
@@ -520,6 +528,23 @@ const config = {
   if (rg.choppyVixMin < 0 || rg.choppyVixMin > rg.vixRiskHalveThreshold) {
     throw new Error(
       `[SYSTEM] CHOPPY_VIX_MIN must be in [0, VIX_RISK_HALVE_THRESHOLD]: ${rg.choppyVixMin}`,
+    );
+  }
+
+  const sent = config.sentiment;
+  if (sent.lookbackHours < 1 || sent.lookbackHours > 168) {
+    throw new Error(
+      `[SYSTEM] SENTIMENT_LOOKBACK_HOURS out of bounds (1–168): ${sent.lookbackHours}`,
+    );
+  }
+  if (sent.maxHeadlinesPerSymbol < 1 || sent.maxHeadlinesPerSymbol > 50) {
+    throw new Error(
+      `[SYSTEM] SENTIMENT_MAX_HEADLINES out of bounds (1–50): ${sent.maxHeadlinesPerSymbol}`,
+    );
+  }
+  if (sent.fetchConcurrency < 1 || sent.fetchConcurrency > 20) {
+    throw new Error(
+      `[SYSTEM] SENTIMENT_FETCH_CONCURRENCY out of bounds (1–20): ${sent.fetchConcurrency}`,
     );
   }
 }());

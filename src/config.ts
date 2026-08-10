@@ -25,6 +25,14 @@ function parseIntEnv(key: string, defaultValue: number): number {
   return parsed;
 }
 
+function parseBusDropPolicy(raw: string | undefined): 'drop_oldest' | 'drop_newest' {
+  const value = (raw ?? 'drop_oldest').trim().toLowerCase();
+  if (value === 'drop_oldest' || value === 'drop_newest') return value;
+  throw new Error(
+    `[SYSTEM] BUS_DROP_POLICY must be drop_oldest|drop_newest: "${raw ?? ''}"`,
+  );
+}
+
 const config = {
   alpaca: {
     keyId: requireEnv('ALPACA_KEY_ID'),
@@ -200,6 +208,12 @@ const config = {
     screenerMinute: 0,
     preMarketHour: 9,
     preMarketMinute: 15,
+  },
+
+  // Market-data bus — decouples WS ingest from strategy decision (V8)
+  bus: {
+    maxQueueSize: parseIntEnv('BUS_MAX_QUEUE', 10_000),
+    dropPolicy: parseBusDropPolicy(process.env.BUS_DROP_POLICY),
   },
 
   paths: {
@@ -432,6 +446,11 @@ const config = {
   }
   if (pm.minGapUpPct <= 0) {
     throw new Error(`[SYSTEM] PREMARKET_MIN_GAP_UP_PCT must be > 0: ${pm.minGapUpPct}`);
+  }
+
+  const bus = config.bus;
+  if (bus.maxQueueSize < 1) {
+    throw new Error(`[SYSTEM] BUS_MAX_QUEUE must be >= 1: ${bus.maxQueueSize}`);
   }
 }());
 

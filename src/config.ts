@@ -216,6 +216,14 @@ const config = {
     dropPolicy: parseBusDropPolicy(process.env.BUS_DROP_POLICY),
   },
 
+  // Offline replay (#11) — deterministic fixture playback into the market-data bus
+  replay: {
+    slippageBps: parseFloatEnv('REPLAY_SLIPPAGE_BPS', 0),
+    fillDelayMs: parseIntEnv('REPLAY_FILL_DELAY_MS', 0),
+    // Documented seed for future RNG extensions; current model is RNG-free.
+    seed: process.env.REPLAY_SEED ?? '0',
+  },
+
   paths: {
     watchlist: './data/watchlist.json',
     watchlistV2: './data/watchlist_v2.json',
@@ -451,6 +459,14 @@ const config = {
   const bus = config.bus;
   if (bus.maxQueueSize < 1) {
     throw new Error(`[SYSTEM] BUS_MAX_QUEUE must be >= 1: ${bus.maxQueueSize}`);
+  }
+
+  const replay = config.replay;
+  if (replay.slippageBps < 0) {
+    throw new Error(`[SYSTEM] REPLAY_SLIPPAGE_BPS must be >= 0: ${replay.slippageBps}`);
+  }
+  if (replay.fillDelayMs < 0) {
+    throw new Error(`[SYSTEM] REPLAY_FILL_DELAY_MS must be >= 0: ${replay.fillDelayMs}`);
   }
 }());
 

@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "screener": "tsx src/screener.ts",
     "premarket-screener": "tsx src/premarket_screener.ts",
+    "replay": "tsx src/scripts/replay.ts",
     "test": "tsx --test 'src/**/*.test.ts'"
   },
   "dependencies": {

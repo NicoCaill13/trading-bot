@@ -305,6 +305,21 @@ export interface WsBarMessage {
   t: string;
 }
 
+/** Alpaca IEX quote (top-of-book). Not full multi-level L2. */
+export interface WsQuoteMessage {
+  T: 'q';
+  S: string;
+  /** Bid price */
+  bp: number;
+  /** Bid size */
+  bs: number;
+  /** Ask price */
+  ap: number;
+  /** Ask size */
+  as: number;
+  t: string;
+}
+
 export interface WsSuccessMessage {
   T: 'success';
   msg: string;
@@ -318,6 +333,7 @@ export interface WsErrorMessage {
 
 export type WsMessage =
   | WsBarMessage
+  | WsQuoteMessage
   | WsSuccessMessage
   | WsErrorMessage
   | { T: string };
@@ -327,10 +343,38 @@ export type BusDropPolicy = 'drop_oldest' | 'drop_newest';
 
 /**
  * Typed market-data bus events (WS producer → strategy consumer).
- * Extensible for quotes / L2 (#8) without changing the bus API.
  */
-export type MarketDataEvent = {
-  kind: 'bar_1m';
-  receivedAt: number;
-  bar: WsBarMessage;
-};
+export type MarketDataEvent =
+  | {
+      kind: 'bar_1m';
+      receivedAt: number;
+      bar: WsBarMessage;
+    }
+  | {
+      kind: 'quote';
+      receivedAt: number;
+      quote: WsQuoteMessage;
+    };
+
+export interface OrderBookLevel {
+  price: number;
+  size: number;
+}
+
+export interface OrderBookSnapshot {
+  symbol: string;
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+  mid: number | null;
+  timestamp: string;
+}
+
+export interface ImbalanceSignal {
+  symbol: string;
+  imbalance: number | null;
+  mid: number | null;
+  wall: boolean;
+  topBid: OrderBookLevel | null;
+  topAsk: OrderBookLevel | null;
+  assessedAt: number;
+}

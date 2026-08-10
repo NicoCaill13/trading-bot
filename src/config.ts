@@ -224,6 +224,14 @@ const config = {
     seed: process.env.REPLAY_SEED ?? '0',
   },
 
+  // Level 2 / quotes microstructure (#8) — IEX top-of-book proxy when enabled
+  level2: {
+    enabled: process.env.LEVEL2_ENABLED === 'true',
+    fastTrigger: process.env.L2_FAST_TRIGGER === 'true',
+    topN: parseIntEnv('L2_TOP_N', 5),
+    imbalanceThreshold: parseFloatEnv('L2_IMBALANCE_THRESHOLD', 0.65),
+  },
+
   paths: {
     watchlist: './data/watchlist.json',
     watchlistV2: './data/watchlist_v2.json',
@@ -467,6 +475,16 @@ const config = {
   }
   if (replay.fillDelayMs < 0) {
     throw new Error(`[SYSTEM] REPLAY_FILL_DELAY_MS must be >= 0: ${replay.fillDelayMs}`);
+  }
+
+  const l2 = config.level2;
+  if (l2.topN < 1) {
+    throw new Error(`[SYSTEM] L2_TOP_N must be >= 1: ${l2.topN}`);
+  }
+  if (l2.imbalanceThreshold <= 0 || l2.imbalanceThreshold > 1) {
+    throw new Error(
+      `[SYSTEM] L2_IMBALANCE_THRESHOLD out of bounds (0–1]: ${l2.imbalanceThreshold}`,
+    );
   }
 }());
 

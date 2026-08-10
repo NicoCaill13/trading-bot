@@ -10,6 +10,9 @@ import type { MarketDataEvent, TradeRecord, WsBarMessage } from './types';
 
 const log = createLogger('REPLAY');
 
+/** Replay fixtures are bar streams only (quotes out of scope for #11). */
+export type ReplayBarEvent = Extract<MarketDataEvent, { kind: 'bar_1m' }>;
+
 export type ReplaySide = 'buy' | 'sell';
 
 export interface ReplayOptions {
@@ -33,14 +36,14 @@ export interface ReplayReport {
   seed: string;
   slippageBps: number;
   fillDelayMs: number;
-  events: MarketDataEvent[];
+  events: ReplayBarEvent[];
   simulatedFills: SimulatedFill[];
   expectancy: ExpectancyMetrics | null;
 }
 
 export interface RunReplayParams {
   bus: MarketDataBus;
-  events: MarketDataEvent[];
+  events: ReplayBarEvent[];
   options: ReplayOptions;
   handler?: MarketDataHandler;
   /** Optional closed trades for E_R (e.g. journal fixture). */
@@ -88,14 +91,14 @@ function isWsBarMessage(value: unknown): value is WsBarMessage {
   );
 }
 
-function isMarketDataEvent(value: unknown): value is MarketDataEvent {
+function isReplayBarEvent(value: unknown): value is ReplayBarEvent {
   if (value === null || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
   return v.kind === 'bar_1m' && typeof v.receivedAt === 'number' && isWsBarMessage(v.bar);
 }
 
-/** Parse JSONL or a JSON array of MarketDataEvent. */
-export function parseReplayEvents(content: string): MarketDataEvent[] {
+/** Parse JSONL or a JSON array of bar_1m MarketDataEvent. */
+export function parseReplayEvents(content: string): ReplayBarEvent[] {
   const trimmed = content.trim();
   if (trimmed === '') return [];
 
@@ -105,14 +108,14 @@ export function parseReplayEvents(content: string): MarketDataEvent[] {
       throw new Error('[REPLAY] JSON fixture must be an array of MarketDataEvent');
     }
     return parsed.map((row, i) => {
-      if (!isMarketDataEvent(row)) {
+      if (!isReplayBarEvent(row)) {
         throw new Error(`[REPLAY] invalid MarketDataEvent at index ${i}`);
       }
       return row;
     });
   }
 
-  const events: MarketDataEvent[] = [];
+  const events: ReplayBarEvent[] = [];
   const lines = trimmed.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -123,7 +126,7 @@ export function parseReplayEvents(content: string): MarketDataEvent[] {
     } catch {
       throw new Error(`[REPLAY] invalid JSONL at line ${i + 1}`);
     }
-    if (!isMarketDataEvent(parsed)) {
+    if (!isReplayBarEvent(parsed)) {
       throw new Error(`[REPLAY] invalid MarketDataEvent at line ${i + 1}`);
     }
     events.push(parsed);
@@ -131,13 +134,13 @@ export function parseReplayEvents(content: string): MarketDataEvent[] {
   return events;
 }
 
-export async function loadReplayEvents(filePath: string): Promise<MarketDataEvent[]> {
+export async function loadReplayEvents(filePath: string): Promise<ReplayBarEvent[]> {
   const content = await fs.readFile(filePath, 'utf8');
   return parseReplayEvents(content);
 }
 
 /** Stable sort by receivedAt, then original index. */
-export function sortReplayEvents(events: readonly MarketDataEvent[]): MarketDataEvent[] {
+export function sortReplayEvents(events: readonly ReplayBarEvent[]): ReplayBarEvent[] {
   return events
     .map((event, index) => ({ event, index }))
     .sort((a, b) => {
@@ -173,10 +176,10 @@ export function applySlippageToBar(
 }
 
 export function applySlippageToEvent(
-  event: MarketDataEvent,
+  event: ReplayBarEvent,
   slippageBps: number,
   side: ReplaySide = 'buy',
-): MarketDataEvent {
+): ReplayBarEvent {
   return {
     ...event,
     bar: applySlippageToBar(event.bar, slippageBps, side),
@@ -184,8 +187,8 @@ export function applySlippageToEvent(
 }
 
 export function buildSimulatedFills(
-  original: readonly MarketDataEvent[],
-  slipped: readonly MarketDataEvent[],
+  original: readonly ReplayBarEvent[],
+  slipped: readonly ReplayBarEvent[],
 ): SimulatedFill[] {
   const n = Math.min(original.length, slipped.length);
   const fills: SimulatedFill[] = [];
@@ -211,9 +214,10 @@ export async function runReplay(params: RunReplayParams): Promise<ReplayReport> 
   const sorted = sortReplayEvents(params.events);
   const slipped = sorted.map(e => applySlippageToEvent(e, options.slippageBps, side));
   const simulatedFills = buildSimulatedFills(sorted, slipped);
-  const recorded: MarketDataEvent[] = [];
+  const recorded: ReplayBarEvent[] = [];
 
   const consumer: MarketDataHandler = async (event) => {
+    if (event.kind !== 'bar_1m') return;
     recorded.push(event);
     if (params.handler) {
       await params.handler(event);

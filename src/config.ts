@@ -44,7 +44,7 @@ const config = {
 
   risk: {
     maxPositions: parseIntEnv('MAX_POSITIONS', 5),
-    // Deprecated for sizing (V7 uses riskPerTradePct). Kept for portfolio share helpers / observability.
+    // Cash-account notional ceiling: qty * entry <= equity * maxPositionPct (no leverage).
     maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.20),
     riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.05),
     minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
@@ -83,8 +83,8 @@ const config = {
     minGapUpPct: parseFloatEnv('MIN_GAP_UP_PCT', 0.02),
     gapHoldTolerance: parseFloatEnv('GAP_HOLD_TOLERANCE', 0.01),
     watchlistMaxSize: parseIntEnv('WATCHLIST_MAX_SIZE', 50),
-    relativeStrengthLookbackDays: 20,
-    volumeAverageDays: 14,
+    relativeStrengthLookbackDays: parseIntEnv('RELATIVE_STRENGTH_LOOKBACK_DAYS', 20),
+    volumeAverageDays: parseIntEnv('VOLUME_AVERAGE_DAYS', 14),
     // V7 liquidity defaults (spec §1) — previously 10 / 50M
     minClosePrice: parseFloatEnv('MIN_CLOSE_PRICE', 5),
     minDollarVolume: parseFloatEnv('MIN_DOLLAR_VOLUME', 20_000_000),
@@ -208,6 +208,13 @@ const config = {
     screenerMinute: 0,
     preMarketHour: 9,
     preMarketMinute: 15,
+    // V3 time-decay slot cascade (EST) — was hardcoded in getTimedecaySlotLimits
+    decayTier1Hour: parseIntEnv('DECAY_TIER1_HOUR', 10),
+    decayTier1Minute: parseIntEnv('DECAY_TIER1_MINUTE', 15),
+    decayTier2Hour: parseIntEnv('DECAY_TIER2_HOUR', 11),
+    decayTier2Minute: parseIntEnv('DECAY_TIER2_MINUTE', 0),
+    decayTier3Hour: parseIntEnv('DECAY_TIER3_HOUR', 11),
+    decayTier3Minute: parseIntEnv('DECAY_TIER3_MINUTE', 45),
   },
 
   // Market-data bus — decouples WS ingest from strategy decision (V8)
@@ -242,7 +249,8 @@ const config = {
     // Heuristic CHOPPY: SPY ADR% >= floor AND VIX >= min (missing features → UNKNOWN)
     choppySpyAdrPct: parseFloatEnv('CHOPPY_SPY_ADR_PCT', 1.2),
     choppyVixMin: parseFloatEnv('CHOPPY_VIX_MIN', 18),
-    // Yahoo chart URL for ^VIX (external; graceful null on failure)
+    // TODO(#26): migrate off unofficial Yahoo chart URL (CORS / route churn risk)
+    // toward an official Alpaca market-data VIX (or VIX proxy ETF) source.
     vixYahooUrl:
       process.env.VIX_YAHOO_URL ??
       'https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d',
@@ -373,6 +381,16 @@ const config = {
   if (s.minDollarVolume <= 0) {
     throw new Error(`[SYSTEM] MIN_DOLLAR_VOLUME must be > 0: ${s.minDollarVolume}`);
   }
+  if (s.relativeStrengthLookbackDays < 1) {
+    throw new Error(
+      `[SYSTEM] RELATIVE_STRENGTH_LOOKBACK_DAYS must be >= 1: ${s.relativeStrengthLookbackDays}`,
+    );
+  }
+  if (s.volumeAverageDays < 1) {
+    throw new Error(
+      `[SYSTEM] VOLUME_AVERAGE_DAYS must be >= 1: ${s.volumeAverageDays}`,
+    );
+  }
   if (s.minAdrPct <= 0) {
     throw new Error(`[SYSTEM] MIN_ADR_PCT must be > 0: ${s.minAdrPct}`);
   }
@@ -488,6 +506,27 @@ const config = {
     throw new Error(`[SYSTEM] PREMARKET_MIN_GAP_UP_PCT must be > 0: ${pm.minGapUpPct}`);
   }
 
+  const sess = config.session;
+  const decayMins = [
+    sess.decayTier1Hour * 60 + sess.decayTier1Minute,
+    sess.decayTier2Hour * 60 + sess.decayTier2Minute,
+    sess.decayTier3Hour * 60 + sess.decayTier3Minute,
+  ];
+  for (const [label, hour, minute] of [
+    ['DECAY_TIER1', sess.decayTier1Hour, sess.decayTier1Minute],
+    ['DECAY_TIER2', sess.decayTier2Hour, sess.decayTier2Minute],
+    ['DECAY_TIER3', sess.decayTier3Hour, sess.decayTier3Minute],
+  ] as const) {
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+      throw new Error(`[SYSTEM] ${label}_HOUR/MINUTE out of bounds`);
+    }
+  }
+  if (!(decayMins[0] < decayMins[1] && decayMins[1] < decayMins[2])) {
+    throw new Error(
+      `[SYSTEM] DECAY_TIER times must be strictly increasing: ${decayMins.join(' < ')}`,
+    );
+  }
+
   const bus = config.bus;
   if (bus.maxQueueSize < 1) {
     throw new Error(`[SYSTEM] BUS_MAX_QUEUE must be >= 1: ${bus.maxQueueSize}`);
@@ -582,22 +621,23 @@ export function getTimedecaySlotLimits(
 ): { coreMaxPositions: number; satelliteMaxPositions: number } {
   const max = config.risk.maxPositions;
   const minutesSinceMidnight = estNow.getHours() * 60 + estNow.getMinutes();
-  const t1015 = 10 * 60 + 15;
-  const t1100 = 11 * 60;
-  const t1145 = 11 * 60 + 45;
+  const sess = config.session;
+  const tTier1 = sess.decayTier1Hour * 60 + sess.decayTier1Minute;
+  const tTier2 = sess.decayTier2Hour * 60 + sess.decayTier2Minute;
+  const tTier3 = sess.decayTier3Hour * 60 + sess.decayTier3Minute;
 
   let core = 4;
   let satellite = max - core;
 
-  if (minutesSinceMidnight >= t1015 && activeCoreCount < 4) {
+  if (minutesSinceMidnight >= tTier1 && activeCoreCount < 4) {
     core = 3;
     satellite = 2;
   }
-  if (minutesSinceMidnight >= t1100 && activeCoreCount < 3) {
+  if (minutesSinceMidnight >= tTier2 && activeCoreCount < 3) {
     core = 2;
     satellite = 3;
   }
-  if (minutesSinceMidnight >= t1145 && activeCoreCount < 2) {
+  if (minutesSinceMidnight >= tTier3 && activeCoreCount < 2) {
     core = 1;
     satellite = 4;
   }

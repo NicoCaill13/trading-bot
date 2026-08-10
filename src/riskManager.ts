@@ -6,6 +6,7 @@ import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { fetchAtr5m } from './atr5m';
 import {
+  capQtyByMaxNotional,
   capQtyBySettledCash,
   computeRiskBasedQty,
   computeTakeProfitPrice,
@@ -150,12 +151,20 @@ export async function computePositionSize(
     stopLossPrice,
   );
   qty = capQtyBySettledCash(qty, entryPrice, settledCash);
+  qty = capQtyByMaxNotional(
+    qty,
+    entryPrice,
+    totalEquity,
+    config.risk.maxPositionPct,
+  );
 
   if (qty < 1) {
     throw new Error(
       `${symbol}: risk sizing insufficient — ` +
       `equity $${totalEquity.toFixed(2)} × ${(riskPct * 100).toFixed(1)}% ` +
-      `/ stopDist $${stopDistance.toFixed(4)} (settled cash $${settledCash.toFixed(2)})`,
+      `/ stopDist $${stopDistance.toFixed(4)} ` +
+      `(settled cash $${settledCash.toFixed(2)}, ` +
+      `maxNotional ${(config.risk.maxPositionPct * 100).toFixed(0)}%)`,
     );
   }
 

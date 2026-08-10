@@ -2,6 +2,7 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getESTDate, toErrorMessage } from './utils';
 import { createLogger } from './logger';
+import { isVwapPullbackEntryWindow } from './vwapSetup';
 import {
   sendTelegramAlert,
   formatEntryAlert,
@@ -29,13 +30,14 @@ let queueProcessing = false;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function isInBlackoutPeriod(): boolean {
-  const est = getESTDate();
-  const h = est.getHours();
-  const m = est.getMinutes();
-  if (h < config.session.marketOpenHour) return true;
-  if (h === config.session.marketOpenHour && m < config.session.blackoutEndMinute) return true;
-  return false;
+/** V7 Core entries only inside configured EST window (default 10:00–11:30). */
+function isOutsideCoreEntryWindow(): boolean {
+  return !isVwapPullbackEntryWindow(getESTDate(), {
+    startHour: config.entry.entryWindowStartHour,
+    startMinute: config.entry.entryWindowStartMinute,
+    endHour: config.entry.entryWindowEndHour,
+    endMinute: config.entry.entryWindowEndMinute,
+  });
 }
 
 // True before 09:30 (cash market not yet open).
@@ -400,7 +402,7 @@ function computeMarketableLimitPrice(askPrice: number): number {
 
 /**
  * Bracket order on entry: aggressive marketable limit + stop-loss + take-profit (R:R).
- * Core entries respect opening blackout; Satellite (ORB) may enter during blackout.
+ * Core entries respect V7 window 10:00–11:30 EST; Satellite (ORB) may enter during morning blackout.
  */
 export async function placeBracketOrder(
   symbol: string,
@@ -412,8 +414,12 @@ export async function placeBracketOrder(
   tier: SignalTier = 'core',
   prefetchedAskPrice?: number,
 ): Promise<AlpacaOrder> {
-  if (tier === 'core' && isInBlackoutPeriod()) {
-    throw new Error(`Blackout active — Core order ${symbol} blocked until 09:45 EST`);
+  if (tier === 'core' && isOutsideCoreEntryWindow()) {
+    throw new Error(
+      `Core entry window closed — order ${symbol} blocked outside ` +
+      `${config.entry.entryWindowStartHour}:${String(config.entry.entryWindowStartMinute).padStart(2, '0')}` +
+      `–${config.entry.entryWindowEndHour}:${String(config.entry.entryWindowEndMinute).padStart(2, '0')} EST`,
+    );
   }
   if (tier === 'satellite' && isPreMarketPeriod()) {
     throw new Error(`Pre-market — Satellite order ${symbol} blocked before 09:30 EST`);

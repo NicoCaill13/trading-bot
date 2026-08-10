@@ -29,6 +29,16 @@ import {
   evaluateFibProximity,
   formatFibLog,
 } from './fibonacci';
+import {
+  hasVolumeDryUp,
+  isGreenBarWithRvol,
+  isNearVwap,
+  isVwapPullbackEntryWindow,
+  minutesSinceMidnight,
+  shouldHardBanSpyBearish,
+  volumesFromBars,
+  type EntryWindowBounds,
+} from './vwapSetup';
 import type {
   BarData,
   PendingSignal,
@@ -51,6 +61,7 @@ import type { SessionDataEntry } from './riskManager';
 import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SYSTEM');
+const traderLog = createLogger('TRADER');
 
 // ---------------------------------------------------------------------------
 // Global session state
@@ -152,6 +163,25 @@ function isBlackoutPeriod(): boolean {
     h < config.session.marketOpenHour ||
     (h === config.session.marketOpenHour && m < config.session.blackoutEndMinute)
   );
+}
+
+function coreEntryWindowBounds(): EntryWindowBounds {
+  return {
+    startHour: config.entry.entryWindowStartHour,
+    startMinute: config.entry.entryWindowStartMinute,
+    endHour: config.entry.entryWindowEndHour,
+    endMinute: config.entry.entryWindowEndMinute,
+  };
+}
+
+function isCoreEntryWindowOpen(): boolean {
+  return isVwapPullbackEntryWindow(getESTDate(), coreEntryWindowBounds());
+}
+
+function isBeforeCoreEntryWindow(): boolean {
+  const bounds = coreEntryWindowBounds();
+  const start = bounds.startHour * 60 + bounds.startMinute;
+  return minutesSinceMidnight(getESTDate()) < start;
 }
 
 // True only during the ORB window: market is open (>= 09:30) AND before 09:45.
@@ -696,8 +726,9 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * V3 VWAP breakout starts the pullback state machine (TRACKING_PULLBACK).
- * Execution is deferred until dynamic support + first tick up (evaluatePullbackState).
+ * V7 Core: VWAP breakout starts TRACKING_PULLBACK; buy signal is confirmed on later 5m bars
+ * (near VWAP 0.1% + volume dry-up + green close + RVOL > min).
+ * Satellite: same breakout arming; execution still via 1m tick-up (evaluatePullbackState).
  */
 function queuePendingSignal(signal: PendingSignal): void {
   signalQueue.enqueue(signal);
@@ -780,12 +811,23 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
 function evaluateSignal(symbol: string, latestBar: BarData): void {
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
-  if (pullbackTrackers.has(symbol)) return;
+
+  const existing = pullbackTrackers.get(symbol);
+  if (existing) {
+    if (existing.tier === 'core') {
+      evaluateCoreV7Pullback(symbol, latestBar);
+    }
+    return;
+  }
 
   const tier = getSymbolTier(symbol);
   if (tier === 'satellite' && isBlackoutPeriod()) return;
 
-  if (!config.entry.tradeDuringLunch && isLunchPeriod()) return;
+  if (tier === 'core') {
+    if (!isCoreEntryWindowOpen()) return;
+  } else if (!config.entry.tradeDuringLunch && isLunchPeriod()) {
+    return;
+  }
 
   const bars = signalBars5m.get(symbol) ?? [];
   if (bars.length < 2) return;
@@ -801,7 +843,8 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   if (currentPrice <= vwap) return;
 
-  if (!passesRvolForPullback(latestBar, bars)) {
+  // Satellite still arms on RVOL at breakout; Core confirms RVOL on the green 5m later.
+  if (tier === 'satellite' && !passesRvolForPullback(latestBar, bars)) {
     const rvol = computeIntradayRvol(latestBar, bars);
     log.info(
       `${symbol}: VWAP breakout below RVOL threshold — ` +
@@ -811,7 +854,9 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   }
 
   const recentBars = bars.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
-  const avgVolume = recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length;
+  const avgVolume = recentBars.length > 0
+    ? recentBars.reduce((sum, b) => sum + b.volume, 0) / recentBars.length
+    : latestBar.volume;
 
   const vwapDeviation = (currentPrice - vwap) / vwap;
   const momentumScore = latestBar.volume * vwapDeviation;
@@ -825,6 +870,8 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
     score: momentumScore,
     avgVolume,
     fibLevels: null,
+    impulseVolumes: volumesFromBars(bars, config.entry.pullbackImpulseBars),
+    pullbackVolumes: [],
   });
 
   log.info(
@@ -836,7 +883,76 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 }
 
 /**
- * V3 pullback micro-structure on 1-min bars: support touch then first tick up → queue.
+ * V7 Core confirmation on 5m bars (no 1m tick-up / EMA9).
+ */
+function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
+  if (tradingHalted || hasEntered(symbol)) {
+    pullbackTrackers.delete(symbol);
+    return;
+  }
+
+  const tracker = pullbackTrackers.get(symbol);
+  if (!tracker || tracker.tier !== 'core') return;
+
+  if (!isCoreEntryWindowOpen()) {
+    if (!isBeforeCoreEntryWindow()) {
+      pullbackTrackers.delete(symbol);
+      log.info(`${symbol}: Core pullback tracker cleared — entry window closed`);
+    }
+    return;
+  }
+
+  if (latestBar.high > tracker.localHigh) {
+    tracker.localHigh = latestBar.high;
+  }
+
+  tracker.pullbackVolumes = [...tracker.pullbackVolumes, latestBar.volume];
+
+  const bars = signalBars5m.get(symbol) ?? [];
+  const vwap = computeVwap(bars) ?? tracker.vwapAtDetection;
+
+  if (!isNearVwap(latestBar.close, vwap, config.entry.vwapProximityPct)) return;
+
+  if (
+    !hasVolumeDryUp(
+      tracker.pullbackVolumes,
+      tracker.impulseVolumes,
+      config.entry.pullbackDryUpRatio,
+    )
+  ) {
+    return;
+  }
+
+  const rvol = computeIntradayRvol(latestBar, bars);
+  if (!isGreenBarWithRvol(latestBar, rvol, config.entry.minRvolForPullback)) return;
+
+  tracker.fibLevels = deriveFibLevelsFromBars(bars, tracker.localHigh);
+  const fibProx = tracker.fibLevels
+    ? evaluateFibProximity(latestBar.close, tracker.fibLevels, config.fibonacci.proximityTolerancePct)
+    : null;
+
+  pullbackTrackers.delete(symbol);
+  log.info(
+    `${symbol}: Core V7 pullback confirmed — ` +
+    `close $${latestBar.close.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
+    `rvol ${rvol === null ? 'N/A' : rvol.toFixed(2)}x` +
+    (fibProx ? ` | ${formatFibLog(fibProx)}` : '') +
+    ` → queued`,
+  );
+  queuePendingSignal({
+    symbol,
+    tier: 'core',
+    score: tracker.score,
+    barData: latestBar,
+    vwap,
+    avgVolume: tracker.avgVolume,
+    fibLevels: tracker.fibLevels,
+  });
+}
+
+/**
+ * Satellite legacy V3 pullback on 1-min bars: support (VWAP|EMA9) then first tick up → queue.
+ * Core never uses this path (V7 confirms on 5m via evaluateCoreV7Pullback).
  */
 function evaluatePullbackState(symbol: string, bar1m: BarData): void {
   if (tradingHalted || hasEntered(symbol)) {
@@ -845,7 +961,7 @@ function evaluatePullbackState(symbol: string, bar1m: BarData): void {
   }
 
   const tracker = pullbackTrackers.get(symbol);
-  if (!tracker) return;
+  if (!tracker || tracker.tier !== 'satellite') return;
 
   const session = sessionData.get(symbol);
   const vwap = session?.vwap ?? tracker.vwapAtDetection;
@@ -1011,6 +1127,13 @@ async function executeSignalsForTier(
       const spyTrend = await fetchSpyTrend5m();
       const filters = feedbackEngine.getFilters();
 
+      if (tier === 'core' && shouldHardBanSpyBearish(spyTrend)) {
+        traderLog.warn(
+          `${symbol}: Core entry hard-banned — SPY 5m trend bearish`,
+        );
+        continue;
+      }
+
       const vwapDist = ((referencePrice - vwap) / vwap) * 100;
       if (vwapDist > filters.maxVwapEntryDistancePct) {
         log.warn(
@@ -1041,14 +1164,6 @@ async function executeSignalsForTier(
         log.warn(
           `${symbol}: entry blocked by FeedbackEngine — gap ${gapPct.toFixed(1)}% ` +
           `> cap ${filters.maxGapPctForEntry}%`,
-        );
-        continue;
-      }
-
-      const origin = screenerData?.origin ?? 'V1_CORE';
-      if (filters.blockV1WhenSpyBearish && origin === 'V1_CORE' && spyTrend === 'bearish') {
-        log.warn(
-          `${symbol}: V1_CORE entry blocked by FeedbackEngine — SPY bearish + historical pattern`,
         );
         continue;
       }
@@ -1180,16 +1295,23 @@ async function flushPendingSignals(): Promise<void> {
     const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
     const coreCandidates = filterEntered(signalQueue.getCoreSignals());
 
-    const blackout = isBlackoutPeriod();
-    if (blackout && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
-      log.info(`Blackout active — ${coreCandidates.length} Core signal(s) deferred`);
-      schedulePendingSignalFlush();
+    const coreWindowOpen = isCoreEntryWindowOpen();
+    const beforeCoreWindow = isBeforeCoreEntryWindow();
+
+    if (!coreWindowOpen && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
+      if (beforeCoreWindow) {
+        log.info(`Core entry window not open — ${coreCandidates.length} Core signal(s) deferred`);
+        schedulePendingSignalFlush();
+        return;
+      }
+      log.info(`Core entry window closed — dropping ${coreCandidates.length} Core signal(s)`);
+      signalQueue.clearCore();
       return;
     }
 
     const executedSymbols: string[] = [];
 
-    if (!blackout && coreCandidates.length > 0) {
+    if (coreWindowOpen && coreCandidates.length > 0) {
       log.info(
         `Flush Core — ${coreCandidates.length} candidate(s), ` +
         `slots ${coreSlotsAvailable}/${slotLimits.coreMaxPositions} ` +
@@ -1200,9 +1322,14 @@ async function flushPendingSignals(): Promise<void> {
         coreSlotsAvailable,
       );
       executedSymbols.push(...coreExecuted);
-    } else if (blackout && coreCandidates.length > 0) {
-      log.info(`Blackout active — ${coreCandidates.length} Core signal(s) kept pending`);
-      schedulePendingSignalFlush();
+    } else if (!coreWindowOpen && coreCandidates.length > 0) {
+      if (beforeCoreWindow) {
+        log.info(`Core entry window not open — ${coreCandidates.length} Core signal(s) kept pending`);
+        schedulePendingSignalFlush();
+      } else {
+        log.info(`Core entry window closed — dropping ${coreCandidates.length} Core signal(s)`);
+        signalQueue.clearCore();
+      }
     }
 
     if (satelliteCandidates.length > 0) {
@@ -1225,7 +1352,8 @@ async function flushPendingSignals(): Promise<void> {
 
     signalQueue.remove(executedSymbols);
 
-    if (!blackout) {
+    // Keep pending Core only while waiting for the 10:00 window; otherwise drain.
+    if (coreWindowOpen || !beforeCoreWindow) {
       signalQueue.clear();
     }
   } finally {

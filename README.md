@@ -35,7 +35,8 @@ Le code est découpé en **6 modules métier** + utilitaires :
 | **Screener Satellite** | `src/premarket_screener.ts` | Scan pré-market (V2), Catalyst Score, export watchlist Satellite |
 | **Trader** | `src/trader.ts` | File d’ordres, bracket orders, liquidations, trailing stops |
 | **Risk Manager** | `src/riskManager.ts` | Sizing ATR par tier, scale-out, circuit breaker, sweeps EOD |
-| **Orchestrateur** | `src/index.ts` | WebSocket, signaux VWAP / ORB, flush dual-bucket, persistance session |
+| **Orchestrateur** | `src/index.ts` | WebSocket, VWAP Pullback V7 / ORB, flush dual-bucket, persistance session |
+| **VWAP setup** | `src/vwapSetup.ts` | Prédicats purs fenêtre / proximité / dry-up / RVOL / ban SPY |
 | **File prioritaire** | `src/signalQueue.ts` | Files Satellite (haute priorité) / Core, enregistrement Play-Maker 09h15 |
 
 Utilitaires : `alpacaClient.ts`, `logger.ts`, `notifier.ts`, `types.ts`, `utils.ts`.
@@ -160,7 +161,14 @@ Univers restreint aux exchanges **NYSE** et **NASDAQ**. Le float n’est pas fou
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `VOLUME_BREAKOUT_MULTIPLIER` | `1.5` | Conviction volume (VWAP et ORB) |
+| `VOLUME_BREAKOUT_MULTIPLIER` | `1.5` | Conviction volume (ORB / Satellite) |
+| `ENTRY_WINDOW_START_HOUR` / `_MINUTE` | `10` / `0` | Début fenêtre Core EST (inclus) |
+| `ENTRY_WINDOW_END_HOUR` / `_MINUTE` | `11` / `30` | Fin fenêtre Core EST (exclu) |
+| `VWAP_PROXIMITY_PCT` | `0.001` | Proximité VWAP Core (0,1 %) |
+| `MIN_RVOL_FOR_PULLBACK` | `1.5` | RVOL confirmation 5m Core (strict >) ; legacy arming était 1.2 |
+| `PULLBACK_DRY_UP_RATIO` | `0.70` | Dry-up volume repli vs impulsion |
+| `PULLBACK_IMPULSE_BARS` | `5` | N barres d’impulsion pour dry-up |
+| `PULLBACK_SUPPORT_PCT` | `0.002` | Legacy Satellite tick-up (0,2 %) — pas le path Core |
 | `SIGNAL_BATCH_WINDOW_MS` | `10000` | Fenêtre debounce des signaux (10 s) |
 | `ORB_WINDOW_BARS` | `1` | Bougies 5 min pour définir l’Opening Range (Satellite) |
 | `ENTRY_LIMIT_OFFSET_PCT` | `0` | Prix limite d’achat = close × (1 + offset). `0` = au close ; négatif = en dessous |
@@ -246,20 +254,24 @@ Exécuté automatiquement à **09h15** (après réconciliation broker) ou via `n
 
 ---
 
-### 3. Entrée intraday — Core (VWAP) et Satellite (ORB + VWAP)
+### 3. Entrée intraday — Core (VWAP Pullback V7) et Satellite (ORB + VWAP)
 
-Surveillance en **barres 5 minutes** (WebSocket IEX). **Aucun RSI.**
+Surveillance en **barres 5 minutes** (WebSocket IEX).
 
-#### Core — signal VWAP
+#### Core — VWAP Pullback V7
 
 | Condition | Règle |
 |-----------|--------|
-| Blackout matinal | Aucune entrée Core avant **09h45 EST** |
-| Heures creuses | Par défaut, aucune entrée **12h00–14h00 EST** |
-| Cassure VWAP | Bougie précédente ≤ VWAP **et** bougie courante > VWAP |
-| Conviction volume | Volume > **1,5×** moyenne des **5** bougies précédentes |
+| Fenêtre d’entrée | **Uniquement** `10:00 <= EST < 11:30` (configurable) |
+| Ban SPY | Si `spy_trend_5m === bearish` → **aucun** buy Core (hard ban `[TRADER]`) |
+| Armement | Cassure VWAP 5m (prev ≤ VWAP, close > VWAP) → tracking pullback |
+| Proximité | `|price − VWAP| / VWAP <= 0,1 %` (pas d’EMA9) |
+| Dry-up | Volume moyen des barres de repli **< 70 %** de la moyenne des **N** barres d’impulsion (N=5) |
+| Trigger | Close 5m **verte** **et** `RVOL_5m > 1,5` (plus de tick-up 1m) |
 | Debounce | File **10 s**, classement par Momentum Score dans le bucket Core |
 | Slots | Jusqu’à **4** positions Core (défaut) |
+
+Legacy V3 (retirés du path Core) : proximité **0,2 %** + support EMA9, RVOL breakout **1,2**, trigger tick-up 1m — encore utilisés uniquement pour le fallback VWAP **Satellite**.
 
 #### Satellite — Opening Range Breakout (ORB)
 
@@ -267,7 +279,7 @@ Surveillance en **barres 5 minutes** (WebSocket IEX). **Aucun RSI.**
 |-----------|--------|
 | Fenêtre ORB | **09h30–09h45 EST** : collecte du range sur `ORB_WINDOW_BARS` bougies |
 | Breakout | `close > ORB high` + conviction volume → entrée **pendant le blackout** |
-| Fallback | Après **09h45**, même logique **VWAP** que le Core si ORB non déclenché |
+| Fallback | Après **09h45**, logique VWAP legacy (support + tick-up 1m) si ORB non déclenché |
 | Slots | **1** position Satellite max (défaut) |
 
 #### Exécution commune
@@ -323,9 +335,10 @@ Exemple (défauts) : Core **0,8 %** equity à risque, Satellite **0,2 %**.
 | Heure | Événement |
 |-------|-----------|
 | **09h15** | Réconciliation broker + screener Satellite + subscribe WS |
-| **09h30** | Ouverture — blackout entrées **Core** ; fenêtre **ORB Satellite** |
-| **09h45** | Fin blackout — signaux VWAP Core + fallback VWAP Satellite |
-| **12h00–14h00** | Lunch filter (entrées off par défaut) |
+| **09h30** | Ouverture — fenêtre **ORB Satellite** (Core hors fenêtre) |
+| **09h45** | Fin fenêtre ORB — fallback VWAP Satellite (legacy) |
+| **10h00–11h30** | Fenêtre d’entrée **Core** VWAP Pullback V7 |
+| **12h00–14h00** | Lunch filter Satellite (entrées off par défaut) |
 | **15h45** | EOD sweep + blocage nouvelles entrées |
 | **15h58** | Hard close — liquidation totale |
 | **16h05** | Rapport journalier |
@@ -362,7 +375,8 @@ Alertes : démarrage (Core/Satellite counts), positions au redémarrage, circuit
 ```
 trading-bot/
 ├── src/
-│   ├── index.ts              # Orchestrateur, WebSocket, VWAP / ORB, flush dual-bucket
+│   ├── index.ts              # Orchestrateur, WebSocket, VWAP V7 / ORB, flush dual-bucket
+│   ├── vwapSetup.ts          # Prédicats VWAP Pullback V7 (purs)
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation
 │   ├── screener.ts           # Screener Core (V1)
 │   ├── screenerMath.ts       # Pure liquidity / ADR gates

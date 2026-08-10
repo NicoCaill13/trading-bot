@@ -7,8 +7,8 @@ import {
   computeRollingExpectancy,
   normalizeTradeRecord,
   resolveRiskDollarsAtEntry,
-} from './expectancy';
-import type { TradeRecord } from './types';
+} from '../src/expectancy';
+import type { TradeRecord } from '../src/types';
 
 function baseTrade(overrides: Partial<TradeRecord>): TradeRecord {
   return normalizeTradeRecord({

@@ -8,9 +8,9 @@ import {
   parseReplayEvents,
   runReplay,
   sortReplayEvents,
-} from './replayEngine';
-import { createMarketDataBus } from './marketDataBus';
-import type { MarketDataEvent } from './types';
+} from '../src/replayEngine';
+import { createMarketDataBus } from '../src/marketDataBus';
+import type { MarketDataEvent } from '../src/types';
 
 function barEvent(
   symbol: string,

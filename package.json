@@ -9,7 +9,7 @@
     "screener": "tsx src/screener.ts",
     "premarket-screener": "tsx src/premarket_screener.ts",
     "replay": "tsx src/scripts/replay.ts",
-    "test": "tsx --test 'src/**/*.test.ts'"
+    "test": "tsx --test test/*.test.ts test/patterns/*.test.ts"
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.2",

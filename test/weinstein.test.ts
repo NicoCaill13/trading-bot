@@ -5,7 +5,7 @@ import {
   computeSma,
   computeSmaAt,
   passesWeinsteinGate,
-} from './weinstein';
+} from '../src/weinstein';
 
 /** Build a rising close series of length n ending at `end`. */
 function risingCloses(n: number, start = 10, step = 0.1): number[] {

@@ -9,7 +9,7 @@ import {
   passesFloatGate,
   sumShareVolume,
   type OhlcBar,
-} from './screenerMath';
+} from '../src/screenerMath';
 
 function bar(high: number, low: number, close: number): OhlcBar {
   return { high, low, close };

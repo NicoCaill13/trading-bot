@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMarketDataBus } from './marketDataBus';
-import type { MarketDataEvent, WsBarMessage } from './types';
+import { createMarketDataBus } from '../src/marketDataBus';
+import type { MarketDataEvent, WsBarMessage } from '../src/types';
 
 function barEvent(symbol: string, receivedAt = Date.now()): MarketDataEvent {
   const bar: WsBarMessage = {

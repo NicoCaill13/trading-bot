@@ -8,7 +8,7 @@ import {
   findSwingLows,
   type PatternBar,
   type ReversalPatternOpts,
-} from './reversal';
+} from '../../src/patterns/reversal';
 
 function bar(low: number, high: number, close: number, volume: number): PatternBar {
   return { low, high, close, volume };

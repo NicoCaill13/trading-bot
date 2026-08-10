@@ -4,9 +4,9 @@ import {
   assessBullishCatalyst,
   classifyHeadline,
   filterWatchlistByBullishCatalyst,
-} from './sentiment';
-import type { NewsHeadline, NewsProvider } from './newsProvider';
-import type { WatchlistSymbol } from './types';
+} from '../src/sentiment';
+import type { NewsHeadline, NewsProvider } from '../src/newsProvider';
+import type { WatchlistSymbol } from '../src/types';
 
 function headline(text: string, id = '1'): NewsHeadline {
   return {

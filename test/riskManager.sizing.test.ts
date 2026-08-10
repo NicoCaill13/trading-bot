@@ -5,7 +5,7 @@ import {
   computeRiskBasedQty,
   computeTakeProfitPrice,
   passesMinRiskReward,
-} from './riskSizing';
+} from '../src/riskSizing';
 
 describe('computeRiskBasedQty', () => {
   it('sizes by equity * riskPct / stop distance', () => {

@@ -8,8 +8,8 @@ import {
   minutesSinceMidnight,
   shouldHardBanSpyBearish,
   volumesFromBars,
-} from './vwapSetup';
-import type { BarData } from './types';
+} from '../src/vwapSetup';
+import type { BarData } from '../src/types';
 
 const WINDOW = {
   startHour: 10,

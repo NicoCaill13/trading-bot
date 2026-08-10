@@ -135,12 +135,16 @@ Les paramètres de stratégie sont **optionnels** ; les valeurs par défaut sont
 | `SMA_200_PERIOD` | `200` | SMA 200 daily |
 | `SMA_150_SLOPE_WEEKS` | `8` | Fenêtre pente SMA150 (`× 5` sessions) ; accept si slope ≥ 0 |
 | `PATTERN_FILTER_ENABLED` | `true` | Annotate soft ETEI / Spring post-Weinstein (pas de hard reject) |
-| `PATTERN_LOOKBACK_BARS` | `90` | Fenêtre daily pour détection patterns |
+| `PATTERN_LOOKBACK_BARS` | `120` | Fenêtre daily pour détection patterns (reversal + continuation) |
 | `PATTERN_PIVOT_LEFT` / `RIGHT` | `3` | Fenêtre swing low |
 | `ETEI_BREAKOUT_RVOL` | `1.5` | RVOL cassure neckline (**strictement >**) |
 | `SPRING_RECLAIM_RVOL` | `1.5` | RVOL réintégration Spring (**≥**) |
 | `SPRING_SUPPORT_TOLERANCE_PCT` | `0.005` | Tolérance égalité des 2 touches de support |
 | `PATTERN_RVOL_AVG_DAYS` | `14` | Moyenne volume pour RVOL pattern |
+| `BULL_FLAG_IMPULSE_MIN_PCT` | `0.08` | Impulsion min Bull Flag (+8 %) |
+| `BULL_FLAG_VOL_DRY_UP_RATIO` | `0.60` | Vol moyen flag ≤ 60 % vol impulsion |
+| `HANDLE_MAX_RETRACE_PCT` | `0.15` | Retrace handle max (15 % de l’advance cup) |
+| `FLAT_BASE_ATR_COMPRESSION_RATIO` | `0.70` | ATR court ≤ 70 % ATR référence |
 
 Univers restreint aux exchanges **NYSE** et **NASDAQ**. Le float n’est pas fourni de façon fiable par Alpaca : laisser `FLOAT_FILTER_ENABLED=false` tant qu’un provider (Polygon / FMP / IEX Cloud) n’est pas branché derrière `src/floatProvider.ts`.
 
@@ -226,7 +230,7 @@ Exécuté automatiquement si `data/watchlist.json` est absent, manuellement via 
 
 1. **Univers dynamique** : actifs US `active`, `tradable`, `marginable`, exchanges **NYSE** / **NASDAQ**.
 2. **Pré-filtre liquidité** (snapshots) : clôture ≥ **5 $**, dollar volume ≥ **20 M$**.
-3. **Analyse journalière** : ADR 14j > **4 %**, Weinstein Phase 2 (close > SMA150 & SMA200, pente SMA150 8 semaines ≥ 0), annotate soft patterns retournement (**ETEI** / **Spring**, post-Weinstein — pas de scan Phase 1 autonome), force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×** (float optionnel via `FLOAT_FILTER_ENABLED`).
+3. **Analyse journalière** : ADR 14j > **4 %**, Weinstein Phase 2 (close > SMA150 & SMA200, pente SMA150 8 semaines ≥ 0), annotate soft patterns (**ETEI** / **Spring** + **Bull Flag** / **Cup & Handle** / **Flat Base**, post-Weinstein), force relative vs **SPY** (20 j), gap up ≥ **+2 %**, gap tenu, RVOL ≥ **2×** (float optionnel via `FLOAT_FILTER_ENABLED`).
 4. Tri par alpha, export des **50** meilleurs → `data/watchlist.json` (`source: core`).
 
 ---
@@ -364,7 +368,8 @@ trading-bot/
 │   ├── screenerMath.ts       # Pure liquidity / ADR gates
 │   ├── weinstein.ts          # Pure Weinstein Phase 2 (SMA 150/200 + slope)
 │   ├── patterns/
-│   │   └── reversal.ts       # Pure ETEI + Double Bottom / Spring
+│   │   ├── reversal.ts       # Pure ETEI + Double Bottom / Spring
+│   │   └── continuation.ts   # Pure Bull Flag + Cup&Handle + Flat Base
 │   ├── premarket_screener.ts # Screener Satellite (V2) → signalQueue
 │   ├── floatProvider.ts      # Float port (disabled until external vendor)
 │   ├── signalQueue.ts        # Files prioritaires Core / Satellite

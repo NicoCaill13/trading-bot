@@ -414,12 +414,27 @@ Feature flag **`REGIME_MODEL_ENABLED=false`** par défaut. Job dans le cron pré
 
 ---
 
-### 10. Résilience et réconciliation
+### 10. Sentiment / catalyseur news (watchlist)
+
+Feature flag **`SENTIMENT_FILTER_ENABLED=false`** par défaut.
+
+Quand activé, après le screener Core (20h) et Satellite (09h15) :
+
+1. Fetch Alpaca News (`/v1beta1/news`) — headlines des **48 h** par symbole.
+2. Classifieur **lexique** léger → `BULLISH` / `BEARISH` / `NEUTRAL`.
+3. **Hard reject** si aucun headline BULLISH (anti pump & dump sans catalyseur).
+4. Enrichissement watchlist : `sentiment`, `catalystHeadline`, `catalystScore`.
+
+Port `NewsProvider` (adapter Alpaca ; Finnhub interchangeable). Logs `[SENTIMENT]` / `[NEWS]`. Échec API → reject (pas de faux positif).
+
+---
+
+### 11. Résilience et réconciliation
 
 - Au boot : `data/session_state.json` → symboles entrés avec **tier** (`core` | `satellite`).
 - Format legacy (`string[]`) toujours accepté → tier `core` par défaut.
 - Réconciliation broker : positions ouvertes + trailing stops (évite double scale-out).
-- **09h15** : réconciliation + **régime matin** + screener Satellite + abonnement WebSocket aux nouveaux symboles.
+- **09h15** : réconciliation + **régime matin** + screener Satellite (+ catalyseur si flag) + abonnement WebSocket aux nouveaux symboles.
 - Reset **20h00** : purge état, screener Core, reconnexion WebSocket.
 - Rapport **16h05** : bilan PnL journalier + expectancy E_R (session / 20 / 50) + scénario.
 
@@ -477,6 +492,8 @@ trading-bot/
 │   ├── replayEngine.ts       # Replay offline + slippage (purs)
 │   ├── orderBook.ts          # Imbalance / wall L2 (quotes)
 │   ├── regimeModel.ts        # Régime matin + VIX scaling (ports DIP)
+│   ├── sentiment.ts          # Lexique BULLISH/BEARISH + gate catalyseur
+│   ├── newsProvider.ts       # Port news (Alpaca /v1beta1/news)
 │   ├── scripts/replay.ts     # CLI npm run replay
 │   ├── analyzer.ts           # Post-mortem KPIs + expectancy
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation

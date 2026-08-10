@@ -149,6 +149,9 @@ export interface ContinuationPatternSignal {
   pivots: PivotPoint[];
 }
 
+/** Lexicon news headline sentiment for the catalyst gate (#21). */
+export type NewsSentiment = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+
 export interface WatchlistSymbol {
   symbol: string;
   origin: SignalOrigin;
@@ -164,6 +167,10 @@ export interface WatchlistSymbol {
   lastOpen?: number;
   preMarketGapPct?: number;
   catalystScore?: number;
+  /** Lexicon sentiment of the strongest recent catalyst headline. */
+  sentiment?: NewsSentiment;
+  /** Headline that armed the bullish catalyst gate (when present). */
+  catalystHeadline?: string;
   /** Average Daily Range % over screener.adrLookbackDays (Core). */
   adrPct?: number;
   /** Free float shares when float filter provider is available. */

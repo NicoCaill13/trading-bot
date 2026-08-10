@@ -40,6 +40,7 @@ Le code est découpé en **6 modules métier** + utilitaires :
 | **Expectancy** | `src/expectancy.ts` | E_R, rolling 20/50, classification scénario |
 | **Market data bus** | `src/marketDataBus.ts` | Queue typée WS → stratégie (FIFO, backpressure) |
 | **Replay** | `src/replayEngine.ts` | Playback fixture → bus + slippage / rapport |
+| **Order book** | `src/orderBook.ts` | Imbalance / buy-wall (quotes IEX) |
 | **File prioritaire** | `src/signalQueue.ts` | Files Satellite (haute priorité) / Core, enregistrement Play-Maker 09h15 |
 
 Utilitaires : `alpacaClient.ts`, `logger.ts`, `notifier.ts`, `types.ts`, `utils.ts`.
@@ -339,7 +340,7 @@ Post-mortem (`[ANALYZER]`, ~16h05) calcule sur trades **clos** uniquement :
 
 ### 6. Market data bus — découplage WS / décision
 
-Le handler WebSocket **ne calcule aucun signal** : il publie des `MarketDataEvent` (`bar_1m`) sur `marketDataBus`. Un consumer async sérialisé (drain `setImmediate`) appelle `handleOneMinuteBarEvent` (agrégation 1m→5m, ORB, VWAP V7, exits) sans bloquer le socket.
+Le handler WebSocket **ne calcule aucun signal** : il publie des `MarketDataEvent` (`bar_1m`, et `quote` si `LEVEL2_ENABLED`) sur `marketDataBus`. Un consumer async sérialisé (drain `setImmediate`) appelle `handleOneMinuteBarEvent` (agrégation 1m→5m, ORB, VWAP V7, exits) sans bloquer le socket.
 
 | Paramètre | Défaut | Rôle |
 |-----------|--------|------|
@@ -371,7 +372,24 @@ Rapport : fills simulés (raw close → fillPrice), dropped bus, E_R optionnel s
 
 ---
 
-### 8. Résilience et réconciliation
+### 8. Level 2 — order book imbalance (quotes IEX)
+
+Feature flag **`LEVEL2_ENABLED=false`** par défaut (graceful degrade : bars-only, pas de crash).
+
+Sur IEX paper, les **quotes** Alpaca exposent le **top-of-book** (1 niveau bid/ask + size), **pas** un carnet L2 multi-niveaux SIP. `L2_TOP_N` est prévu pour un futur feed depth ; runtime IEX = N effectif **1**.
+
+| Paramètre | Défaut | Rôle |
+|-----------|--------|------|
+| `LEVEL2_ENABLED` | `false` | Subscribe `quotes` + consumer bus |
+| `L2_IMBALANCE_THRESHOLD` | `0.65` | `bidSize / (bid+ask)` pour mur d’achat |
+| `L2_FAST_TRIGGER` | `false` | Wall + near VWAP → entrée sans attendre close verte 5m |
+| Proximité VWAP | `VWAP_PROXIMITY_PCT` | `|mid−VWAP|/VWAP <= 0.1%` |
+
+Logs `[L2]` : imbalance, mid, top bid/ask, `wall=YES/no`. Path Core nominal : dry-up + green RVOL ; si quotes vues pour le symbole, wall requis. Upgrade SIP/depth nécessaire pour vrai L2 N>1.
+
+---
+
+### 9. Résilience et réconciliation
 
 - Au boot : `data/session_state.json` → symboles entrés avec **tier** (`core` | `satellite`).
 - Format legacy (`string[]`) toujours accepté → tier `core` par défaut.
@@ -432,6 +450,7 @@ trading-bot/
 │   ├── expectancy.ts         # E_R + scénarios (purs)
 │   ├── marketDataBus.ts      # Bus market data (WS producer / strategy consumer)
 │   ├── replayEngine.ts       # Replay offline + slippage (purs)
+│   ├── orderBook.ts          # Imbalance / wall L2 (quotes)
 │   ├── scripts/replay.ts     # CLI npm run replay
 │   ├── analyzer.ts           # Post-mortem KPIs + expectancy
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation

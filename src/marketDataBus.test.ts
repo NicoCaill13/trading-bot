@@ -48,7 +48,7 @@ describe('marketDataBus FIFO', () => {
     });
 
     bus.start(async (e) => {
-      seen.push(e.bar.S);
+      if (e.kind === 'bar_1m') seen.push(e.bar.S);
       if (seen.length === 3) resolveDone();
     });
 
@@ -109,7 +109,7 @@ describe('marketDataBus backpressure', () => {
       resolveDone = r;
     });
     bus.start(async (e) => {
-      seen.push(e.bar.S);
+      if (e.kind === 'bar_1m') seen.push(e.bar.S);
       if (seen.length === 3) resolveDone();
     });
 
@@ -140,7 +140,7 @@ describe('marketDataBus backpressure', () => {
       resolveDone = r;
     });
     bus.start(async (e) => {
-      seen.push(e.bar.S);
+      if (e.kind === 'bar_1m') seen.push(e.bar.S);
       if (seen.length === 3) resolveDone();
     });
 
@@ -185,7 +185,7 @@ describe('marketDataBus stop', () => {
     bus.stop();
 
     bus.start(async (e) => {
-      seen.push(e.bar.S);
+      if (e.kind === 'bar_1m') seen.push(e.bar.S);
     });
 
     // stop() cleared the handler binding; start again should drain residual if still queued.

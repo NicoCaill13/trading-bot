@@ -16,7 +16,7 @@ function barEvent(
   symbol: string,
   receivedAt: number,
   close: number,
-): MarketDataEvent {
+): Extract<MarketDataEvent, { kind: 'bar_1m' }> {
   return {
     kind: 'bar_1m',
     receivedAt,

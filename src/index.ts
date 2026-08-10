@@ -41,6 +41,7 @@ import {
 } from './vwapSetup';
 import { resolveRiskDollarsAtEntry } from './expectancy';
 import { createMarketDataBus } from './marketDataBus';
+import { assessQuoteForWall } from './orderBook';
 import type {
   BarData,
   PendingSignal,
@@ -53,10 +54,12 @@ import type {
   EnteredSymbolEntry,
   WsMessage,
   WsBarMessage,
+  WsQuoteMessage,
   WsSuccessMessage,
   WsErrorMessage,
   DiscordField,
   SpyTrend,
+  ImbalanceSignal,
 } from './types';
 import { resolveSymbolTier } from './types';
 import type { SessionDataEntry } from './riskManager';
@@ -64,6 +67,7 @@ import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SYSTEM');
 const traderLog = createLogger('TRADER');
+const l2Log = createLogger('L2');
 
 /** WS producer → strategy consumer (decoupled ingest). */
 const marketDataBus = createMarketDataBus({
@@ -103,6 +107,10 @@ const v2PersistentSymbols = new Set<string>();
 const pullbackTrackers = new Map<string, PullbackTracker>();
 const ema9ClosePrices = new Map<string, number[]>();
 const EMA9_HISTORY_MAX = 50;
+
+// Level 2 / quote wall arming (Core VWAP complementary trigger)
+const l2WallSignals = new Map<string, ImbalanceSignal>();
+const l2QuotesSeen = new Set<string>();
 
 // Rolling 1-min bar history for RSI, VMA_10 and Satellite volume confirmation
 const oneMinBarHistory = new Map<string, BarData[]>();
@@ -897,6 +905,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
 /**
  * V7 Core confirmation on 5m bars (no 1m tick-up / EMA9).
+ * When LEVEL2_ENABLED: wall flag can unlock L2_FAST_TRIGGER or gate nominal path after quotes seen.
  */
 function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   if (tradingHalted || hasEntered(symbol)) {
@@ -926,6 +935,15 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
 
   if (!isNearVwap(latestBar.close, vwap, config.entry.vwapProximityPct)) return;
 
+  const wallArmed = l2WallSignals.get(symbol)?.wall === true;
+  const l2Enabled = config.level2.enabled;
+
+  // Fast path: buy-wall + near VWAP → queue without waiting for green 5m.
+  if (l2Enabled && config.level2.fastTrigger && wallArmed) {
+    confirmCoreV7Entry(symbol, latestBar, tracker, vwap, bars, 'L2_FAST_TRIGGER');
+    return;
+  }
+
   if (
     !hasVolumeDryUp(
       tracker.pullbackVolumes,
@@ -939,14 +957,43 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   const rvol = computeIntradayRvol(latestBar, bars);
   if (!isGreenBarWithRvol(latestBar, rvol, config.entry.minRvolForPullback)) return;
 
+  // Once quotes have been seen for this symbol, require an armed wall (graceful if never seen).
+  if (l2Enabled && l2QuotesSeen.has(symbol) && !wallArmed) {
+    l2Log.info(
+      `${symbol}: Core confirm blocked — L2 wall not armed ` +
+      `(imbalance=${l2WallSignals.get(symbol)?.imbalance?.toFixed(2) ?? 'N/A'})`,
+    );
+    return;
+  }
+
+  confirmCoreV7Entry(
+    symbol,
+    latestBar,
+    tracker,
+    vwap,
+    bars,
+    wallArmed ? 'V7+L2_WALL' : 'V7',
+  );
+}
+
+function confirmCoreV7Entry(
+  symbol: string,
+  latestBar: BarData,
+  tracker: PullbackTracker,
+  vwap: number,
+  bars: BarData[],
+  reason: string,
+): void {
+  const rvol = computeIntradayRvol(latestBar, bars);
   tracker.fibLevels = deriveFibLevelsFromBars(bars, tracker.localHigh);
   const fibProx = tracker.fibLevels
     ? evaluateFibProximity(latestBar.close, tracker.fibLevels, config.fibonacci.proximityTolerancePct)
     : null;
 
   pullbackTrackers.delete(symbol);
+  l2WallSignals.delete(symbol);
   log.info(
-    `${symbol}: Core V7 pullback confirmed — ` +
+    `${symbol}: Core V7 pullback confirmed (${reason}) — ` +
     `close $${latestBar.close.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
     `rvol ${rvol === null ? 'N/A' : rvol.toFixed(2)}x` +
     (fibProx ? ` | ${formatFibLog(fibProx)}` : '') +
@@ -1506,11 +1553,22 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function buildSubscribeMessage(symbols: string[]): string {
-  return JSON.stringify({ action: 'subscribe', bars: symbols });
+  const payload: { action: string; bars: string[]; quotes?: string[] } = {
+    action: 'subscribe',
+    bars: symbols,
+  };
+  if (config.level2.enabled) {
+    payload.quotes = symbols;
+  }
+  return JSON.stringify(payload);
 }
 
 function isWsBarMessage(msg: WsMessage): msg is WsBarMessage {
   return msg.T === 'b';
+}
+
+function isWsQuoteMessage(msg: WsMessage): msg is WsQuoteMessage {
+  return msg.T === 'q';
 }
 
 function isWsSuccessMessage(msg: WsMessage): msg is WsSuccessMessage {
@@ -1519,6 +1577,45 @@ function isWsSuccessMessage(msg: WsMessage): msg is WsSuccessMessage {
 
 function isWsErrorMessage(msg: WsMessage): msg is WsErrorMessage {
   return msg.T === 'error';
+}
+
+function resolveVwapForSymbol(symbol: string): number | null {
+  const bars = signalBars5m.get(symbol);
+  if (bars && bars.length > 0) {
+    return computeVwap(bars);
+  }
+  return sessionData.get(symbol)?.vwap ?? null;
+}
+
+function handleQuoteEvent(quote: WsQuoteMessage, receivedAt: number): void {
+  if (!config.level2.enabled) return;
+
+  try {
+    const vwap = resolveVwapForSymbol(quote.S);
+    const signal = assessQuoteForWall(quote, vwap, {
+      imbalanceThreshold: config.level2.imbalanceThreshold,
+      vwapProximityPct: config.entry.vwapProximityPct,
+      topN: config.level2.topN,
+      assessedAt: receivedAt,
+    });
+
+    l2QuotesSeen.add(quote.S);
+    l2WallSignals.set(quote.S, signal);
+
+    const bid = signal.topBid;
+    const ask = signal.topAsk;
+    l2Log.info(
+      `${quote.S}: imbalance=${signal.imbalance === null ? 'N/A' : signal.imbalance.toFixed(3)} ` +
+      `mid=${signal.mid === null ? 'N/A' : `$${signal.mid.toFixed(2)}`} ` +
+      `vwap=${vwap === null ? 'N/A' : `$${vwap.toFixed(2)}`} ` +
+      `bid=${bid ? `${bid.size}@${bid.price.toFixed(2)}` : 'N/A'} ` +
+      `ask=${ask ? `${ask.size}@${ask.price.toFixed(2)}` : 'N/A'} ` +
+      `wall=${signal.wall ? 'YES' : 'no'}`,
+    );
+  } catch (err: unknown) {
+    // Graceful degrade — never crash the bus consumer on bad quotes.
+    l2Log.warn(`${quote.S}: quote handling failed — ${toErrorMessage(err)}`);
+  }
 }
 
 async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promise<void> {
@@ -1533,12 +1630,14 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 
   for (const msg of messages) {
     if (isWsSuccessMessage(msg) && msg.msg === 'authenticated') {
-      log.info(`WebSocket authenticated — subscribing to ${symbols.length} symbols`);
+      log.info(
+        `WebSocket authenticated — subscribing to ${symbols.length} symbols` +
+        (config.level2.enabled ? ' (bars+quotes)' : ' (bars)'),
+      );
       ws?.send(buildSubscribeMessage(symbols));
     }
 
     if (isWsBarMessage(msg)) {
-      // Producer only — strategy runs on the async market-data bus consumer.
       marketDataBus.publish({
         kind: 'bar_1m',
         receivedAt: Date.now(),
@@ -1546,8 +1645,19 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
       });
     }
 
+    if (config.level2.enabled && isWsQuoteMessage(msg)) {
+      marketDataBus.publish({
+        kind: 'quote',
+        receivedAt: Date.now(),
+        quote: msg,
+      });
+    }
+
     if (isWsErrorMessage(msg)) {
       log.warn(`WebSocket error: code ${msg.code} — ${msg.msg}`);
+      if (config.level2.enabled && /quote/i.test(msg.msg)) {
+        l2Log.warn(`Quote feed error — degrading to bars-only path: ${msg.msg}`);
+      }
       void sendTelegramAlert(formatErrorAlert(`WebSocket: code ${msg.code} — ${msg.msg}`));
     }
   }
@@ -1890,10 +2000,21 @@ async function main(): Promise<void> {
   marketDataBus.start(async (event) => {
     if (event.kind === 'bar_1m') {
       await handleOneMinuteBarEvent(event.bar);
+      return;
+    }
+    if (event.kind === 'quote') {
+      handleQuoteEvent(event.quote, event.receivedAt);
     }
   });
 
   connectWebSocket(symbols);
+
+  if (config.level2.enabled) {
+    l2Log.info(
+      `LEVEL2 enabled — IEX quotes subscribed | threshold=${config.level2.imbalanceThreshold} ` +
+      `fastTrigger=${config.level2.fastTrigger} topN=${config.level2.topN} (IEX effective depth=1)`,
+    );
+  }
 
   const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
   const satCount = [...symbolTier.values()].filter(t => t === 'satellite').length;

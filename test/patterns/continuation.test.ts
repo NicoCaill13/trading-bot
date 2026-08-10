@@ -7,8 +7,8 @@ import {
   detectCupAndHandle,
   detectFlatBase,
   type ContinuationPatternOpts,
-} from './continuation';
-import type { PatternBar } from './reversal';
+} from '../../src/patterns/continuation';
+import type { PatternBar } from '../../src/patterns/reversal';
 
 function bar(low: number, high: number, close: number, volume: number): PatternBar {
   return { low, high, close, volume };

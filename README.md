@@ -514,6 +514,10 @@ trading-bot/
 │   ├── types.ts
 │   ├── utils.ts
 │   └── alpaca.d.ts           # Types SDK Alpaca
+├── test/                     # Tests unitaires (tsx --test)
+│   ├── *.test.ts
+│   └── patterns/
+├── fixtures/                 # Fixtures replay / CI
 ├── data/                     # Watchlists & état session
 ├── logs/                     # Logs applicatifs
 ├── .env.example

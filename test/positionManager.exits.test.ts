@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldActivateAtrTrail, shouldTriggerTimeStop } from './exitPredicates';
+import { shouldActivateAtrTrail, shouldTriggerTimeStop } from '../src/exitPredicates';
 
 describe('shouldTriggerTimeStop', () => {
   const entry = '2026-08-08T14:00:00.000Z';

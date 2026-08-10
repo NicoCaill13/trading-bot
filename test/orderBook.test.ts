@@ -5,8 +5,8 @@ import {
   computeImbalance,
   detectBuyWall,
   quoteToSnapshot,
-} from './orderBook';
-import type { OrderBookLevel, WsQuoteMessage } from './types';
+} from '../src/orderBook';
+import type { OrderBookLevel, WsQuoteMessage } from '../src/types';
 
 function levels(sizes: number[], price = 100): OrderBookLevel[] {
   return sizes.map(size => ({ price, size }));

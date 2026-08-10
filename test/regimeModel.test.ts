@@ -9,8 +9,8 @@ import {
   resetRegimeSnapshotForTests,
   resolveRegimeScaling,
   setRegimeSnapshotForTests,
-} from './regimeModel';
-import type { RegimeFeatures } from './types';
+} from '../src/regimeModel';
+import type { RegimeFeatures } from '../src/types';
 
 const classifier = new HeuristicRegimeClassifier({
   choppySpyAdrPct: 1.2,

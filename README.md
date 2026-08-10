@@ -39,6 +39,7 @@ Le code est découpé en **6 modules métier** + utilitaires :
 | **VWAP setup** | `src/vwapSetup.ts` | Prédicats purs fenêtre / proximité / dry-up / RVOL / ban SPY |
 | **Expectancy** | `src/expectancy.ts` | E_R, rolling 20/50, classification scénario |
 | **Market data bus** | `src/marketDataBus.ts` | Queue typée WS → stratégie (FIFO, backpressure) |
+| **Replay** | `src/replayEngine.ts` | Playback fixture → bus + slippage / rapport |
 | **File prioritaire** | `src/signalQueue.ts` | Files Satellite (haute priorité) / Core, enregistrement Play-Maker 09h15 |
 
 Utilitaires : `alpacaClient.ts`, `logger.ts`, `notifier.ts`, `types.ts`, `utils.ts`.
@@ -349,7 +350,28 @@ Logs overflow : `[BUS]` (throttlés). Extensible quotes/L2 (#8) et replay (#11) 
 
 ---
 
-### 7. Résilience et réconciliation
+### 7. Replay engine — session offline (fixture)
+
+Rejoue un flux `MarketDataEvent` (`bar_1m`) dans le **même bus** que le live (`createMarketDataBus` → consumer), **sans réseau**.
+
+```bash
+npm run replay -- --fixture fixtures/replay/sample-session.jsonl
+npm run replay -- --fixture path.jsonl --slippage-bps 5 --trades data/journal.json
+```
+
+| Paramètre | Défaut | Rôle |
+|-----------|--------|------|
+| `REPLAY_SLIPPAGE_BPS` | `0` | Slippage adverse sur le close (buy = +bps) |
+| `REPLAY_FILL_DELAY_MS` | `0` | Délai avant chaque `publish` (0 en CI) |
+| `REPLAY_SEED` | `0` | Seed documenté (modèle actuel sans RNG) |
+
+Rapport : fills simulés (raw close → fillPrice), dropped bus, E_R optionnel si `--trades` (journal clos).
+
+**Capture paper :** exporter les bars reçues en JSONL `{ kind, receivedAt, bar }` (même shape que le WS). **Strategy live replay** (handler `index.ts`) = follow-up après extraction du consumer.
+
+---
+
+### 8. Résilience et réconciliation
 
 - Au boot : `data/session_state.json` → symboles entrés avec **tier** (`core` | `satellite`).
 - Format legacy (`string[]`) toujours accepté → tier `core` par défaut.
@@ -409,6 +431,8 @@ trading-bot/
 │   ├── vwapSetup.ts          # Prédicats VWAP Pullback V7 (purs)
 │   ├── expectancy.ts         # E_R + scénarios (purs)
 │   ├── marketDataBus.ts      # Bus market data (WS producer / strategy consumer)
+│   ├── replayEngine.ts       # Replay offline + slippage (purs)
+│   ├── scripts/replay.ts     # CLI npm run replay
 │   ├── analyzer.ts           # Post-mortem KPIs + expectancy
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation
 │   ├── screener.ts           # Screener Core (V1)

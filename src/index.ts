@@ -39,6 +39,7 @@ import {
   volumesFromBars,
   type EntryWindowBounds,
 } from './vwapSetup';
+import { resolveRiskDollarsAtEntry } from './expectancy';
 import type {
   BarData,
   PendingSignal,
@@ -1236,6 +1237,13 @@ async function executeSignalsForTier(
         spy_trend_5m: spyTrend,
         fib_level_at_entry: fibLevelAtEntry,
         fib_level_name_at_entry: fibLevelNameAtEntry,
+        equity_at_entry: allocation.totalCapital,
+        risk_dollars_at_entry: resolveRiskDollarsAtEntry(
+          Math.max(0, referencePrice - stopLossPrice),
+          qty,
+          allocation.totalCapital,
+          config.risk.riskPerTradePct,
+        ),
       });
 
       executed.push(symbol);

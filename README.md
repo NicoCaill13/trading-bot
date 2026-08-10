@@ -37,6 +37,7 @@ Le code est découpé en **6 modules métier** + utilitaires :
 | **Risk Manager** | `src/riskManager.ts` | Sizing ATR par tier, scale-out, circuit breaker, sweeps EOD |
 | **Orchestrateur** | `src/index.ts` | WebSocket, VWAP Pullback V7 / ORB, flush dual-bucket, persistance session |
 | **VWAP setup** | `src/vwapSetup.ts` | Prédicats purs fenêtre / proximité / dry-up / RVOL / ban SPY |
+| **Expectancy** | `src/expectancy.ts` | E_R, rolling 20/50, classification scénario |
 | **File prioritaire** | `src/signalQueue.ts` | Files Satellite (haute priorité) / Core, enregistrement Play-Maker 09h15 |
 
 Utilitaires : `alpacaClient.ts`, `logger.ts`, `notifier.ts`, `types.ts`, `utils.ts`.
@@ -319,14 +320,29 @@ Exemple (défauts) : Core **0,8 %** equity à risque, Satellite **0,2 %**.
 
 ---
 
-### 5. Résilience et réconciliation
+### 5. Expectancy — tracking E en R-multiples
+
+À chaque entrée, le journal stocke `equity_at_entry` et `risk_dollars_at_entry` (stop × qty, fallback equity × `RISK_PER_TRADE_PCT`). À la clôture : `pnl_r = net_pnl_dollars / risk_dollars_at_entry`.
+
+Post-mortem (`[ANALYZER]`, ~16h05) calcule sur trades **clos** uniquement :
+
+| Fenêtre | Métriques |
+|---------|-----------|
+| Session du jour | WR, AvgWin_R, AvgLoss_R, **E_R**, scénario |
+| Last 20 / Last 50 | Idem (journal cumulatif) |
+
+`E = WR × AvgWin_R − LossRate × AvgLoss_R`. Scénario le plus proche : **Break-even** (33,3 % / 0R), **Robustesse** (60 % / +0,80R), **Standard** (71,4 % / +1,14R), **Sniper** (80 % / +1,40R). Lignes journal legacy sans `risk_$` sont ignorées pour E_R (migration soft).
+
+---
+
+### 6. Résilience et réconciliation
 
 - Au boot : `data/session_state.json` → symboles entrés avec **tier** (`core` | `satellite`).
 - Format legacy (`string[]`) toujours accepté → tier `core` par défaut.
 - Réconciliation broker : positions ouvertes + trailing stops (évite double scale-out).
 - **09h15** : réconciliation + screener Satellite + abonnement WebSocket aux nouveaux symboles.
 - Reset **20h00** : purge état, screener Core, reconnexion WebSocket.
-- Rapport **16h05** : bilan PnL journalier.
+- Rapport **16h05** : bilan PnL journalier + expectancy E_R (session / 20 / 50) + scénario.
 
 ---
 
@@ -341,7 +357,7 @@ Exemple (défauts) : Core **0,8 %** equity à risque, Satellite **0,2 %**.
 | **12h00–14h00** | Lunch filter Satellite (entrées off par défaut) |
 | **15h45** | EOD sweep + blocage nouvelles entrées |
 | **15h58** | Hard close — liquidation totale |
-| **16h05** | Rapport journalier |
+| **16h05** | Rapport journalier + post-mortem E_R / scénario |
 | **20h00** | Reset session + screener Core pour le lendemain |
 
 Toutes les heures sont calculées en fuseau **America/New_York**.
@@ -377,6 +393,8 @@ trading-bot/
 ├── src/
 │   ├── index.ts              # Orchestrateur, WebSocket, VWAP V7 / ORB, flush dual-bucket
 │   ├── vwapSetup.ts          # Prédicats VWAP Pullback V7 (purs)
+│   ├── expectancy.ts         # E_R + scénarios (purs)
+│   ├── analyzer.ts           # Post-mortem KPIs + expectancy
 │   ├── config.ts             # Configuration, portfolio Core/Satellite, validation
 │   ├── screener.ts           # Screener Core (V1)
 │   ├── screenerMath.ts       # Pure liquidity / ADR gates

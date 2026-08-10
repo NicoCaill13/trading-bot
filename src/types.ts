@@ -321,3 +321,16 @@ export type WsMessage =
   | WsSuccessMessage
   | WsErrorMessage
   | { T: string };
+
+/** Backpressure policy when the market-data queue is full. */
+export type BusDropPolicy = 'drop_oldest' | 'drop_newest';
+
+/**
+ * Typed market-data bus events (WS producer → strategy consumer).
+ * Extensible for quotes / L2 (#8) without changing the bus API.
+ */
+export type MarketDataEvent = {
+  kind: 'bar_1m';
+  receivedAt: number;
+  bar: WsBarMessage;
+};

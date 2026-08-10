@@ -40,6 +40,7 @@ import {
   type EntryWindowBounds,
 } from './vwapSetup';
 import { resolveRiskDollarsAtEntry } from './expectancy';
+import { createMarketDataBus } from './marketDataBus';
 import type {
   BarData,
   PendingSignal,
@@ -63,6 +64,12 @@ import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('SYSTEM');
 const traderLog = createLogger('TRADER');
+
+/** WS producer → strategy consumer (decoupled ingest). */
+const marketDataBus = createMarketDataBus({
+  maxQueueSize: config.bus.maxQueueSize,
+  dropPolicy: config.bus.dropPolicy,
+});
 
 // ---------------------------------------------------------------------------
 // Global session state
@@ -420,6 +427,11 @@ function closeWebSocket(): void {
   ws.close();
   ws = null;
   log.info('WebSocket closed cleanly');
+}
+
+function haltMarketDataIngest(): void {
+  closeWebSocket();
+  marketDataBus.clear();
 }
 
 function pushEma9Close(symbol: string, close: number): void {
@@ -1437,7 +1449,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
         const drawdownTriggered = await riskManager.checkDailyDrawdownKillSwitch(equity);
         if (drawdownTriggered) {
           tradingHalted = true;
-          closeWebSocket();
+          haltMarketDataIngest();
           const pnlPct = (((equity - sessionStartEquity) / sessionStartEquity) * 100).toFixed(2);
           log.info(`Trading halted — daily drawdown ${pnlPct}% reached`);
           void sendTelegramAlert(
@@ -1451,7 +1463,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
         const triggered = await riskManager.checkCircuitBreaker(equity);
         if (triggered) {
           tradingHalted = true;
-          closeWebSocket();
+          haltMarketDataIngest();
           const pnlPct = (((equity - sessionStartEquity) / sessionStartEquity) * 100).toFixed(2);
           log.info(`Trading halted — daily target +${pnlPct}% reached`);
           alertCritical(
@@ -1526,7 +1538,12 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
     }
 
     if (isWsBarMessage(msg)) {
-      await handleOneMinuteBarEvent(msg);
+      // Producer only — strategy runs on the async market-data bus consumer.
+      marketDataBus.publish({
+        kind: 'bar_1m',
+        receivedAt: Date.now(),
+        bar: msg,
+      });
     }
 
     if (isWsErrorMessage(msg)) {
@@ -1629,7 +1646,7 @@ function scheduleHardClose(): void {
         return;
       }
       riskManager.runHardClose()
-        .then(() => closeWebSocket())
+        .then(() => haltMarketDataIngest())
         .catch((err: unknown) => {
           log.error(`Hard close error: ${toErrorMessage(err)}`);
         });
@@ -1741,7 +1758,7 @@ function scheduleDailyReset(): void {
 
       if (!tradingToday) {
         log.info('Market closed today — Core screener skipped');
-        closeWebSocket();
+        haltMarketDataIngest();
         return;
       }
 
@@ -1756,7 +1773,7 @@ function scheduleDailyReset(): void {
         monitoredSymbols = newSymbols;
         ensureV2SymbolsMonitored();
         log.info(`Core screener done — ${newSymbols.length} symbol(s) ready for next session`);
-        closeWebSocket();
+        haltMarketDataIngest();
         log.info('Post-session screener done — WebSocket remains closed until next trading day boot');
       } catch (err: unknown) {
         log.error(`Post-session screener failed: ${toErrorMessage(err)}`);
@@ -1869,6 +1886,12 @@ async function main(): Promise<void> {
   await reconcileStateFromBroker();
 
   await hydrateIntradayBars(symbols);
+
+  marketDataBus.start(async (event) => {
+    if (event.kind === 'bar_1m') {
+      await handleOneMinuteBarEvent(event.bar);
+    }
+  });
 
   connectWebSocket(symbols);
 

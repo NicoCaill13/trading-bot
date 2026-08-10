@@ -58,7 +58,7 @@ Deux buckets coexistent sur la même session (même WebSocket, même risk manage
 
 - Les signaux sont classés et exécutés **par bucket** (pas de classement global Core vs Satellite).
 - Un symbole présent dans les deux watchlists est traité en **Satellite** (priorité V2).
-- Plafond nominal par position : `MAX_POSITION_PCT` réparti selon le tier (ex. 16 % Core / 4 % Satellite si base 20 %).
+- Plafond notionnel cash par position : `MAX_POSITION_PCT` de l’équité (ex. 20 %) — empêche le levier quand le stop est très serré.
 - **Plafond agrégé** : `getPortfolioAllocation(origin)` dans `riskManager.ts` — le capital **déployé** Satellite ne peut pas dépasser **20 %** de l’équité (idem 80 % pour Core).
 
 ---
@@ -109,7 +109,7 @@ Les paramètres de stratégie sont **optionnels** ; les valeurs par défaut sont
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `MAX_POSITIONS` | `5` | Nombre max de positions simultanées (tous buckets) |
-| `MAX_POSITION_PCT` | `0.20` | Plafond nominal global (réparti par tier) |
+| `MAX_POSITION_PCT` | `0.20` | Plafond notionnel cash : `qty×entry ≤ equity×MAX_POSITION_PCT` (anti-levier) |
 | `RISK_PER_TRADE_PCT` | `0.05` | Risque de base par trade (5 %), avant part Core/Satellite ; halved si VIX > seuil régime |
 | `CORE_RISK_SHARE` | `0.80` | Part du risque allouée au bucket Core |
 | `SATELLITE_RISK_SHARE` | `0.20` | Part du risque allouée au bucket Satellite |
@@ -397,7 +397,7 @@ Feature flag **`REGIME_MODEL_ENABLED=false`** par défaut. Job dans le cron pré
 
 | Feature | Source |
 |---------|--------|
-| VIX last | Yahoo `^VIX` (HTTPS natif) — échec → `null` |
+| VIX last | Yahoo `^VIX` (HTTPS natif) — échec → `null` — **TODO** migrer vers source Alpaca officielle |
 | SPY ADR 14j | Alpaca daily bars |
 | Volume PM global (proxy) | Somme shares 1Min SPY+QQQ EST `[04:00, 09:30)` |
 

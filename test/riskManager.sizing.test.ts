@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  capQtyByMaxNotional,
   capQtyBySettledCash,
   computeRiskBasedQty,
   computeTakeProfitPrice,
@@ -44,5 +45,25 @@ describe('capQtyBySettledCash', () => {
 
   it('returns 0 when cash cannot buy one share', () => {
     assert.equal(capQtyBySettledCash(10, 50, 40), 0);
+  });
+});
+
+describe('capQtyByMaxNotional', () => {
+  it('caps qty so notional <= equity * maxPositionPct', () => {
+    // equity 100k, max 20% → 20k notional @ $50 → max 400 shares
+    assert.equal(capQtyByMaxNotional(500, 50, 100_000, 0.20), 400);
+  });
+
+  it('leaves qty unchanged when already under the ceiling', () => {
+    assert.equal(capQtyByMaxNotional(100, 50, 100_000, 0.20), 100);
+  });
+
+  it('prevents leverage from a tight-stop inflated risk qty', () => {
+    // 5% risk / $0.10 stop on $100 stock → huge share count → capped to 20% equity
+    const riskQty = computeRiskBasedQty(100_000, 0.05, 100, 99.9);
+    assert.ok(riskQty > 1000);
+    const capped = capQtyByMaxNotional(riskQty, 100, 100_000, 0.20);
+    assert.equal(capped, 200);
+    assert.ok(capped * 100 <= 100_000 * 0.20);
   });
 });

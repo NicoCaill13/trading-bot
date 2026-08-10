@@ -45,3 +45,18 @@ export function capQtyBySettledCash(
   if (qty < 1 || entryPrice <= 0 || settledCash <= 0) return 0;
   return Math.min(qty, Math.floor(settledCash / entryPrice));
 }
+
+/**
+ * Cash-account notional ceiling: qty * entryPrice <= equity * maxPositionPct.
+ * Prevents leverage when a tight stop inflates risk-based share count.
+ */
+export function capQtyByMaxNotional(
+  qty: number,
+  entryPrice: number,
+  equity: number,
+  maxPositionPct: number,
+): number {
+  if (qty < 1 || entryPrice <= 0 || equity <= 0 || maxPositionPct <= 0) return 0;
+  const maxNotional = equity * maxPositionPct;
+  return Math.min(qty, Math.floor(maxNotional / entryPrice));
+}

@@ -3,6 +3,7 @@ import path from 'path';
 import config from './config';
 import { createLogger } from './logger';
 import * as feedbackEngine from './feedbackEngine';
+import { computePnlR, normalizeTradeRecords } from './expectancy';
 import type { TradeRecord, ExitReason, SignalOrigin, SpyTrend, FibLevelName } from './types';
 
 type ScaleOutTarget = 'target-5pct' | 'target-7pct' | 'target-atr';
@@ -37,6 +38,8 @@ export interface OpenTradeParams {
   spy_trend_5m: SpyTrend;
   fib_level_at_entry: number | null;
   fib_level_name_at_entry: FibLevelName | null;
+  equity_at_entry?: number | null;
+  risk_dollars_at_entry?: number | null;
 }
 
 /**
@@ -79,11 +82,17 @@ export function openTrade(symbol: string, params: OpenTradeParams): void {
     net_pnl_percentage: null,
     mfe_percent: null,
     mae_percent: null,
+    equity_at_entry: params.equity_at_entry ?? null,
+    risk_dollars_at_entry: params.risk_dollars_at_entry ?? null,
+    pnl_r: null,
   };
 
   openRecords.set(symbol, record);
   lastKnownPrices.set(symbol, params.entry_price);
-  log.info(`${symbol}: trade record opened at $${params.entry_price.toFixed(2)}`);
+  const riskLabel = record.risk_dollars_at_entry !== null
+    ? ` risk:$${record.risk_dollars_at_entry.toFixed(2)}`
+    : '';
+  log.info(`${symbol}: trade record opened at $${params.entry_price.toFixed(2)}${riskLabel}`);
 }
 
 /**
@@ -174,6 +183,7 @@ export function closeTrade(
   record.exit_reason = exitReason;
   record.net_pnl_dollars = net_pnl_dollars;
   record.net_pnl_percentage = net_pnl_percentage;
+  record.pnl_r = computePnlR(net_pnl_dollars, record.risk_dollars_at_entry ?? 0);
 
   openRecords.delete(symbol);
   lastKnownPrices.delete(symbol);
@@ -182,10 +192,11 @@ export function closeTrade(
   const scaleOutLabel = record.scale_out_price !== null
     ? ` scale-out:$${record.scale_out_price.toFixed(2)} +`
     : '';
+  const pnlRLabel = record.pnl_r !== null ? ` | R:${record.pnl_r.toFixed(2)}` : '';
   log.info(
     `${symbol}: trade closed — reason:${exitReason}${scaleOutLabel} ` +
     `finalPrice:$${price.toFixed(2)} PnL:${net_pnl_percentage.toFixed(2)}% ` +
-    `($${net_pnl_dollars.toFixed(2)}) | MFE:${(record.mfe_percent ?? 0).toFixed(2)}% ` +
+    `($${net_pnl_dollars.toFixed(2)})${pnlRLabel} | MFE:${(record.mfe_percent ?? 0).toFixed(2)}% ` +
     `MAE:${(record.mae_percent ?? 0).toFixed(2)}%`,
   );
 
@@ -221,7 +232,7 @@ export async function saveJournal(): Promise<void> {
     let existing: TradeRecord[] = [];
     try {
       const raw = await fs.readFile(JOURNAL_PATH, 'utf8');
-      existing = JSON.parse(raw) as TradeRecord[];
+      existing = normalizeTradeRecords(JSON.parse(raw) as TradeRecord[]);
     } catch {
       // File absent or corrupted — start fresh
     }

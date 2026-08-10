@@ -4,6 +4,12 @@ import config from './config';
 import { createLogger } from './logger';
 import { getESTDate } from './utils';
 import { sendTelegramAlert } from './notificationManager';
+import { alertInfo } from './notifier';
+import {
+  computeRollingExpectancy,
+  formatExpectancyLine,
+  normalizeTradeRecords,
+} from './expectancy';
 import type { TradeRecord } from './types';
 
 const log = createLogger('ANALYZER');
@@ -82,14 +88,20 @@ function resolveBestSetup(records: TradeRecord[]): BestSetup | null {
   };
 }
 
+function sessionDatePrefixEST(): string {
+  const est = getESTDate();
+  const y = est.getFullYear();
+  const m = String(est.getMonth() + 1).padStart(2, '0');
+  const d = String(est.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 // ---------------------------------------------------------------------------
 // Main analysis
 // ---------------------------------------------------------------------------
 
 /**
- * Reads today's closed records from the journal, computes KPIs and
- * sends the result as a Telegram report.
- *
+ * Reads closed journal records, computes KPIs + expectancy in R, and notifies.
  * Called automatically after the Hard Close (15:58 EST) at 16:05 EST.
  */
 export async function runPostMortem(): Promise<void> {
@@ -98,18 +110,13 @@ export async function runPostMortem(): Promise<void> {
   let allRecords: TradeRecord[] = [];
   try {
     const raw = await fs.readFile(journalPath, 'utf8');
-    allRecords = JSON.parse(raw) as TradeRecord[];
+    allRecords = normalizeTradeRecords(JSON.parse(raw) as TradeRecord[]);
   } catch {
     log.warn('Journal file absent or unreadable — skipping post-mortem');
     return;
   }
 
-  // Filter to today's completed trades only — use EST date to match session day
-  const est = getESTDate();
-  const y = est.getFullYear();
-  const m = String(est.getMonth() + 1).padStart(2, '0');
-  const d = String(est.getDate()).padStart(2, '0');
-  const todayESTPrefix = `${y}-${m}-${d}`;
+  const todayESTPrefix = sessionDatePrefixEST();
 
   const records = allRecords.filter(
     r => r.entry_time.startsWith(todayESTPrefix) && r.exit_time !== null,
@@ -120,24 +127,21 @@ export async function runPostMortem(): Promise<void> {
     return;
   }
 
-  // Win Rate
+  // Win Rate (dollar PnL — unchanged legacy KPI)
   const winners = records.filter(r => (r.net_pnl_dollars ?? 0) > 0);
   const losers = records.filter(r => (r.net_pnl_dollars ?? 0) <= 0);
   const winRate = (winners.length / records.length) * 100;
 
-  // Average Win / Average Loss (price-based %)
   const avgWinPct = average(winners.map(r => r.net_pnl_percentage ?? 0));
   const avgLossPct = Math.abs(average(losers.map(r => r.net_pnl_percentage ?? 0)));
-
-  // Total net PnL
   const totalPnl = records.reduce((sum, r) => sum + (r.net_pnl_dollars ?? 0), 0);
-
-  // Best MFE across all trades
   const bestMfe = Math.max(...records.map(r => r.mfe_percent ?? 0));
 
-  // Best setup
   const bestSetup = resolveBestSetup(winners.length > 0 ? winners : records);
   const bestSetupDesc = bestSetup?.description ?? 'N/A';
+
+  const rolling = computeRollingExpectancy(allRecords, todayESTPrefix);
+  const sessionE = rolling.session;
 
   log.info(
     `Post-mortem — ${records.length} trade(s) | ` +
@@ -146,14 +150,65 @@ export async function runPostMortem(): Promise<void> {
     `Total PnL: $${totalPnl.toFixed(2)} | Best MFE: +${bestMfe.toFixed(2)}% | ` +
     `Best setup: ${bestSetupDesc}`,
   );
+  log.info(formatExpectancyLine('Expectancy session', sessionE));
+  log.info(formatExpectancyLine('Expectancy last20', rolling.last20));
+  log.info(formatExpectancyLine('Expectancy last50', rolling.last50));
+
+  const eRLabel = sessionE.n > 0
+    ? `E_R ${sessionE.eR >= 0 ? '+' : ''}${sessionE.eR.toFixed(2)}R [${sessionE.scenario ?? 'N/A'}]`
+    : 'E_R N/A (no risk_$ on closed trades)';
 
   const message =
-    `📊 <b>[ANALYSE V6]</b> Win Rate: ${winRate.toFixed(0)}% | ` +
+    `<b>[ANALYSE V7]</b> Win Rate: ${winRate.toFixed(0)}% | ` +
     `Meilleur setup: ${bestSetupDesc}\n` +
-    `📈 Avg Win: +${avgWinPct.toFixed(2)}% | Avg Loss: -${avgLossPct.toFixed(2)}%\n` +
-    `💼 Trades: ${records.length} (${winners.length}W/${losers.length}L) | ` +
+    `Avg Win: +${avgWinPct.toFixed(2)}% | Avg Loss: -${avgLossPct.toFixed(2)}%\n` +
+    `Trades: ${records.length} (${winners.length}W/${losers.length}L) | ` +
     `PnL net: $${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)} | ` +
-    `Best MFE: +${bestMfe.toFixed(2)}%`;
+    `Best MFE: +${bestMfe.toFixed(2)}%\n` +
+    `${eRLabel}`;
 
   await sendTelegramAlert(message);
+
+  await alertInfo(
+    'Expectancy post-mortem',
+    `${records.length} closed trade(s) today — ${eRLabel}`,
+    [
+      {
+        name: 'Session E_R',
+        value: sessionE.n > 0
+          ? `${sessionE.eR >= 0 ? '+' : ''}${sessionE.eR.toFixed(2)}R`
+          : 'N/A',
+        inline: true,
+      },
+      {
+        name: 'Scenario',
+        value: sessionE.scenario ?? 'N/A',
+        inline: true,
+      },
+      {
+        name: 'WR (session R)',
+        value: sessionE.n > 0 ? `${(sessionE.winRate * 100).toFixed(1)}%` : 'N/A',
+        inline: true,
+      },
+      {
+        name: 'Last 20 E_R',
+        value: rolling.last20.n > 0
+          ? `${rolling.last20.eR >= 0 ? '+' : ''}${rolling.last20.eR.toFixed(2)}R`
+          : 'N/A',
+        inline: true,
+      },
+      {
+        name: 'Last 50 E_R',
+        value: rolling.last50.n > 0
+          ? `${rolling.last50.eR >= 0 ? '+' : ''}${rolling.last50.eR.toFixed(2)}R`
+          : 'N/A',
+        inline: true,
+      },
+      {
+        name: 'Total PnL $',
+        value: `$${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}`,
+        inline: true,
+      },
+    ],
+  );
 }

@@ -3,6 +3,7 @@ import path from 'path';
 import config from './config';
 import { createLogger } from './logger';
 import type { AdaptiveFilters, TradeRecord } from './types';
+import { normalizeTradeRecords } from './expectancy';
 
 const log = createLogger('FEEDBACK');
 
@@ -146,7 +147,7 @@ async function loadClosedRecords(journalPath: string): Promise<TradeRecord[]> {
   const resolved = path.resolve(journalPath);
   try {
     const raw = await fs.readFile(resolved, 'utf8');
-    const records = JSON.parse(raw) as TradeRecord[];
+    const records = normalizeTradeRecords(JSON.parse(raw) as TradeRecord[]);
     return records.filter(isClosedTrade);
   } catch {
     return [];

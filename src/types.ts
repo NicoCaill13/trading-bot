@@ -262,6 +262,11 @@ export interface TradeRecord {
   net_pnl_percentage: number | null;
   mfe_percent: number | null;
   mae_percent: number | null;
+
+  // Risk in R-multiples (V7 expectancy) — null on legacy journal rows
+  equity_at_entry: number | null;
+  risk_dollars_at_entry: number | null;
+  pnl_r: number | null;
 }
 
 export interface DailyReportData {

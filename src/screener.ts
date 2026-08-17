@@ -185,10 +185,24 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
 // 3. Historical analysis
 // ---------------------------------------------------------------------------
 
+interface FunnelTally {
+  clearedLiquidity: number;
+  clearedAdr: number;
+  clearedPhase2: number;
+}
+
+function emptyFunnelTally(): FunnelTally {
+  return { clearedLiquidity: 0, clearedAdr: 0, clearedPhase2: 0 };
+}
+
+// ~252 trading days per 365 calendar days; the extra margin absorbs holiday
+// clusters so a 200-day SMA window never falls short and silently rejects a name.
+const CALENDAR_DAYS_PER_TRADING_DAY = 1.75;
+
 async function fetchDailyBars(symbol: string, limit: number): Promise<AlpacaBar[]> {
   const end = new Date();
   const start = new Date();
-  start.setDate(start.getDate() - Math.ceil(limit * 1.6) + 1);
+  start.setDate(start.getDate() - Math.ceil(limit * CALENDAR_DAYS_PER_TRADING_DAY) + 1);
 
   const bars: AlpacaBar[] = [];
   const iter = alpaca.getBarsV2(symbol, {
@@ -196,6 +210,9 @@ async function fetchDailyBars(symbol: string, limit: number): Promise<AlpacaBar[
     end: end.toISOString().split('T')[0],
     timeframe: '1Day',
     feed: 'iex',
+    // Alpaca defaults to raw bars: a split inside the 200-day window would put
+    // pre-split prices in the SMA and reject the name on a phantom downtrend.
+    adjustment: 'split',
   });
 
   for await (const bar of iter) {
@@ -240,6 +257,7 @@ async function analyzeSymbol(
   benchmarkReturn: number,
   lookbackDays: number,
   exchange: string | undefined,
+  tally: FunnelTally,
 ): Promise<WatchlistSymbol | null> {
   const ticker =
     typeof symbol === 'string' && symbol.trim().length > 0 ? symbol.trim() : null;
@@ -283,6 +301,8 @@ async function analyzeSymbol(
       return null;
     }
 
+    tally.clearedLiquidity++;
+
     const adrPct = computeAdrPct(
       bars.map(b => ({ high: b.HighPrice, low: b.LowPrice, close: b.ClosePrice })),
       config.screener.adrLookbackDays,
@@ -301,6 +321,8 @@ async function analyzeSymbol(
       );
       return null;
     }
+
+    tally.clearedAdr++;
 
     let floatShares: number | undefined;
     if (isFloatFilterActive()) {
@@ -351,6 +373,7 @@ async function analyzeSymbol(
       `> SMA150 $${weinstein.sma150.toFixed(2)} & SMA200 $${weinstein.sma200.toFixed(2)} ` +
       `| slope ${weinstein.sma150Slope.toFixed(4)}`,
     );
+    tally.clearedPhase2++;
 
     let reversalPattern: WatchlistSymbol['reversalPattern'];
     let reversalDetail: ReversalPatternSignal | undefined;
@@ -585,9 +608,16 @@ export async function runScreener(): Promise<Watchlist> {
   );
 
   log.info(`Full analysis on ${liquidUniverse.length} qualified symbols...`);
+  const funnel = emptyFunnelTally();
   const candidates = await throttledMap(
     liquidUniverse,
-    symbol => analyzeSymbol(symbol, benchmarkReturn, lookbackDays, exchangeBySymbol.get(symbol)),
+    symbol => analyzeSymbol(
+      symbol,
+      benchmarkReturn,
+      lookbackDays,
+      exchangeBySymbol.get(symbol),
+      funnel,
+    ),
     ANALYSIS_CONCURRENCY,
   );
 
@@ -603,12 +633,14 @@ export async function runScreener(): Promise<Watchlist> {
   const retained = withCatalyst.slice(0, config.screener.watchlistMaxSize);
 
   log.info(
-    `${retained.length} symbols retained from ${liquidUniverse.length} analyzed ` +
-    `(initial universe: ${rawUniverse.length}` +
+    `Funnel — universe: ${rawUniverse.length} ` +
+    `-> price/volume: ${funnel.clearedLiquidity} ` +
+    `-> ADR: ${funnel.clearedAdr} ` +
+    `-> Phase 2: ${funnel.clearedPhase2} ` +
+    `-> watchlist: ${retained.length}` +
     (config.sentiment.enabled
-      ? `; catalyst gate ${withCatalyst.length}/${pool.length}`
-      : '') +
-    `)`,
+      ? ` (catalyst gate ${withCatalyst.length}/${pool.length})`
+      : ''),
   );
 
   retained.forEach(s => {

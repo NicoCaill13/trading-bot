@@ -20,6 +20,12 @@ import {
   assessWeinsteinPhase2,
   passesWeinsteinGate,
 } from './weinstein';
+import {
+  assessStraightRun,
+  computeVolumeRatio,
+  describeStraightRunRejection,
+  type StraightRunBar,
+} from './straightRun';
 import { detectReversalPatterns } from './patterns/reversal';
 import { detectContinuationPatterns } from './patterns/continuation';
 import { createNewsProvider } from './newsProvider';
@@ -35,6 +41,7 @@ import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
 const log = createLogger('SCREENER');
 const weinsteinLog = createLogger('WEINSTEIN');
 const patternLog = createLogger('PATTERN');
+const straightRunLog = createLogger('STRAIGHT_RUN');
 const floatProvider = createFloatProvider();
 const newsProvider = createNewsProvider();
 
@@ -270,6 +277,15 @@ async function fetchDailyBars(
   return adjusted.slice(-limit);
 }
 
+function toStraightRunBar(bar: AlpacaBar): StraightRunBar {
+  return {
+    high: bar.HighPrice,
+    low: bar.LowPrice,
+    close: bar.ClosePrice,
+    volume: bar.Volume,
+  };
+}
+
 function computeReturn(bars: AlpacaBar[]): number | null {
   if (bars.length < 2) return null;
   const first = bars[0].ClosePrice;
@@ -302,7 +318,7 @@ function isGapHeld(bars: AlpacaBar[]): boolean {
 
 async function analyzeSymbol(
   symbol: string,
-  benchmarkReturn: number,
+  benchmark: BenchmarkStats,
   lookbackDays: number,
   exchange: string | undefined,
   tally: FunnelTally,
@@ -424,6 +440,30 @@ async function analyzeSymbol(
     );
     tally.clearedPhase2++;
 
+    const straightRun = assessStraightRun(
+      bars.map(toStraightRunBar),
+      config.straightRun,
+      benchmark.volumeRatio,
+    );
+    if (straightRun === null) {
+      straightRunLog.info(`${ticker} — insufficient history for the run window`);
+    } else if (straightRun.isStraightRun) {
+      straightRunLog.info(
+        `${ticker} TAGGED — ${straightRun.trigger} ` +
+        `| streak ${straightRun.consecutiveUpDays}d ` +
+        `| run ${(straightRun.runReturnPct * 100).toFixed(2)}% ` +
+        `| dd ${(straightRun.drawdownPct * 100).toFixed(2)}% ` +
+        `| rel. RVOL ${straightRun.marketRelativeRvol.toFixed(2)}x ` +
+        `(abs ${straightRun.volumeRatio.toFixed(2)}x) ` +
+        `| score ${straightRun.score.toFixed(2)}`,
+      );
+    } else {
+      straightRunLog.info(
+        `${ticker} — not a straight run: ` +
+        describeStraightRunRejection(straightRun, config.straightRun),
+      );
+    }
+
     let reversalPattern: WatchlistSymbol['reversalPattern'];
     let reversalDetail: ReversalPatternSignal | undefined;
     let continuationPattern: WatchlistSymbol['continuationPattern'];
@@ -518,11 +558,11 @@ async function analyzeSymbol(
       return null;
     }
 
-    if (symbolReturn <= benchmarkReturn) {
+    if (symbolReturn <= benchmark.ret) {
       log.info(
         `${ticker} REJECTED — relative strength: ` +
-        `symbol ${(symbolReturn * 100).toFixed(2)}% vs SPY ${(benchmarkReturn * 100).toFixed(2)}% ` +
-        `(alpha ${((symbolReturn - benchmarkReturn) * 100).toFixed(2)}%)`,
+        `symbol ${(symbolReturn * 100).toFixed(2)}% vs SPY ${(benchmark.ret * 100).toFixed(2)}% ` +
+        `(alpha ${((symbolReturn - benchmark.ret) * 100).toFixed(2)}%)`,
       );
       return null;
     }
@@ -558,7 +598,7 @@ async function analyzeSymbol(
       symbol: ticker,
       origin: 'V1_CORE',
       source: 'core',
-      relativeReturn: symbolReturn - benchmarkReturn,
+      relativeReturn: symbolReturn - benchmark.ret,
       symbolReturn,
       gapUp,
       gapHeld: true,
@@ -576,6 +616,8 @@ async function analyzeSymbol(
       reversalDetail,
       continuationPattern,
       continuationDetail,
+      isStraightRun: straightRun?.isStraightRun ?? false,
+      straightRunDetail: straightRun ?? undefined,
     };
   } catch (err) {
     log.warn(`${ticker}: analysis error — ${toErrorMessage(err)}`);
@@ -608,14 +650,37 @@ async function throttledMap<T, R>(
 // 5. Benchmark
 // ---------------------------------------------------------------------------
 
-async function computeBenchmarkReturn(
+/**
+ * Benchmark figures every candidate is scored against: relative strength on the
+ * return, and the market-wide volume trend the straight-run conviction check is
+ * normalised by.
+ */
+interface BenchmarkStats {
+  ret: number;
+  volumeRatio: number;
+}
+
+async function computeBenchmarkStats(
   lookbackDays: number,
   eod: EodContext,
-): Promise<number | null> {
+): Promise<BenchmarkStats | null> {
   log.info(`Fetching benchmark data for ${BENCHMARK}...`);
   const needed = dailyBarsNeeded(lookbackDays);
   const bars = await fetchDailyBars(BENCHMARK, needed, eod);
-  return computeReturn(bars.slice(-lookbackDays));
+
+  const ret = computeReturn(bars.slice(-lookbackDays));
+  if (ret === null) return null;
+
+  const volumeRatio = computeVolumeRatio(
+    bars.map(b => toStraightRunBar(b)),
+    config.straightRun.minDays,
+    config.straightRun.rvolBaselineDays,
+  );
+  if (volumeRatio === null) {
+    log.warn(`${BENCHMARK}: volume ratio unavailable — STRAIGHT_RUN tagging disabled this run`);
+  }
+
+  return { ret, volumeRatio: volumeRatio ?? 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -651,8 +716,8 @@ export async function runScreener(): Promise<Watchlist> {
     };
   }
 
-  const benchmarkReturn = await computeBenchmarkReturn(lookbackDays, eod);
-  if (benchmarkReturn === null) {
+  const benchmark = await computeBenchmarkStats(lookbackDays, eod);
+  if (benchmark === null) {
     log.warn('Failed to compute benchmark return — screening aborted');
     return {
       generatedAt: new Date().toISOString(),
@@ -664,7 +729,8 @@ export async function runScreener(): Promise<Watchlist> {
   }
 
   log.info(
-    `${BENCHMARK} return over ${lookbackDays}d: ${(benchmarkReturn * 100).toFixed(2)}%`,
+    `${BENCHMARK} return over ${lookbackDays}d: ${(benchmark.ret * 100).toFixed(2)}% ` +
+    `| volume trend ${benchmark.volumeRatio.toFixed(2)}x`,
   );
 
   log.info(`Full analysis on ${liquidUniverse.length} qualified symbols...`);
@@ -673,7 +739,7 @@ export async function runScreener(): Promise<Watchlist> {
     liquidUniverse,
     symbol => analyzeSymbol(
       symbol,
-      benchmarkReturn,
+      benchmark,
       lookbackDays,
       exchangeBySymbol.get(symbol),
       funnel,
@@ -701,7 +767,8 @@ export async function runScreener(): Promise<Watchlist> {
     `-> watchlist: ${retained.length}` +
     (config.sentiment.enabled
       ? ` (catalyst gate ${withCatalyst.length}/${pool.length})`
-      : ''),
+      : '') +
+    ` | STRAIGHT_RUN: ${retained.filter(s => s.isStraightRun).length}`,
   );
 
   retained.forEach(s => {
@@ -714,7 +781,8 @@ export async function runScreener(): Promise<Watchlist> {
       `| DV: $${((s.dollarVolume ?? 0) / 1_000_000).toFixed(0)}M ` +
       `| close: $${(s.lastClose ?? 0).toFixed(2)}` +
       (s.exchange ? ` | exch: ${s.exchange}` : '') +
-      (s.sentiment ? ` | sent: ${s.sentiment}` : ''),
+      (s.sentiment ? ` | sent: ${s.sentiment}` : '') +
+      (s.isStraightRun ? ` | RUN ${(s.straightRunDetail?.score ?? 0).toFixed(2)}` : ''),
     );
   });
 
@@ -723,7 +791,7 @@ export async function runScreener(): Promise<Watchlist> {
 
   const watchlist: Watchlist = {
     generatedAt: new Date().toISOString(),
-    benchmarkReturn,
+    benchmarkReturn: benchmark.ret,
     universeSize: rawUniverse.length,
     liquidFiltered: liquidUniverse.length,
     symbols: [...retained, ...v2Symbols],

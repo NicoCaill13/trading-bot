@@ -104,6 +104,16 @@ const config = {
     flatBaseAtrCompressionRatio: parseFloatEnv('FLAT_BASE_ATR_COMPRESSION_RATIO', 0.70),
   },
 
+  // Straight-line run tag (#29) — soft annotate post-Weinstein, arms the
+  // Opening Drive path only. Never rejects a Core candidate.
+  straightRun: {
+    minDays: parseIntEnv('STRAIGHT_RUN_MIN_DAYS', 5),
+    maxDrawdownPct: parseFloatEnv('STRAIGHT_RUN_MAX_DD_PCT', 0.04),
+    // Relative to the benchmark's own volume trend, not an absolute ratio.
+    minMarketRelativeRvol: parseFloatEnv('STRAIGHT_RUN_MIN_REL_RVOL', 1.0),
+    rvolBaselineDays: parseIntEnv('STRAIGHT_RUN_RVOL_BASELINE_DAYS', 14),
+  },
+
   portfolio: {
     coreRiskShare: parseFloatEnv('CORE_RISK_SHARE', 0.80),
     satelliteRiskShare: parseFloatEnv('SATELLITE_RISK_SHARE', 0.20),
@@ -432,6 +442,26 @@ const config = {
   }
   if (s.eteiBreakoutRvol <= 0) {
     throw new Error(`[SYSTEM] ETEI_BREAKOUT_RVOL must be > 0: ${s.eteiBreakoutRvol}`);
+  }
+
+  const sr = config.straightRun;
+  if (sr.minDays < 2) {
+    throw new Error(`[SYSTEM] STRAIGHT_RUN_MIN_DAYS must be >= 2: ${sr.minDays}`);
+  }
+  if (sr.maxDrawdownPct <= 0 || sr.maxDrawdownPct >= 1) {
+    throw new Error(
+      `[SYSTEM] STRAIGHT_RUN_MAX_DD_PCT must be between 0 and 1: ${sr.maxDrawdownPct}`,
+    );
+  }
+  if (sr.minMarketRelativeRvol <= 0) {
+    throw new Error(
+      `[SYSTEM] STRAIGHT_RUN_MIN_REL_RVOL must be > 0: ${sr.minMarketRelativeRvol}`,
+    );
+  }
+  if (sr.rvolBaselineDays < 1) {
+    throw new Error(
+      `[SYSTEM] STRAIGHT_RUN_RVOL_BASELINE_DAYS must be >= 1: ${sr.rvolBaselineDays}`,
+    );
   }
   if (s.springReclaimRvol <= 0) {
     throw new Error(`[SYSTEM] SPRING_RECLAIM_RVOL must be > 0: ${s.springReclaimRvol}`);

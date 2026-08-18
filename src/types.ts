@@ -149,6 +149,35 @@ export interface ContinuationPatternSignal {
   pivots: PivotPoint[];
 }
 
+/**
+ * Which branch armed the straight-run tag (#29). `consecutive_closes` is the
+ * textbook straight line; `range_breakout` catches a name that based then
+ * cleared the window high in one move — same absence of pullback.
+ */
+export type StraightRunTrigger = 'consecutive_closes' | 'range_breakout';
+
+export interface StraightRunAssessment {
+  isStraightRun: boolean;
+  trigger: StraightRunTrigger | null;
+  /** Unbroken close-over-close streak ending on the last bar. */
+  consecutiveUpDays: number;
+  /** Close-to-close return across the window. */
+  runReturnPct: number;
+  /** Deepest close-to-close decline inside the window. */
+  drawdownPct: number;
+  /** Window volume / pre-window baseline volume, unnormalised. Kept for logs. */
+  volumeRatio: number;
+  /**
+   * `volumeRatio` divided by the benchmark's own ratio. Absolute volume ratios
+   * track the market-wide seasonal trend — in the mid-August trough every name
+   * including SPY sits near 0.7 — so the gate is applied to this figure, which
+   * measures conviction relative to the market instead of the calendar.
+   */
+  marketRelativeRvol: number;
+  /** 0..1 blend, only meaningful when `isStraightRun` is true. */
+  score: number;
+}
+
 /** Lexicon news headline sentiment for the catalyst gate (#21). */
 export type NewsSentiment = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 
@@ -189,6 +218,12 @@ export interface WatchlistSymbol {
   /** Soft annotate: Bull Flag / Cup&Handle / Flat Base post-Weinstein. */
   continuationPattern?: ContinuationPattern;
   continuationDetail?: ContinuationPatternSignal;
+  /**
+   * Soft annotate (#29): daily straight-line run. Arms the isolated Opening
+   * Drive entry path; the Core VWAP pullback logic ignores it entirely.
+   */
+  isStraightRun?: boolean;
+  straightRunDetail?: StraightRunAssessment;
 }
 
 export interface Watchlist {

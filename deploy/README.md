@@ -1,64 +1,67 @@
-# Déploiement EC2
+# Déploiement EC2 (PM2)
 
-Deux units systemd indépendantes : le bot, et le watchdog qui le surveille.
+Prod actuelle : Ubuntu, user `ubuntu`, app dans `/home/ubuntu/apps/trading-bot`.
+Superviseurs : **PM2 uniquement**. Pas de units systemd applicatives.
 
-## Pourquoi systemd et pas pm2
+Deux process, même `cwd` : `trading-bot` (écrit `data/heartbeat.json`) et `trading-watchdog` (le lit). Un `cwd` différent = le watchdog surveille un fichier que personne n'écrit.
 
-- `Restart=always` avec `StartLimitIntervalSec=0` supprime la falaise de redémarrages. La configuration pm2 précédente (`max_restarts: 5`) abandonnait après cinq crashs **et n'en notifiait personne** — c'est le mode de défaillance que ce déploiement existe pour éliminer.
-- Le démarrage au boot est garanti par `WantedBy=multi-user.target`, sans avoir à superviser un `pm2 resurrect`.
-- Une couche de process en moins entre systemd et le bot, donc une propagation de `SIGTERM` fiable — indispensable pour que `gracefulShutdown` persiste l'état de session.
-
-## Prérequis sur l'instance
+## Première mise en service (déjà faite)
 
 ```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin trading
-sudo mkdir -p /opt/trading-bot
-sudo chown -R trading:trading /opt/trading-bot
+cd /home/ubuntu/apps/trading-bot
+npm ci
+npx tsc --noEmit
+mkdir -p data logs
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup   # une fois, suit les instructions affichées
 ```
 
-Déployer le code dans `/opt/trading-bot`, puis :
+Ne rejoue `pm2 startup` que si le daemon n'est plus enregistré au boot.
+
+## Déploiement d'un nouveau code (bot déjà en cours)
+
+Ne pas `pm2 kill`. Ça tue le daemon, pas seulement l'app.
+
+Ne pas `pm2 restart trading-bot` tout seul. Ça relance l'existant **sans** enregistrer `trading-watchdog`, et **sans** relire `max_restarts` / `kill_timeout`.
 
 ```bash
-cd /opt/trading-bot
-sudo -u trading npm ci
-sudo -u trading npx tsc --noEmit   # aucune erreur de type ne doit atteindre le marché
-sudo -u trading cp .env.example .env  # puis renseigner les clés
-sudo -u trading mkdir -p data logs
+cd /home/ubuntu/apps/trading-bot
+# déployer le code, puis :
+npm ci
+npx tsc --noEmit
+pm2 startOrRestart ecosystem.config.js
+pm2 save
+pm2 status
 ```
 
-## Installation des units
+`startOrRestart` :
 
-```bash
-sudo cp deploy/systemd/trading-bot.service /etc/systemd/system/
-sudo cp deploy/systemd/trading-watchdog.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now trading-watchdog.service
-sudo systemctl enable --now trading-bot.service
-```
+| Process | Effet |
+|---------|--------|
+| `trading-bot` déjà listé | restart (quelques secondes d'arrêt, SIGTERM → graceful shutdown) |
+| `trading-watchdog` absent | start |
+| les deux déjà listés | restart des deux, config relue |
 
-Démarrer le **watchdog d'abord** : il dispose d'une fenêtre de grâce (`WATCHDOG_STARTUP_GRACE_MS`, 120 s par défaut) pendant laquelle un heartbeat absent n'est pas signalé, ce qui couvre le boot du bot.
+`pm2 save` est obligatoire : sans ça, un reboot ressuscite l'ancienne liste (bot seul).
 
 ## Vérification
 
 ```bash
-systemctl status trading-bot trading-watchdog
-cat /opt/trading-bot/data/heartbeat.json      # doit apparaître en moins d'une seconde
-journalctl -u trading-watchdog -f
+pm2 status
+cat data/heartbeat.json
+pm2 logs trading-watchdog --lines 50
 ```
 
-Un heartbeat frais et un journal watchdog silencieux valent confirmation. Les digests de 09h35 et 16h10 EST arrivent sur Telegram et rendent ce silence vérifiable.
-
-## Piège à connaître
-
-`WorkingDirectory` doit être **identique** dans les deux units. Tous les chemins du code (`./data`, `./logs`, `./.env`) sont relatifs au répertoire courant : lancés depuis des répertoires différents, les deux process pointeraient sur des fichiers heartbeat distincts et le watchdog surveillerait un fichier que personne n'écrit.
+Le heartbeat doit apparaître en moins d'une seconde après le start du bot. Les digests Telegram 09h35 / 16h10 EST rendent le silence vérifiable.
 
 ## Fuseau horaire
 
-Laisser l'instance en **UTC**. Tout le raisonnement horaire du bot passe par `America/New_York` via `toESTDate`, y compris les transitions DST. Une instance en heure locale européenne rajouterait un second décalage, désynchronisé du DST américain deux semaines par an.
+Laisser l'instance en **UTC**. Le bot raisonne en `America/New_York` via `toESTDate`. Une instance en heure Europe ajoute un second décalage, désynchronisé du DST US.
 
 ## Reste à faire (hors lot)
 
-- Alarme CloudWatch sur métrique custom en `missing data = breaching` — seule couverture de la panne au niveau instance, où bot et watchdog meurent ensemble.
-- Secrets via SSM Parameter Store plutôt qu'un `.env` sur disque.
+- Alarme CloudWatch `missing data = breaching` — seule couverture de la panne d'instance (bot + watchdog + PM2 meurent ensemble).
+- Secrets SSM plutôt qu'un `.env` sur disque.
 - Persistance de `data/journal.json` hors du disque d'instance (EBS dédié ou sync S3).
-- Build compilé (`tsc` puis `node dist/index.js`) : `tsx` retire les types sans les vérifier, donc `strict: true` n'est jamais appliqué au runtime.
+- Build compilé (`tsc` puis `node dist/index.js`) : `tsx` retire les types sans les vérifier.

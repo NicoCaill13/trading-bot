@@ -2,33 +2,41 @@
 
 const path = require('path');
 
+const tsx = path.join(__dirname, 'node_modules/.bin/tsx');
+
+const common = {
+  interpreter: tsx,
+  cwd: __dirname,
+  instances: 1,
+  autorestart: true,
+  watch: false,
+  min_uptime: '10s',
+  max_restarts: 40,
+  restart_delay: 10000,
+  env: { NODE_ENV: 'production' },
+  merge_logs: true,
+  log_date_format: 'YYYY-MM-DD HH:mm:ss',
+};
+
 module.exports = {
   apps: [
     {
-      name:              'trading-bot',
-      // interpreter + script: PM2 captures stdout/stderr (tsx as "script" leaves pm2-out empty)
-      script:            path.join(__dirname, 'src/index.ts'),
-      interpreter:       path.join(__dirname, 'node_modules/.bin/tsx'),
-      cwd:               __dirname,
-      instances:         1,
-      autorestart:       true,
-      watch:             false,
-      // Redémarre automatiquement si le process dépasse 400MB
+      ...common,
+      name: 'trading-bot',
+      script: path.join(__dirname, 'src/index.ts'),
+      min_uptime: '30s',
       max_memory_restart: '400M',
-      // Délai minimum entre deux restarts (évite les boucles crash rapides)
-      min_uptime:        '30s',
-      max_restarts:      5,
-      env: {
-        NODE_ENV: 'production',
-      },
-      // PM2 écrit ses propres logs en parallèle du logger applicatif
-      out_file:          './logs/pm2-out.log',
-      error_file:        './logs/pm2-error.log',
-      merge_logs:        true,
-      log_date_format:   'YYYY-MM-DD HH:mm:ss',
-      // Envoie SIGTERM avant SIGKILL — laisse 10s au graceful shutdown
-      kill_timeout:      10000,
-      listen_timeout:    5000,
+      out_file: './logs/pm2-out.log',
+      error_file: './logs/pm2-error.log',
+      kill_timeout: 20000,
+    },
+    {
+      ...common,
+      name: 'trading-watchdog',
+      script: path.join(__dirname, 'src/watchdog.ts'),
+      out_file: './logs/pm2-watchdog-out.log',
+      error_file: './logs/pm2-watchdog-error.log',
+      kill_timeout: 10000,
     },
   ],
 };

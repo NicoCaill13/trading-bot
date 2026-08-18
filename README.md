@@ -214,13 +214,24 @@ npm run premarket-screener
 
 ### Production avec PM2
 
+Deux process (`trading-bot` + `trading-watchdog`), même `cwd`. Procédure EC2 : [`deploy/README.md`](deploy/README.md).
+
+Premier lancement :
+
 ```bash
 pm2 start ecosystem.config.js
-pm2 logs trading-bot
+pm2 save
+```
+
+Code déjà en cours — ne pas `pm2 kill`, ne pas `restart` seul (le watchdog ne serait jamais enregistré) :
+
+```bash
+pm2 startOrRestart ecosystem.config.js
+pm2 save
 pm2 status
 ```
 
-Arrêt propre (sauvegarde de `session_state.json` avant exit) :
+Arrêt propre du bot (sauvegarde de `session_state.json` avant exit) :
 
 ```bash
 pm2 stop trading-bot
@@ -482,7 +493,7 @@ Dès qu'un heartbeat est périmé, les autres règles sont **suspendues** : elle
 
 Sans identifiants Telegram, les constats partent uniquement dans `logs/`.
 
-Déploiement des deux units systemd : voir [`deploy/README.md`](deploy/README.md).
+Déploiement PM2 (prod actuelle) : voir [`deploy/README.md`](deploy/README.md).
 
 ---
 

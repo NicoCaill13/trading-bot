@@ -246,6 +246,8 @@ const config = {
     sessionState: './data/session_state.json',
     journal: './data/journal.json',
     heartbeat: parseStringEnv('HEARTBEAT_PATH', './data/heartbeat.json'),
+    // Root of the per-trading-day adjusted daily-bar cache (data/eod/<day>/<sym>.json).
+    eodCache: parseStringEnv('EOD_CACHE_PATH', './data/eod'),
   },
 
   // Liveness contract consumed by the standalone watchdog process.

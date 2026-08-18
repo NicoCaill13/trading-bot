@@ -3,7 +3,9 @@ import alpaca from './alpacaClient';
 import config, { getSma150SlopeLookbackBars } from './config';
 import { createFloatProvider, isFloatFilterActive } from './floatProvider';
 import { createLogger } from './logger';
-import { toErrorMessage } from './utils';
+import { estCalendarDayKey, getESTDate, toErrorMessage } from './utils';
+import { applySplits, loadSplitIndex, type SplitIndex } from './corporateActions';
+import { readEodBars, writeEodBars } from './eodCache';
 import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
 import {
@@ -199,27 +201,73 @@ function emptyFunnelTally(): FunnelTally {
 // clusters so a 200-day SMA window never falls short and silently rejects a name.
 const CALENDAR_DAYS_PER_TRADING_DAY = 1.75;
 
-async function fetchDailyBars(symbol: string, limit: number): Promise<AlpacaBar[]> {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - Math.ceil(limit * CALENDAR_DAYS_PER_TRADING_DAY) + 1);
+/**
+ * The window every symbol of a run shares, plus the split index used to rescale
+ * it. Resolved once in `runScreener`: computing it per symbol would let a run
+ * straddling midnight give the first and last symbol different histories.
+ */
+interface EodContext {
+  startDay: string;
+  tradingDay: string;
+  splits: SplitIndex;
+}
 
+/**
+ * Window bounds as NY calendar days.
+ *
+ * `toISOString` was used here before and is a UTC projection: a run at 20:00
+ * EST is already 00:00 UTC the next day, so two runs minutes apart on either
+ * side of that boundary requested different windows. When the boundary landed
+ * on a split ex-date the 200-bar window slid across it and the SMA200 jumped
+ * (NFLX, 10-for-1 on 2025-11-17).
+ */
+function resolveEodWindow(limit: number): { startDay: string; tradingDay: string } {
+  const end = getESTDate();
+  // Plain clone: `end` is already a wall-clock carrier, re-projecting it through
+  // toESTDate would apply the NY offset twice and shift the calendar day.
+  const start = new Date(end.getTime());
+  start.setDate(start.getDate() - Math.ceil(limit * CALENDAR_DAYS_PER_TRADING_DAY) + 1);
+  return { startDay: estCalendarDayKey(start), tradingDay: estCalendarDayKey(end) };
+}
+
+async function fetchDailyBarsFromApi(
+  symbol: string,
+  eod: EodContext,
+): Promise<AlpacaBar[]> {
   const bars: AlpacaBar[] = [];
   const iter = alpaca.getBarsV2(symbol, {
-    start: start.toISOString().split('T')[0],
-    end: end.toISOString().split('T')[0],
+    start: eod.startDay,
+    end: eod.tradingDay,
     timeframe: '1Day',
     feed: 'iex',
-    // Alpaca defaults to raw bars: a split inside the 200-day window would put
-    // pre-split prices in the SMA and reject the name on a phantom downtrend.
-    adjustment: 'split',
+    // Raw when we own the rescaling: the broker's own split adjustment is
+    // applied relative to the requested range, so it moves when the range does.
+    adjustment: eod.splits.mode === 'own' ? 'raw' : 'split',
   });
 
   for await (const bar of iter) {
     bars.push(bar);
   }
 
-  return bars.slice(-limit);
+  return bars;
+}
+
+async function fetchDailyBars(
+  symbol: string,
+  limit: number,
+  eod: EodContext,
+): Promise<AlpacaBar[]> {
+  const cached = await readEodBars(eod.tradingDay, symbol, eod.startDay, eod.splits.mode);
+  if (cached !== null) return cached.slice(-limit);
+
+  const raw = await fetchDailyBarsFromApi(symbol, eod);
+  const adjusted = eod.splits.mode === 'own'
+    ? applySplits(raw, eod.splits.getSplits(symbol))
+    : raw;
+
+  await writeEodBars(eod.tradingDay, symbol, eod.startDay, eod.splits.mode, adjusted);
+
+  return adjusted.slice(-limit);
 }
 
 function computeReturn(bars: AlpacaBar[]): number | null {
@@ -258,6 +306,7 @@ async function analyzeSymbol(
   lookbackDays: number,
   exchange: string | undefined,
   tally: FunnelTally,
+  eod: EodContext,
 ): Promise<WatchlistSymbol | null> {
   const ticker =
     typeof symbol === 'string' && symbol.trim().length > 0 ? symbol.trim() : null;
@@ -269,7 +318,7 @@ async function analyzeSymbol(
 
   try {
     const needed = dailyBarsNeeded(lookbackDays);
-    const bars = await fetchDailyBars(ticker, needed);
+    const bars = await fetchDailyBars(ticker, needed, eod);
 
     if (bars.length < needed) {
       log.info(
@@ -559,10 +608,13 @@ async function throttledMap<T, R>(
 // 5. Benchmark
 // ---------------------------------------------------------------------------
 
-async function computeBenchmarkReturn(lookbackDays: number): Promise<number | null> {
+async function computeBenchmarkReturn(
+  lookbackDays: number,
+  eod: EodContext,
+): Promise<number | null> {
   log.info(`Fetching benchmark data for ${BENCHMARK}...`);
   const needed = dailyBarsNeeded(lookbackDays);
-  const bars = await fetchDailyBars(BENCHMARK, needed);
+  const bars = await fetchDailyBars(BENCHMARK, needed, eod);
   return computeReturn(bars.slice(-lookbackDays));
 }
 
@@ -573,6 +625,14 @@ async function computeBenchmarkReturn(lookbackDays: number): Promise<number | nu
 export async function runScreener(): Promise<Watchlist> {
   log.info('Starting post-session screening...');
   const lookbackDays = config.screener.relativeStrengthLookbackDays;
+
+  const window = resolveEodWindow(dailyBarsNeeded(lookbackDays));
+  const splits = await loadSplitIndex(window.startDay, window.tradingDay);
+  const eod: EodContext = { ...window, splits };
+  log.info(
+    `EOD window ${window.startDay} → ${window.tradingDay} (NY) ` +
+    `| adjustment: ${splits.mode}`,
+  );
 
   const universeAssets = await getDynamicUniverseAssets();
   const exchangeBySymbol = new Map(universeAssets.map(a => [a.symbol, a.exchange]));
@@ -591,7 +651,7 @@ export async function runScreener(): Promise<Watchlist> {
     };
   }
 
-  const benchmarkReturn = await computeBenchmarkReturn(lookbackDays);
+  const benchmarkReturn = await computeBenchmarkReturn(lookbackDays, eod);
   if (benchmarkReturn === null) {
     log.warn('Failed to compute benchmark return — screening aborted');
     return {
@@ -617,6 +677,7 @@ export async function runScreener(): Promise<Watchlist> {
       lookbackDays,
       exchangeBySymbol.get(symbol),
       funnel,
+      eod,
     ),
     ANALYSIS_CONCURRENCY,
   );

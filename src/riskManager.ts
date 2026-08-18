@@ -117,6 +117,11 @@ export async function getPortfolioAllocation(
  * Risk % and R:R come from RegimeRiskScaler when the morning model is applied.
  *
  * @param settledCash - cash available to cap notional (cash account)
+ * @param stopPriceOverride - structural stop supplied by a strategy (Opening
+ *   Drive impulse-bar low) in place of the ATR-derived distance. The hard stop
+ *   floor is still applied on top: a structural stop only basis points away
+ *   would otherwise divide the risk budget by a near-zero distance and size an
+ *   enormous position.
  */
 export async function computePositionSize(
   symbol: string,
@@ -124,12 +129,20 @@ export async function computePositionSize(
   settledCash: number,
   tier: SignalTier = 'core',
   positionTiers: Map<string, SignalTier> = new Map(),
+  stopPriceOverride: number | null = null,
 ): Promise<PositionSizeResult> {
   const atr = await fetchAtr5m(symbol);
 
   const atrStopDistance = atr * config.risk.atrStopMultiplier5m;
   const hardFloorDistance = entryPrice * config.risk.hardStopFloorPct;
-  const stopDistance = Math.max(atrStopDistance, hardFloorDistance);
+  const structuralDistance =
+    stopPriceOverride !== null && stopPriceOverride > 0 && stopPriceOverride < entryPrice
+      ? entryPrice - stopPriceOverride
+      : null;
+  const stopDistance = Math.max(
+    structuralDistance ?? atrStopDistance,
+    hardFloorDistance,
+  );
   const stopLossPrice = entryPrice - stopDistance;
 
   const allocation = await getPortfolioAllocation(tier, positionTiers);

@@ -15,7 +15,17 @@ import { runPostMortem } from './analyzer';
 import { isTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
-import { getESTDate, isNonRetryableOrderError, toErrorMessage } from './utils';
+import {
+  getESTDate,
+  isNonRetryableOrderError,
+  toESTDate,
+  toErrorMessage,
+} from './utils';
+import {
+  describeOpeningDriveDecision,
+  evaluateOpeningDrive,
+  type OpeningDriveContext,
+} from './openingDrive';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
 import {
   sendTelegramAlert,
@@ -76,6 +86,7 @@ import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 const log = createLogger('SYSTEM');
 const traderLog = createLogger('TRADER');
 const l2Log = createLogger('L2');
+const odLog = createLogger('OPENING_DRIVE');
 
 /** WS producer → strategy consumer (decoupled ingest). */
 const marketDataBus = createMarketDataBus({
@@ -119,6 +130,13 @@ const EMA9_HISTORY_MAX = 50;
 // Level 2 / quote wall arming (Core VWAP complementary trigger)
 const l2WallSignals = new Map<string, ImbalanceSignal>();
 const l2QuotesSeen = new Set<string>();
+
+// Regular-session open per symbol — the Opening Drive extension reference.
+// Captured from the first 1-min bar timestamped at or after 09:30 EST, never
+// from a pre-market bar, and never from wall-clock time (hydration replays bars).
+const sessionOpenPrice = new Map<string, number>();
+// Symbols already evaluated-and-armed by the Opening Drive path this session.
+const openingDriveTriggered = new Set<string>();
 
 // Rolling 1-min bar history for RSI, VMA_10 and Satellite volume confirmation
 const oneMinBarHistory = new Map<string, BarData[]>();
@@ -644,6 +662,23 @@ function getSessionDateStr(): string {
   return `${y}-${m}-${d}`;
 }
 
+/**
+ * Records the regular-session open from the bar's own timestamp.
+ *
+ * Wall-clock time cannot be used here: REST hydration and reconnects replay bars
+ * minutes after the fact, and a pre-market bar must never be mistaken for the
+ * 09:30 open — the Opening Drive extension cap is measured against this value.
+ */
+function captureSessionOpen(symbol: string, bar: BarData): void {
+  if (sessionOpenPrice.has(symbol)) return;
+
+  const barEst = toESTDate(new Date(bar.timestamp));
+  const openMinutes = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
+  if (minutesSinceMidnight(barEst) < openMinutes) return;
+
+  sessionOpenPrice.set(symbol, bar.open);
+}
+
 function isRegularSessionStarted(): boolean {
   const est = getESTDate();
   const h = est.getHours();
@@ -915,6 +950,98 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
     vwap,
     avgVolume,
     fibLevels: orbFibLevels,
+  });
+}
+
+function openingDriveWindowMinutes(): { start: number; end: number } {
+  const od = config.openingDrive;
+  return {
+    start: od.windowStartHour * 60 + od.windowStartMinute,
+    end: od.windowEndHour * 60 + od.windowEndMinute,
+  };
+}
+
+/**
+ * Opening Drive path — evaluated on 1-min bars, only for STRAIGHT_RUN symbols.
+ *
+ * Runs entirely outside the Core pullback state machine: no tracker, no VWAP
+ * proximity, no Fibonacci gate. Ships in shadow mode, where a decision is logged
+ * and no order is ever queued.
+ */
+function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
+  if (tradingHalted) return;
+  if (hasEntered(symbol)) return;
+  if (openingDriveTriggered.has(symbol)) return;
+
+  const screenerData = screenerDataMap.get(symbol);
+  if (screenerData?.isStraightRun !== true) return;
+
+  const window = openingDriveWindowMinutes();
+  const ctx: OpeningDriveContext = {
+    symbol,
+    barMinutesSinceMidnight: minutesSinceMidnight(toESTDate(new Date(bar1m.timestamp))),
+    isStraightRun: true,
+    straightRunScore: screenerData.straightRunDetail?.score ?? 0,
+    previousClose: screenerData.lastClose ?? null,
+    sessionOpen: sessionOpenPrice.get(symbol) ?? null,
+    sessionVwap: resolveVwapForSymbol(symbol),
+    impulseBar: bar1m,
+    oneMinBars: oneMinBarHistory.get(symbol) ?? [bar1m],
+    imbalance: l2WallSignals.get(symbol)?.imbalance ?? null,
+  };
+
+  const decision = evaluateOpeningDrive(ctx, {
+    windowStartMinutes: window.start,
+    windowEndMinutes: window.end,
+    minRvol1m: config.openingDrive.minRvol1m,
+    minImbalance: config.openingDrive.minImbalance,
+    maxExtensionPct: config.openingDrive.maxExtensionPct,
+    rvolBaselineBars: config.openingDrive.rvolBaselineBars,
+  });
+
+  // Codes that fire on every bar outside the setup would flood the log; the ones
+  // kept below all mean "the setup was live and something specific stopped it".
+  if (!decision.armed) {
+    if (decision.rejection === 'max_extension' || decision.rejection === 'no_stop_reference') {
+      odLog.info(
+        `${symbol}: setup rejected by ${decision.rejection} — ` +
+        describeOpeningDriveDecision(decision),
+      );
+    }
+    return;
+  }
+
+  openingDriveTriggered.add(symbol);
+
+  const banner = config.openingDrive.shadow ? 'SHADOW signal' : 'signal';
+  odLog.info(
+    `${symbol}: Opening Drive ${banner} — ` +
+    describeOpeningDriveDecision(decision) +
+    ` | run score ${ctx.straightRunScore.toFixed(2)}` +
+    ` | score ${Math.round(decision.score).toLocaleString()}`,
+  );
+
+  if (config.openingDrive.shadow) {
+    // Étape 4 persists the MFE/MAE verdict; nothing reaches the broker here.
+    return;
+  }
+
+  const bars5m = signalBars5m.get(symbol) ?? [];
+  const baseline = bars5m.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
+  const avgVolume = baseline.length > 0
+    ? baseline.reduce((sum, b) => sum + b.volume, 0) / baseline.length
+    : bar1m.volume;
+
+  queuePendingSignal({
+    symbol,
+    tier: 'satellite',
+    score: decision.score,
+    barData: bar1m,
+    vwap: ctx.sessionVwap ?? bar1m.close,
+    avgVolume,
+    fibLevels: null,
+    stopPriceOverride: decision.stopPrice,
+    skipFibonacciGate: true,
   });
 }
 
@@ -1265,6 +1392,7 @@ async function executeSignalsForTier(
         settledCash,
         tier,
         enteredByTier,
+        signal.stopPriceOverride ?? null,
       );
 
       if (qty < 1) {
@@ -1327,7 +1455,11 @@ async function executeSignalsForTier(
       let fibLevelAtEntry: number | null = null;
       let fibLevelNameAtEntry: import('./types').FibLevelName | null = null;
 
-      if (signal.fibLevels) {
+      if (signal.skipFibonacciGate) {
+        // Continuation paths buy strength away from support; a retracement gate
+        // would reject every setup they exist to take.
+        log.info(`${symbol}: Fibonacci gate skipped — continuation entry path`);
+      } else if (signal.fibLevels) {
         const fibProx = evaluateFibProximity(
           referencePrice,
           signal.fibLevels,
@@ -1541,7 +1673,9 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
 
   pushEma9Close(symbol, barData.close);
   pushOneMinBar(symbol, barData);
+  captureSessionOpen(symbol, barData);
   evaluatePullbackState(symbol, barData);
+  evaluateOpeningDriveSignal(symbol, barData);
 
   // UT1m dynamic exit monitoring for confirmed open positions.
   if (hasEntered(symbol)) {
@@ -1935,6 +2069,8 @@ function scheduleDailyReset(): void {
     isFlushInProgress = false;
     monitoredSymbols = [];
     oneMinBarHistory.clear();
+    sessionOpenPrice.clear();
+    openingDriveTriggered.clear();
     atrAtEntry.clear();
     signalQueue.clear();
     if (signalFlushTimer) {

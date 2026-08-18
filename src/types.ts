@@ -102,6 +102,14 @@ export interface PendingSignal {
   vwap: number;
   avgVolume: number;
   fibLevels: FibLevels | null;
+  /**
+   * Structural stop supplied by the strategy instead of the ATR-derived one
+   * (Opening Drive uses the impulse bar low). The hard stop floor still applies
+   * on top, so a stop sitting a few basis points away cannot inflate size.
+   */
+  stopPriceOverride?: number | null;
+  /** Set when the strategy opts out of the Fibonacci support gate. */
+  skipFibonacciGate?: boolean;
 }
 
 /** Motifs de rejet liquidité / univers (logs screener). */
@@ -175,6 +183,36 @@ export interface StraightRunAssessment {
    */
   marketRelativeRvol: number;
   /** 0..1 blend, only meaningful when `isStraightRun` is true. */
+  score: number;
+}
+
+/**
+ * Why an Opening Drive setup did not arm (#29).
+ *
+ * `max_extension` is evaluated last on purpose: a setup carrying that code
+ * satisfied every other condition, which is what makes the shadow-mode audit of
+ * the anti-chase cap meaningful.
+ */
+export type OpeningDriveRejection =
+  | 'not_straight_run'
+  | 'outside_window'
+  | 'insufficient_data'
+  | 'gap_down'
+  | 'open_broken'
+  | 'no_momentum'
+  | 'no_stop_reference'
+  | 'max_extension';
+
+export interface OpeningDriveDecision {
+  armed: boolean;
+  rejection: OpeningDriveRejection | null;
+  /** Impulse close vs session VWAP. Null when the session state is incomplete. */
+  extensionPct: number | null;
+  rvol1m: number | null;
+  /** Top-of-book bid share; null when L2 is disabled or no quote was seen. */
+  imbalance: number | null;
+  /** Impulse bar low — the emergency stop reference. */
+  stopPrice: number | null;
   score: number;
 }
 

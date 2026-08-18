@@ -114,6 +114,21 @@ const config = {
     rvolBaselineDays: parseIntEnv('STRAIGHT_RUN_RVOL_BASELINE_DAYS', 14),
   },
 
+  // Opening Drive Satellite path (#29). Window starts at 09:45 so it never
+  // competes with the ORB (09:30–09:45) for the single Satellite slot.
+  // Ships in shadow mode: signals are recorded, no order is ever sent.
+  openingDrive: {
+    shadow: process.env.OD_SHADOW !== 'false',
+    windowStartHour: parseIntEnv('OD_WINDOW_START_HOUR', 9),
+    windowStartMinute: parseIntEnv('OD_WINDOW_START_MINUTE', 45),
+    windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 10),
+    windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 15),
+    minRvol1m: parseFloatEnv('OD_RVOL_1M', 2.0),
+    minImbalance: parseFloatEnv('OD_MIN_IMBALANCE', 0.65),
+    maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.015),
+    rvolBaselineBars: parseIntEnv('OD_RVOL_BASELINE_BARS', 20),
+  },
+
   portfolio: {
     coreRiskShare: parseFloatEnv('CORE_RISK_SHARE', 0.80),
     satelliteRiskShare: parseFloatEnv('SATELLITE_RISK_SHARE', 0.20),
@@ -462,6 +477,37 @@ const config = {
     throw new Error(
       `[SYSTEM] STRAIGHT_RUN_RVOL_BASELINE_DAYS must be >= 1: ${sr.rvolBaselineDays}`,
     );
+  }
+
+  const od = config.openingDrive;
+  const odStart = od.windowStartHour * 60 + od.windowStartMinute;
+  const odEnd = od.windowEndHour * 60 + od.windowEndMinute;
+  if (odStart >= odEnd) {
+    throw new Error(`[SYSTEM] OD window start must precede end: ${odStart} >= ${odEnd}`);
+  }
+  // The ORB owns 09:30 to blackoutEndMinute and draws from the same Satellite
+  // slot; overlapping windows would make the winner depend on bar arrival order.
+  const orbEnd = config.session.marketOpenHour * 60 + config.session.blackoutEndMinute;
+  if (odStart < orbEnd) {
+    throw new Error(
+      `[SYSTEM] OD window must start at or after the ORB window end (${orbEnd} min EST): ${odStart}`,
+    );
+  }
+  if (od.minRvol1m <= 0) {
+    throw new Error(`[SYSTEM] OD_RVOL_1M must be > 0: ${od.minRvol1m}`);
+  }
+  if (od.minImbalance <= 0.5 || od.minImbalance > 1) {
+    throw new Error(
+      `[SYSTEM] OD_MIN_IMBALANCE must be in (0.5, 1]: ${od.minImbalance}`,
+    );
+  }
+  if (od.maxExtensionPct <= 0 || od.maxExtensionPct >= 1) {
+    throw new Error(
+      `[SYSTEM] OD_MAX_EXTENSION_PCT must be between 0 and 1: ${od.maxExtensionPct}`,
+    );
+  }
+  if (od.rvolBaselineBars < 2) {
+    throw new Error(`[SYSTEM] OD_RVOL_BASELINE_BARS must be >= 2: ${od.rvolBaselineBars}`);
   }
   if (s.springReclaimRvol <= 0) {
     throw new Error(`[SYSTEM] SPRING_RECLAIM_RVOL must be > 0: ${s.springReclaimRvol}`);

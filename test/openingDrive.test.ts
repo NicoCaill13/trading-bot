@@ -7,6 +7,7 @@ import {
   type OpeningDriveOptions,
 } from '../src/openingDrive';
 import type { BarData } from '../src/types';
+import { assertRatio } from './helpers/assertions';
 
 const OPTS: OpeningDriveOptions = {
   windowStartMinutes: 9 * 60 + 45,
@@ -15,6 +16,7 @@ const OPTS: OpeningDriveOptions = {
   minImbalance: 0.65,
   maxExtensionPct: 0.015,
   rvolBaselineBars: 20,
+  hardStopFloorPct: 0.015,
 };
 
 const IN_WINDOW = 10 * 60; // 10:00 EST
@@ -79,7 +81,6 @@ describe('evaluateOpeningDrive — gating', () => {
     assert.equal(decision.rejection, null);
     assert.equal(decision.rvol1m, 5);
     assert.ok(decision.extensionPct !== null && decision.extensionPct < OPTS.maxExtensionPct);
-    assert.equal(decision.stopPrice, context().impulseBar.low);
     assert.ok(decision.score > 0);
   });
 
@@ -249,7 +250,7 @@ describe('evaluateOpeningDrive — anti-chase cap', () => {
 
     assert.equal(decision.rejection, 'max_extension');
     assert.equal(decision.rvol1m, 5);
-    assert.equal(decision.stopPrice, impulseBar.low);
+    assert.ok(decision.stopPrice !== null && decision.stopPrice < impulseBar.close);
     assert.equal(decision.score, 0);
   });
 
@@ -264,13 +265,40 @@ describe('evaluateOpeningDrive — anti-chase cap', () => {
 });
 
 describe('evaluateOpeningDrive — stop reference', () => {
-  it('rejects a bar whose low offers no risk distance', () => {
+  it('rejects a bar with no upward body — there is no impulse to trade', () => {
     const impulseBar = bar(100.5, 5_000, 100.5);
     const decision = evaluateOpeningDrive(
       context({ impulseBar, oneMinBars: history(impulseBar) }),
       OPTS,
     );
-    assert.equal(decision.rejection, 'no_stop_reference');
+    assert.equal(decision.rejection, 'no_impulse_body');
+  });
+
+  it('keeps a structural stop that is already wider than the floor', () => {
+    const impulseBar = bar(100.5, 5_000, 97);
+    const decision = evaluateOpeningDrive(
+      context({ impulseBar, oneMinBars: history(impulseBar) }),
+      OPTS,
+    );
+
+    assert.equal(decision.armed, true);
+    assert.equal(decision.stopPrice, 97);
+  });
+
+  /**
+   * Impulse-bar lows are routinely a few basis points away. Without the floor the
+   * risk budget would be divided by a near-zero distance, and a shadow verdict
+   * measured against that low would report stop-outs live would never take.
+   */
+  it('widens a stop tighter than the floor down to the floor', () => {
+    const impulseBar = bar(100.5, 5_000, 100.48);
+    const decision = evaluateOpeningDrive(
+      context({ impulseBar, oneMinBars: history(impulseBar) }),
+      OPTS,
+    );
+
+    assert.equal(decision.armed, true);
+    assertRatio(decision.stopPrice ?? 0, 100.5 * (1 - OPTS.hardStopFloorPct));
   });
 });
 

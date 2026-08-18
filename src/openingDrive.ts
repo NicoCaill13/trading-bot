@@ -39,6 +39,13 @@ export interface OpeningDriveOptions {
   /** Max tolerated distance above session VWAP, not above the session open. */
   maxExtensionPct: number;
   rvolBaselineBars: number;
+  /**
+   * Minimum stop distance, as a fraction of entry. Applied here so the decision
+   * reports the stop that will actually be used: impulse-bar lows are routinely
+   * a few basis points away, and a shadow verdict measured against the raw low
+   * would report stop-outs the live path would never take.
+   */
+  hardStopFloorPct: number;
 }
 
 function reject(
@@ -51,6 +58,7 @@ function reject(
     extensionPct: partial.extensionPct ?? null,
     rvol1m: partial.rvol1m ?? null,
     imbalance: partial.imbalance ?? null,
+    entryPrice: partial.entryPrice ?? null,
     stopPrice: partial.stopPrice ?? null,
     score: 0,
   };
@@ -120,16 +128,20 @@ export function evaluateOpeningDrive(
   // reject exactly the moves this path exists to take. VWAP rises with the
   // drive, which keeps the guard meaningful at any point in the window.
   const extensionPct = (price - sessionVwap) / sessionVwap;
-  const observed = { extensionPct, rvol1m, imbalance };
+  const observed = { extensionPct, rvol1m, imbalance, entryPrice: price };
 
   const hasVolumeSurge = rvol1m !== null && rvol1m > opts.minRvol1m;
   const hasBuyPressure = imbalance !== null && imbalance >= opts.minImbalance;
   if (!hasVolumeSurge && !hasBuyPressure) return reject('no_momentum', observed);
 
-  const stopPrice = impulseBar.low;
-  if (!(stopPrice > 0) || stopPrice >= price) {
-    return reject('no_stop_reference', observed);
+  // An impulse bar with no upward body is not an impulse, whatever its volume.
+  if (!(impulseBar.low > 0) || impulseBar.low >= price) {
+    return reject('no_impulse_body', observed);
   }
+
+  // The wider of the structural low and the floor, matching what
+  // `computePositionSize` will derive, so shadow and live agree on the risk.
+  const stopPrice = Math.min(impulseBar.low, price * (1 - opts.hardStopFloorPct));
 
   if (extensionPct > opts.maxExtensionPct) {
     return reject('max_extension', { ...observed, stopPrice });
@@ -146,6 +158,7 @@ export function evaluateOpeningDrive(
     extensionPct,
     rvol1m,
     imbalance,
+    entryPrice: price,
     stopPrice,
     score,
   };

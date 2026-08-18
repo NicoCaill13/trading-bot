@@ -6,6 +6,7 @@ import {
   type StraightRunBar,
   type StraightRunOptions,
 } from '../src/straightRun';
+import { assertRatio } from './helpers/assertions';
 
 const OPTS: StraightRunOptions = {
   minDays: 5,
@@ -16,14 +17,6 @@ const OPTS: StraightRunOptions = {
 
 /** A flat market: the symbol's own ratio is already the market-relative one. */
 const FLAT_MARKET = 1;
-
-/** Ratios come out of two divisions, so exact equality is not available. */
-function assertRatio(actual: number, expected: number): void {
-  assert.ok(
-    Math.abs(actual - expected) < 1e-9,
-    `expected ~${expected}, got ${actual}`,
-  );
-}
 
 function bar(close: number, volume = 1_000, high = close, low = close): StraightRunBar {
   return { high, low, close, volume };

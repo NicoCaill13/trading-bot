@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import config from './config';
 import { createLogger } from './logger';
+import { writeJsonAtomic } from './jsonStore';
 import { toErrorMessage } from './utils';
 import type { SplitAdjustmentMode } from './corporateActions';
 import type { AlpacaBar } from '@alpacahq/alpaca-trade-api';
@@ -110,9 +111,8 @@ export async function readEodBars(
 }
 
 /**
- * Writes through a temporary file in the destination directory then renames, so
- * a crash mid-write cannot leave a truncated JSON that the next run would read
- * as a valid — but incomplete — history.
+ * Persisted atomically: a crash mid-write must not leave a truncated JSON that
+ * the next run would read as a valid — but incomplete — history.
  */
 export async function writeEodBars(
   tradingDay: string,
@@ -135,13 +135,9 @@ export async function writeEodBars(
     bars: [...bars],
   };
 
-  const tempPath = `${recordPath}.${process.pid}.tmp`;
   try {
-    await fs.mkdir(path.dirname(recordPath), { recursive: true });
-    await fs.writeFile(tempPath, JSON.stringify(record));
-    await fs.rename(tempPath, recordPath);
+    await writeJsonAtomic(recordPath, record);
   } catch (err) {
     log.warn(`${symbol}: cache write failed — ${toErrorMessage(err)}`);
-    await fs.rm(tempPath, { force: true }).catch(() => undefined);
   }
 }

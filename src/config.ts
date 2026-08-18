@@ -127,6 +127,7 @@ const config = {
     minImbalance: parseFloatEnv('OD_MIN_IMBALANCE', 0.65),
     maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.015),
     rvolBaselineBars: parseIntEnv('OD_RVOL_BASELINE_BARS', 20),
+    shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
   },
 
   portfolio: {
@@ -273,6 +274,9 @@ const config = {
     heartbeat: parseStringEnv('HEARTBEAT_PATH', './data/heartbeat.json'),
     // Root of the per-trading-day adjusted daily-bar cache (data/eod/<day>/<sym>.json).
     eodCache: parseStringEnv('EOD_CACHE_PATH', './data/eod'),
+    // Opening Drive observations. Kept apart from journal.json so hypothetical
+    // fills never reach the FeedbackEngine.
+    shadowSignals: parseStringEnv('OD_SHADOW_PATH', './data/shadow_signals.json'),
   },
 
   // Liveness contract consumed by the standalone watchdog process.
@@ -508,6 +512,11 @@ const config = {
   }
   if (od.rvolBaselineBars < 2) {
     throw new Error(`[SYSTEM] OD_RVOL_BASELINE_BARS must be >= 2: ${od.rvolBaselineBars}`);
+  }
+  if (od.shadowHorizonMinutes < 1) {
+    throw new Error(
+      `[SYSTEM] OD_SHADOW_HORIZON_MIN must be >= 1: ${od.shadowHorizonMinutes}`,
+    );
   }
   if (s.springReclaimRvol <= 0) {
     throw new Error(`[SYSTEM] SPRING_RECLAIM_RVOL must be > 0: ${s.springReclaimRvol}`);

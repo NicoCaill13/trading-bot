@@ -9,9 +9,15 @@
 import alpaca from '../src/alpacaClient';
 import config from '../src/config';
 import { evaluateOpeningDrive, type OpeningDriveContext } from '../src/openingDrive';
+import {
+  applyBarToShadowRecord,
+  createShadowRecord,
+  isHorizonElapsed,
+  summarizeShadowRecord,
+} from '../src/shadowJournal';
 import { minutesSinceMidnight } from '../src/vwapSetup';
 import { toESTDate } from '../src/utils';
-import type { BarData } from '../src/types';
+import type { BarData, ShadowSignalRecord } from '../src/types';
 
 const symbol = process.argv[2] ?? 'WDC';
 const day = process.argv[3] ?? '2026-08-17';
@@ -23,6 +29,7 @@ const opts = {
   minImbalance: config.openingDrive.minImbalance,
   maxExtensionPct: config.openingDrive.maxExtensionPct,
   rvolBaselineBars: config.openingDrive.rvolBaselineBars,
+  hardStopFloorPct: config.risk.hardStopFloorPct,
 };
 
 async function main(): Promise<void> {
@@ -52,6 +59,10 @@ async function main(): Promise<void> {
   const rth: BarData[] = [];
 
   const tally = new Map<string, number>();
+  const observations = new Map<string, ShadowSignalRecord>();
+  const verdicts: ShadowSignalRecord[] = [];
+  let auditLogged = false;
+  let armedLogged = false;
   let inWindow = 0;
   let surgeBars = 0;
   let minExt = Infinity;
@@ -64,6 +75,17 @@ async function main(): Promise<void> {
     const minutes = minutesSinceMidnight(est);
     history.push(bar);
     if (history.length > 30) history.splice(0, history.length - 30);
+
+    // Same ordering as the live hook: a bar updates observations opened earlier
+    // before it can open one of its own.
+    for (const [key, rec] of observations) {
+      if (isHorizonElapsed(rec, bar)) {
+        verdicts.push(rec);
+        observations.delete(key);
+        continue;
+      }
+      observations.set(key, applyBarToShadowRecord(rec, bar));
+    }
 
     if (minutes < openMinutes) continue;
     if (sessionOpen === null) {
@@ -106,6 +128,29 @@ async function main(): Promise<void> {
 
     if (d.rejection === 'no_momentum') continue;
 
+    if (d.armed || d.rejection === 'max_extension') {
+      const rejectedBy = d.armed ? null : 'max_extension';
+      // Mirrors the live gates: one arm per symbol per session, and one audited
+      // cap rejection. Observing every qualifying bar would overstate the number
+      // of trades the bot actually takes.
+      const isFirst = d.armed ? !armedLogged : !auditLogged;
+      if (isFirst) {
+        if (d.armed) armedLogged = true;
+        else auditLogged = true;
+        observations.set(
+          `${symbol}|${bar.timestamp}`,
+          createShadowRecord({
+            symbol,
+            signalAt: bar.timestamp,
+            decision: d,
+            straightRunScore: ctx.straightRunScore,
+            rejectedBy,
+            horizonMinutes: config.openingDrive.shadowHorizonMinutes,
+          }),
+        );
+      }
+    }
+
     const clock = `${String(minutes / 60 | 0).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
     console.log(
       `  ${clock} ${d.armed ? 'ARMED'.padEnd(20) : `rej ${d.rejection}`.padEnd(20)} ` +
@@ -121,6 +166,11 @@ async function main(): Promise<void> {
     `(cap ${(opts.maxExtensionPct * 100).toFixed(2)}%)`,
   );
   console.log(`  outcomes ${[...tally].map(([k, v]) => `${k}=${v}`).join(' ')}`);
+
+  for (const rec of observations.values()) verdicts.push(rec);
+  for (const rec of verdicts) {
+    console.log(`  VERDICT ${summarizeShadowRecord(rec)}`);
+  }
 
   const last = rth[rth.length - 1];
   if (sessionOpen !== null && last) {

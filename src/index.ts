@@ -11,6 +11,7 @@ import * as riskManager from './riskManager';
 import * as positionManager from './positionManager';
 import * as journalManager from './journalManager';
 import * as feedbackEngine from './feedbackEngine';
+import * as shadowJournal from './shadowJournal';
 import { runPostMortem } from './analyzer';
 import { isTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
@@ -137,6 +138,10 @@ const l2QuotesSeen = new Set<string>();
 const sessionOpenPrice = new Map<string, number>();
 // Symbols already evaluated-and-armed by the Opening Drive path this session.
 const openingDriveTriggered = new Set<string>();
+// Symbols whose audited rejection was already recorded. Tracked apart from the
+// armed set: a name can be capped at 09:51 and legitimately arm at 09:54 once
+// VWAP catches up, and both observations matter — but only the first cap does.
+const openingDriveAuditLogged = new Set<string>();
 
 // Rolling 1-min bar history for RSI, VMA_10 and Satellite volume confirmation
 const oneMinBarHistory = new Map<string, BarData[]>();
@@ -997,16 +1002,31 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     minImbalance: config.openingDrive.minImbalance,
     maxExtensionPct: config.openingDrive.maxExtensionPct,
     rvolBaselineBars: config.openingDrive.rvolBaselineBars,
+    hardStopFloorPct: config.risk.hardStopFloorPct,
   });
 
   // Codes that fire on every bar outside the setup would flood the log; the ones
   // kept below all mean "the setup was live and something specific stopped it".
   if (!decision.armed) {
-    if (decision.rejection === 'max_extension' || decision.rejection === 'no_stop_reference') {
+    if (decision.rejection === 'max_extension' || decision.rejection === 'no_impulse_body') {
       odLog.info(
         `${symbol}: setup rejected by ${decision.rejection} — ` +
         describeOpeningDriveDecision(decision),
       );
+    }
+
+    // A cap rejection is only actionable with an outcome attached: a bare counter
+    // cannot say whether the cap protected the book or discarded a winner.
+    if (decision.rejection === 'max_extension' && !openingDriveAuditLogged.has(symbol)) {
+      openingDriveAuditLogged.add(symbol);
+      shadowJournal.recordShadowSignal({
+        symbol,
+        signalAt: bar1m.timestamp,
+        decision,
+        straightRunScore: ctx.straightRunScore,
+        rejectedBy: 'max_extension',
+        horizonMinutes: config.openingDrive.shadowHorizonMinutes,
+      });
     }
     return;
   }
@@ -1021,10 +1041,18 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     ` | score ${Math.round(decision.score).toLocaleString()}`,
   );
 
-  if (config.openingDrive.shadow) {
-    // Étape 4 persists the MFE/MAE verdict; nothing reaches the broker here.
-    return;
-  }
+  // Armed setups are observed in both modes: in shadow it is the only record, and
+  // live it gives the realised fill something to be compared against.
+  shadowJournal.recordShadowSignal({
+    symbol,
+    signalAt: bar1m.timestamp,
+    decision,
+    straightRunScore: ctx.straightRunScore,
+    rejectedBy: null,
+    horizonMinutes: config.openingDrive.shadowHorizonMinutes,
+  });
+
+  if (config.openingDrive.shadow) return;
 
   const bars5m = signalBars5m.get(symbol) ?? [];
   const baseline = bars5m.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
@@ -1675,7 +1703,14 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   pushOneMinBar(symbol, barData);
   captureSessionOpen(symbol, barData);
   evaluatePullbackState(symbol, barData);
+
+  // Observation before evaluation, so this bar is folded into records opened on
+  // earlier bars only. A setup's own impulse bar is its entry, not an outcome.
+  shadowJournal.updateShadowRecords(symbol, barData);
   evaluateOpeningDriveSignal(symbol, barData);
+  if (shadowJournal.pendingFlushCount() > 0) {
+    void shadowJournal.flushShadowRecords();
+  }
 
   // UT1m dynamic exit monitoring for confirmed open positions.
   if (hasEntered(symbol)) {
@@ -1969,6 +2004,10 @@ function scheduleEodSweep(): void {
       riskManager.runEodSweep(sessionData).catch((err: unknown) => {
         log.error(`EOD sweep error: ${toErrorMessage(err)}`);
       });
+      // Late-session observations will never see their full horizon; a partial
+      // excursion is still the calibration data we came for.
+      shadowJournal.closeAllShadowRecords(new Date().toISOString());
+      void shadowJournal.flushShadowRecords();
       scheduleEodSweep();
     });
   }, ms);
@@ -2071,6 +2110,9 @@ function scheduleDailyReset(): void {
     oneMinBarHistory.clear();
     sessionOpenPrice.clear();
     openingDriveTriggered.clear();
+    openingDriveAuditLogged.clear();
+    shadowJournal.closeAllShadowRecords(new Date().toISOString());
+    void shadowJournal.flushShadowRecords().then(() => shadowJournal.reset());
     atrAtEntry.clear();
     signalQueue.clear();
     if (signalFlushTimer) {

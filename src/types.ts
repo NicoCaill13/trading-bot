@@ -200,7 +200,7 @@ export type OpeningDriveRejection =
   | 'gap_down'
   | 'open_broken'
   | 'no_momentum'
-  | 'no_stop_reference'
+  | 'no_impulse_body'
   | 'max_extension';
 
 export interface OpeningDriveDecision {
@@ -211,9 +211,61 @@ export interface OpeningDriveDecision {
   rvol1m: number | null;
   /** Top-of-book bid share; null when L2 is disabled or no quote was seen. */
   imbalance: number | null;
-  /** Impulse bar low — the emergency stop reference. */
+  /** Impulse bar close — the theoretical fill this decision is about. */
+  entryPrice: number | null;
+  /** Effective stop: impulse bar low widened to the hard stop floor. */
   stopPrice: number | null;
   score: number;
+}
+
+/**
+ * One observed Opening Drive setup, armed or audited, tracked over a fixed
+ * horizon (#29 Étape 4).
+ *
+ * Deliberately kept out of `journal.json`: the FeedbackEngine derives live entry
+ * filters from that file, and hypothetical setups that never reached the broker
+ * would silently retune the Core path.
+ *
+ * All `*Pct` fields are fractions, not percentage points: 0.015 means +1.5%.
+ * This matches `OpeningDriveDecision.extensionPct`, which feeds this record.
+ */
+export interface ShadowSignalRecord {
+  symbol: string;
+  strategy: 'opening_drive';
+  /** NY trading day, so records stay groupable without re-deriving timezones. */
+  tradingDay: string;
+  signalAt: string;
+  /**
+   * Null when the setup armed. Otherwise the single gate that stopped it — only
+   * gates worth auditing are recorded, currently `max_extension`.
+   */
+  rejectedBy: OpeningDriveRejection | null;
+  /** Theoretical fill: the impulse bar close. */
+  entryPrice: number;
+  /** Theoretical stop: impulse bar low widened to the hard stop floor. */
+  stopPrice: number;
+  extensionPct: number;
+  rvol1m: number | null;
+  imbalance: number | null;
+  straightRunScore: number;
+  horizonMinutes: number;
+  /** Best/worst excursion vs entry, measured on bar highs/lows (intrabar). */
+  mfePct: number;
+  maePct: number;
+  /** Bar index (0-based, from the first bar after the signal) of each event. */
+  mfeBarIndex: number | null;
+  stopHitBarIndex: number | null;
+  stopHit: boolean;
+  /**
+   * True when the stop was touched no later than the bar that set the MFE peak.
+   * A stop touched on the very bar that set a new high counts as "before": bar
+   * data cannot order a high and a low within the same minute, and overstating
+   * the opportunity would bias the anti-chase audit toward loosening the cap.
+   */
+  stopHitBeforeMfe: boolean;
+  barsObserved: number;
+  /** Set when the horizon elapsed or the session ended. */
+  closedAt: string | null;
 }
 
 /** Lexicon news headline sentiment for the catalyst gate (#21). */

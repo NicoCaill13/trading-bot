@@ -1,45 +1,25 @@
 import config from './config';
 import { createLogger } from './logger';
-import { toErrorMessage } from './utils';
+import { sendTelegramMessage } from './telegramClient';
 import type { SignalTier, Watchlist } from './types';
 
 const log = createLogger('NOTIFICATION');
-
-const TELEGRAM_TIMEOUT_MS = 8000;
 
 /**
  * Sends an HTML-formatted alert via the Telegram Bot API.
  * Failures are logged and swallowed — never throws, never blocks trading.
  */
 export async function sendTelegramAlert(message: string): Promise<void> {
-  const token = config.notify.telegramBotToken;
-  const chatId = config.notify.telegramChatId;
-  if (!token || !chatId) return;
+  const result = await sendTelegramMessage(
+    {
+      token: config.notify.telegramBotToken,
+      chatId: config.notify.telegramChatId,
+    },
+    message,
+  );
 
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), TELEGRAM_TIMEOUT_MS);
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'HTML',
-      }),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      log.warn(`Telegram API HTTP ${response.status}`);
-    }
-  } catch (err) {
-    log.warn(`Telegram alert failed: ${toErrorMessage(err)}`);
+  if (!result.delivered && config.notify.telegramBotToken !== null) {
+    log.warn(`Telegram alert failed: ${result.reason}`);
   }
 }
 

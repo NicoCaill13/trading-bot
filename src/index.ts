@@ -41,6 +41,7 @@ import {
 } from './vwapSetup';
 import { resolveRiskDollarsAtEntry } from './expectancy';
 import { createMarketDataBus } from './marketDataBus';
+import { createHeartbeatWriter } from './heartbeat';
 import { assessQuoteForWall } from './orderBook';
 import {
   getEffectiveRiskPerTradePct,
@@ -48,8 +49,10 @@ import {
 } from './regimeModel';
 import type {
   BarData,
+  HeartbeatSnapshot,
   PendingSignal,
   PullbackTracker,
+  SessionPhase,
   SessionState,
   SignalTier,
   OrbState,
@@ -64,6 +67,7 @@ import type {
   DiscordField,
   SpyTrend,
   ImbalanceSignal,
+  WsState,
 } from './types';
 import { resolveSymbolTier } from './types';
 import type { SessionDataEntry } from './riskManager';
@@ -155,6 +159,85 @@ const EQUITY_CHECK_INTERVAL_MS = 60_000;
 let sessionStartEquity = 0;
 
 const WS_URL = 'wss://stream.data.alpaca.markets/v2/iex';
+
+// ---------------------------------------------------------------------------
+// Liveness telemetry — produced for the standalone watchdog, never read back
+// ---------------------------------------------------------------------------
+
+const botStartedAt = new Date().toISOString();
+let wsState: WsState = 'disabled';
+let lastBarAt: string | null = null;
+let watchlistGeneratedAt: string | null = null;
+let tradingDayFlag = false;
+let currentSessionPhase: SessionPhase | null = null;
+let sessionPhaseSince = botStartedAt;
+
+// Broker-sourced position count. The in-process `enteredByTier` map is cleared on
+// bar events, which stop flowing after the close — precisely when the overnight
+// exposure check matters — so the count is refreshed independently.
+let openPositionsCount = 0;
+let openPositionsCheckedAt: string | null = null;
+const POSITION_REFRESH_INTERVAL_MS = 60_000;
+
+function resolveSessionPhase(): SessionPhase {
+  if (!tradingDayFlag) return 'non_trading_day';
+  const mins = minutesSinceMidnight(getESTDate());
+  const open = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
+  const close = config.session.hardCloseHour * 60 + config.session.hardCloseMinute;
+  if (mins < open) return 'pre_open';
+  if (mins < close) return 'session';
+  return 'post_close';
+}
+
+function buildHeartbeatSnapshot(): HeartbeatSnapshot {
+  const writtenAt = new Date().toISOString();
+  const sessionPhase = resolveSessionPhase();
+
+  if (sessionPhase !== currentSessionPhase) {
+    currentSessionPhase = sessionPhase;
+    sessionPhaseSince = writtenAt;
+  }
+
+  return {
+    writtenAt,
+    startedAt: botStartedAt,
+    pid: process.pid,
+    sessionPhase,
+    sessionPhaseSince,
+    tradingDay: tradingDayFlag,
+    tradingHalted,
+    wsState,
+    lastBarAt,
+    monitoredSymbols: monitoredSymbols.length,
+    openPositions: openPositionsCount,
+    openPositionsCheckedAt,
+    watchlistGeneratedAt,
+  };
+}
+
+const heartbeatWriter = createHeartbeatWriter(
+  config.paths.heartbeat,
+  config.health.heartbeatIntervalMs,
+  buildHeartbeatSnapshot,
+);
+
+async function refreshOpenPositionsCount(): Promise<void> {
+  try {
+    const positions = await trader.getOpenPositions();
+    openPositionsCount = positions.length;
+    openPositionsCheckedAt = new Date().toISOString();
+  } catch (err) {
+    // Keep the last known count and let it age out — the watchdog ignores a
+    // stale count rather than alerting on it.
+    log.warn(`Open position refresh failed: ${toErrorMessage(err)}`);
+  }
+}
+
+function startPositionRefreshLoop(): void {
+  void refreshOpenPositionsCount();
+  const timer = setInterval(() => { void refreshOpenPositionsCount(); }, POSITION_REFRESH_INTERVAL_MS);
+  timer.unref();
+}
 
 // ---------------------------------------------------------------------------
 // EST time helpers
@@ -371,6 +454,8 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
     v2PersistentSymbols.add(s.symbol);
   }
   signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
+
+  watchlistGeneratedAt = data.generatedAt;
 
   const v1Count = data.symbols.length - v2Symbols.length;
   log.info(
@@ -1447,6 +1532,8 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
     timestamp: bar.t,
   };
 
+  lastBarAt = new Date().toISOString();
+
   if (!liveBarsAnnounced) {
     liveBarsAnnounced = true;
     log.info(`Live 1-min bars flowing — first tick: ${symbol} @ $${barData.close.toFixed(2)}`);
@@ -1634,6 +1721,7 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 
   for (const msg of messages) {
     if (isWsSuccessMessage(msg) && msg.msg === 'authenticated') {
+      wsState = 'authenticated';
       log.info(
         `WebSocket authenticated — subscribing to ${symbols.length} symbols` +
         (config.level2.enabled ? ' (bars+quotes)' : ' (bars)'),
@@ -1679,6 +1767,7 @@ function connectWebSocket(symbols: string[]): void {
     secret: config.alpaca.secretKey,
   });
 
+  wsState = 'connecting';
   ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
@@ -1694,6 +1783,7 @@ function connectWebSocket(symbols: string[]): void {
   });
 
   ws.on('close', (code: number) => {
+    wsState = 'disconnected';
     log.warn(`WebSocket closed (code ${code}) — reconnection scheduled...`);
     void sendTelegramAlert(formatErrorAlert(`WebSocket déconnecté (code ${code}) — reconnexion...`));
     scheduleReconnect(symbols);
@@ -1964,6 +2054,12 @@ async function main(): Promise<void> {
   log.info('Initializing trading bot...');
 
   const tradingToday = await isTradingDay();
+  tradingDayFlag = tradingToday;
+
+  // Started before any await that can fail: an unreachable broker must still
+  // produce a heartbeat, otherwise the watchdog cannot tell "degraded" from "dead".
+  heartbeatWriter.start();
+
   const symbols = await loadWatchlist(!tradingToday);
   monitoredSymbols = symbols;
 
@@ -1979,6 +2075,7 @@ async function main(): Promise<void> {
 
   if (!tradingToday) {
     wsEnabled = false;
+    wsState = 'disabled';
     log.warn(
       'Market closed today (weekend/holiday) — idle mode. ' +
       'WebSocket disabled, crons armed for next trading day.',
@@ -1987,6 +2084,7 @@ async function main(): Promise<void> {
   }
 
   wsEnabled = true;
+  startPositionRefreshLoop();
 
   if (symbols.length === 0) {
     log.warn('Empty watchlist — no trades today. Waiting for 20:00 screener...');
@@ -2047,6 +2145,10 @@ async function main(): Promise<void> {
 async function gracefulShutdown(signal: string): Promise<void> {
   log.warn(`Signal ${signal} received — saving state and shutting down`);
   await saveSessionState().catch(() => { });
+  // Final write then stop: the watchdog sees the last known state age out
+  // naturally instead of finding a file frozen mid-session.
+  heartbeatWriter.flush();
+  heartbeatWriter.stop();
   process.exit(0);
 }
 

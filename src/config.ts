@@ -1,29 +1,5 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
-function requireEnv(key: string): string {
-  const value = process.env[key];
-  if (!value) {
-    throw new Error(`[SYSTEM] Missing environment variable: ${key}`);
-  }
-  return value;
-}
-
-function parseFloatEnv(key: string, defaultValue: number): number {
-  const raw = process.env[key];
-  if (raw === undefined || raw === '') return defaultValue;
-  const parsed = parseFloat(raw);
-  if (isNaN(parsed)) throw new Error(`[SYSTEM] Invalid float for ${key}: "${raw}"`);
-  return parsed;
-}
-
-function parseIntEnv(key: string, defaultValue: number): number {
-  const raw = process.env[key];
-  if (raw === undefined || raw === '') return defaultValue;
-  const parsed = parseInt(raw, 10);
-  if (isNaN(parsed)) throw new Error(`[SYSTEM] Invalid integer for ${key}: "${raw}"`);
-  return parsed;
-}
+// Importing './env' loads the environment file — see the note in that module.
+import { parseFloatEnv, parseIntEnv, parseStringEnv, requireEnv } from './env';
 
 function parseBusDropPolicy(raw: string | undefined): 'drop_oldest' | 'drop_newest' {
   const value = (raw ?? 'drop_oldest').trim().toLowerCase();
@@ -269,6 +245,13 @@ const config = {
     watchlistV2: './data/watchlist_v2.json',
     sessionState: './data/session_state.json',
     journal: './data/journal.json',
+    heartbeat: parseStringEnv('HEARTBEAT_PATH', './data/heartbeat.json'),
+  },
+
+  // Liveness contract consumed by the standalone watchdog process.
+  // The bot only produces the heartbeat; it never reads it back.
+  health: {
+    heartbeatIntervalMs: parseIntEnv('HEARTBEAT_INTERVAL_MS', 20_000),
   },
 
   notify: {
@@ -314,6 +297,14 @@ const config = {
 
   if (r.dailyProfitTargetPct <= 0 || r.dailyProfitTargetPct > 0.1)
     throw new Error(`[SYSTEM] DAILY_PROFIT_TARGET_PCT out of bounds (0–10%): ${r.dailyProfitTargetPct}`);
+
+  // Below 1s the writer would thrash the disk; above 60s the watchdog cannot
+  // distinguish a slow heartbeat from a dead process within a useful delay.
+  if (config.health.heartbeatIntervalMs < 1000 || config.health.heartbeatIntervalMs > 60_000) {
+    throw new Error(
+      `[SYSTEM] HEARTBEAT_INTERVAL_MS out of bounds (1000–60000): ${config.health.heartbeatIntervalMs}`,
+    );
+  }
 
   const e = config.entry;
   if (e.maxEntryChasePct < 0 || e.maxEntryChasePct > 10)

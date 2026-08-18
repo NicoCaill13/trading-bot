@@ -1,4 +1,8 @@
+import { minutesSinceMidnight } from './utils';
 import type { BarData, SpyTrend } from './types';
+
+// Re-exported so strategy modules keep a single import surface for setup helpers.
+export { minutesSinceMidnight };
 
 export interface EntryWindowBounds {
   startHour: number;
@@ -10,11 +14,6 @@ export interface EntryWindowBounds {
 export interface OhcBar {
   open: number;
   close: number;
-}
-
-/** Minutes since local midnight for an EST wall-clock Date from getESTDate(). */
-export function minutesSinceMidnight(est: Date): number {
-  return est.getHours() * 60 + est.getMinutes();
 }
 
 /**

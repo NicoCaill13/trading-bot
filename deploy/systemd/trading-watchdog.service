@@ -1,0 +1,41 @@
+[Unit]
+Description=Trading bot liveness watchdog
+Documentation=https://github.com/NicoCaill13/trading-bot
+After=network-online.target
+Wants=network-online.target
+# No After= / Requires= on trading-bot.service, by design. A watchdog that only
+# runs once its subject is healthy cannot report a subject that never started.
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+
+# Must match trading-bot.service: the heartbeat path is resolved from here.
+WorkingDirectory=/opt/trading-bot
+
+ExecStart=/opt/trading-bot/node_modules/.bin/tsx src/watchdog.ts
+
+Environment=NODE_ENV=production
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-watchdog
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# Reads data/heartbeat.json (reads stay allowed under ProtectSystem=strict) and
+# writes only its own log file. It holds no broker credentials and never trades.
+ReadWritePaths=/opt/trading-bot/logs
+
+[Install]
+WantedBy=multi-user.target

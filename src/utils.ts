@@ -1,5 +1,29 @@
+/**
+ * Projects any instant onto America/New_York wall-clock time. The returned Date
+ * carries the EST/EDT calendar fields in its local getters — it is a wall-clock
+ * carrier, not a valid instant, and must never be compared to Date.now().
+ */
+export function toESTDate(instant: Date): Date {
+  return new Date(instant.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+}
+
 export function getESTDate(): Date {
-  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return toESTDate(new Date());
+}
+
+/** Minutes since local midnight for a wall-clock carrier from toESTDate(). */
+export function minutesSinceMidnight(est: Date): number {
+  return est.getHours() * 60 + est.getMinutes();
+}
+
+/**
+ * YYYY-MM-DD key from a wall-clock carrier. Uses local getters on purpose:
+ * toISOString would re-project the carrier to UTC and shift the calendar day.
+ */
+export function estCalendarDayKey(est: Date): string {
+  const month = String(est.getMonth() + 1).padStart(2, '0');
+  const day = String(est.getDate()).padStart(2, '0');
+  return `${est.getFullYear()}-${month}-${day}`;
 }
 
 /**

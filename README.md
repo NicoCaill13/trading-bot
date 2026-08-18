@@ -440,6 +440,52 @@ Port `NewsProvider` (adapter Alpaca ; Finnhub interchangeable). Logs `[SENTIMENT
 
 ---
 
+### 12. Watchdog de liveness (process indépendant)
+
+Le bot ne peut pas signaler sa propre mort : toutes ses alertes (`[NOTIFIER]`, Telegram) supposent le process vivant. Un **second process** surveille donc le bot depuis l'extérieur.
+
+```bash
+npm start       # le bot — produit le heartbeat
+npm run watchdog  # le surveillant — le lit et alerte
+```
+
+**Contrat unique entre les deux : un fichier.** Pas de socket, pas de port, pas de config partagée. Le watchdog n'importe ni `config`, ni le client Alpaca, ni la stratégie — un surveillant qui partage les modes de panne de son sujet n'en est pas un. Il **n'a aucune clé broker** : il alerte, il n'agit jamais.
+
+`data/heartbeat.json` est réécrit toutes les **20 s** (écriture atomique temp + rename) :
+
+| Champ | Rôle |
+|-------|------|
+| `writtenAt` | Fraîcheur du process |
+| `sessionPhase` / `sessionPhaseSince` | Phase EST + période de grâce des règles |
+| `lastBarAt` | Fraîcheur du feed (socket ouverte mais muette) |
+| `openPositions` / `openPositionsCheckedAt` | Comptage **broker** rafraîchi 1×/min |
+| `watchlistGeneratedAt` | Détection d'une séance sur données périmées |
+| `tradingHalted` / `wsState` / `monitoredSymbols` | Contexte de décision |
+
+**Règles évaluées** (`watchdogRules.ts`, pures et horloge injectée) :
+
+| Code | Déclencheur |
+|------|-------------|
+| `HEARTBEAT_MISSING` | Fichier absent, illisible ou schéma invalide |
+| `HEARTBEAT_STALE` | Plus vieux que **120 s** — process mort ou event loop bloquée |
+| `MARKET_DATA_STALE` | En séance, aucune barre depuis **180 s** |
+| `WATCHLIST_STALE` | Watchlist générée il y a plus de **96 h** |
+| `POSITIONS_OPEN_AFTER_CLOSE` | Position ouverte après **16h05 EST** — EOD sweep non exécuté |
+
+Dès qu'un heartbeat est périmé, les autres règles sont **suspendues** : elles liraient un payload obsolète et produiraient de faux constats.
+
+`POSITIONS_OPEN_AFTER_CLOSE` est la règle à plus forte valeur : elle vérifie le **résultat attendu** de la séance, pas la respiration du process. C'est le garde-fou contre le risque overnight non voulu.
+
+**Escalade** (`watchdogEscalation.ts`) : alerte immédiate, puis rappels à 5 / 15 / 30 / 60 min, puis message de résolution avec la durée de l'incident. Deux **digests** quotidiens (`09h35` et `16h10` EST) annoncent « aucun incident » — sans eux, un silence total serait ambigu : watchdog mort et système sain se ressemblent.
+
+**Fenêtre de grâce au démarrage** (`WATCHDOG_STARTUP_GRACE_MS`, 120 s) : après un reboot les deux process démarrent ensemble, donc `HEARTBEAT_MISSING` et `HEARTBEAT_STALE` sont tus le temps que le bot boote. Les constats issus d'un snapshot frais, eux, ne sont jamais masqués.
+
+Sans identifiants Telegram, les constats partent uniquement dans `logs/`.
+
+Déploiement des deux units systemd : voir [`deploy/README.md`](deploy/README.md).
+
+---
+
 ## Calendrier de session (EST)
 
 | Heure | Événement |
@@ -465,6 +511,7 @@ Toutes les heures sont calculées en fuseau **America/New_York**.
 | `data/watchlist.json` | Watchlist **Core** (V1) — symboles + métriques momentum |
 | `data/watchlist_v2.json` | Watchlist **Satellite** (V2) — gap, Catalyst Score |
 | `data/session_state.json` | Symboles entrés + tier (`core` / `satellite`) pour recovery crash |
+| `data/heartbeat.json` | Contrat de liveness écrit par le bot, lu par le watchdog |
 | `logs/trading-YYYY-MM-DD.log` | Logs applicatifs rotatifs par jour |
 | `logs/pm2-out.log` / `pm2-error.log` | Logs PM2 (si utilisé) |
 

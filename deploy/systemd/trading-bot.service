@@ -1,0 +1,52 @@
+[Unit]
+Description=Algorithmic trading bot (Alpaca, cash account)
+Documentation=https://github.com/NicoCaill13/trading-bot
+# network-online rather than plain network: the boot sequence must not race the
+# WebSocket connection and the Alpaca REST reconciliation.
+After=network-online.target
+Wants=network-online.target
+# Deliberately no relation to trading-watchdog.service: the watchdog must be able
+# to observe and report a bot that never starts.
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+
+# Anchors every relative path in the codebase (./data, ./logs, ./.env).
+# Both units must declare the same directory or they would silently disagree on
+# where the heartbeat file lives.
+WorkingDirectory=/opt/trading-bot
+
+# Invokes tsx directly instead of `npm start`: npm inserts a process layer that
+# forwards signals unreliably, and SIGTERM must reach the bot for
+# gracefulShutdown to persist session state before exit.
+ExecStart=/opt/trading-bot/node_modules/.bin/tsx src/index.ts
+
+# The environment file is read by dotenv from WorkingDirectory. Not declared as
+# EnvironmentFile= on purpose: one loading mechanism, identical to local dev.
+Environment=NODE_ENV=production
+
+Restart=always
+RestartSec=10
+# No restart cliff. pm2 gave up after 5 crashes and went silent, which is the
+# failure mode this deployment exists to remove. The watchdog reports a bot that
+# cannot stay up; systemd keeps trying.
+StartLimitIntervalSec=0
+
+# gracefulShutdown persists session state, so let it finish.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/logs
+
+[Install]
+WantedBy=multi-user.target

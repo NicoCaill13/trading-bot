@@ -233,6 +233,57 @@ export interface AdaptiveFilters {
   computedAt: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Liveness contract — written by the bot, read by the standalone watchdog.
+// This is the only coupling between the two processes: no shared config, no
+// shared business logic, no socket.
+// ---------------------------------------------------------------------------
+
+export type SessionPhase = 'pre_open' | 'session' | 'post_close' | 'non_trading_day';
+
+export type WsState = 'disabled' | 'disconnected' | 'connecting' | 'authenticated';
+
+export interface HeartbeatSnapshot {
+  writtenAt: string;
+  startedAt: string;
+  pid: number;
+  sessionPhase: SessionPhase;
+  /** Instant the current phase was first observed — grace period for staleness rules. */
+  sessionPhaseSince: string;
+  tradingDay: boolean;
+  tradingHalted: boolean;
+  wsState: WsState;
+  lastBarAt: string | null;
+  monitoredSymbols: number;
+  /** Broker-sourced count — the in-process map is not authoritative after the close. */
+  openPositions: number;
+  openPositionsCheckedAt: string | null;
+  watchlistGeneratedAt: string | null;
+}
+
+export type WatchdogFindingCode =
+  | 'HEARTBEAT_MISSING'
+  | 'HEARTBEAT_STALE'
+  | 'MARKET_DATA_STALE'
+  | 'WATCHLIST_STALE'
+  | 'POSITIONS_OPEN_AFTER_CLOSE';
+
+export interface WatchdogFinding {
+  code: WatchdogFindingCode;
+  message: string;
+}
+
+export interface WatchdogThresholds {
+  heartbeatStaleMs: number;
+  marketDataStaleMs: number;
+  watchlistMaxAgeHours: number;
+  /** EST wall-clock time after which any open position is considered overnight risk. */
+  openPositionCheckHour: number;
+  openPositionCheckMinute: number;
+  /** Beyond this age the broker position count is too old to raise an overnight alert. */
+  openPositionDataMaxAgeMs: number;
+}
+
 export interface TradeRecord {
   // Pre-trade context (Screener Data)
   symbol: string;

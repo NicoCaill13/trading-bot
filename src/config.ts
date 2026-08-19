@@ -153,8 +153,8 @@ const config = {
     minRvolForPullback: parseFloatEnv('MIN_RVOL_FOR_PULLBACK', 1.5),
     // Legacy V3 proximity (0.2%) — Satellite tick-up path only; Core uses vwapProximityPct.
     pullbackSupportPct: parseFloatEnv('PULLBACK_SUPPORT_PCT', 0.002),
-    // V7 Core: |price - vwap| / vwap <= 0.1%.
-    vwapProximityPct: parseFloatEnv('VWAP_PROXIMITY_PCT', 0.001),
+    // V7 Core: |price - vwap| / vwap <= 0.3%.
+    vwapProximityPct: parseFloatEnv('VWAP_PROXIMITY_PCT', 0.003),
     // V7 Core entry window EST [start, end).
     entryWindowStartHour: parseIntEnv('ENTRY_WINDOW_START_HOUR', 10),
     entryWindowStartMinute: parseIntEnv('ENTRY_WINDOW_START_MINUTE', 0),

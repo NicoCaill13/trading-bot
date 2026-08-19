@@ -2,6 +2,7 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getESTDate, toErrorMessage } from './utils';
 import { createLogger } from './logger';
+import { sanitizeLiveAskPrice } from './entryPrice';
 import { isVwapPullbackEntryWindow } from './vwapSetup';
 import {
   sendTelegramAlert,
@@ -342,22 +343,21 @@ export async function liquidateAll(reason: string): Promise<void> {
 // Order placement
 // ---------------------------------------------------------------------------
 
-/**
- * Resolves the most aggressive (highest) available price anchor from a snapshot.
- * Priority: ask > last trade > minute bar close.
- * Returns null when no live price data is available.
- */
-function resolveAskPrice(snap: AlpacaSnapshot): number | null {
-  const ask = snap.LatestQuote?.AskPrice;
-  if (ask !== undefined && ask > 0) return ask;
+function positiveOrNull(value: number | undefined): number | null {
+  return value !== undefined && value > 0 ? value : null;
+}
 
-  const lastTrade = snap.LatestTrade?.Price;
-  if (lastTrade !== undefined && lastTrade > 0) return lastTrade;
-
-  const minuteClose = snap.MinuteBar?.ClosePrice;
-  if (minuteClose !== undefined && minuteClose > 0) return minuteClose;
-
-  return null;
+/** Pulls ask / last / minute close from an Alpaca snapshot without preferring a stale ask. */
+function extractSnapshotPrices(snap: AlpacaSnapshot): {
+  ask: number | null;
+  lastTrade: number | null;
+  minuteClose: number | null;
+} {
+  return {
+    ask: positiveOrNull(snap.LatestQuote?.AskPrice),
+    lastTrade: positiveOrNull(snap.LatestTrade?.Price),
+    minuteClose: positiveOrNull(snap.MinuteBar?.ClosePrice),
+  };
 }
 
 /**
@@ -384,8 +384,25 @@ async function fetchLiveAskPrice(symbol: string, signalPrice: number): Promise<n
     );
     if (!snap) return signalPrice;
 
-    const ask = resolveAskPrice(snap);
-    return ask ?? signalPrice;
+    const extracted = extractSnapshotPrices(snap);
+    const staleAskExcess = config.entry.maxEntryChasePct / 100;
+    const virtualSlippage = config.entry.marketableLimitVwapMultiplier - 1;
+    const resolved = sanitizeLiveAskPrice(
+      { ...extracted, signalClose: signalPrice },
+      { staleAskExcess, virtualSlippage },
+    );
+
+    if (resolved.usedStaleAskFallback) {
+      const askLabel = extracted.ask === null ? 'n/a' : `$${extracted.ask.toFixed(2)}`;
+      log.warn(
+        `WARNING — Stale IEX ask detected (spread > 1%). ` +
+        `Fallback to signal close + virtual slippage. ` +
+        `${symbol} ask ${askLabel} vs signal $${signalPrice.toFixed(2)} ` +
+        `→ $${resolved.price.toFixed(2)}`,
+      );
+    }
+
+    return resolved.price;
   } catch {
     return signalPrice;
   }

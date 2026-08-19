@@ -33,7 +33,7 @@ import {
   formatStartupAlert,
   formatErrorAlert,
 } from './notificationManager';
-import { extractV2Symbols, readWatchlist } from './watchlistIO';
+import { extractV2Symbols, isV2Symbol, readWatchlist } from './watchlistIO';
 import { isWatchlistCurrent } from './watchlistFreshness';
 import {
   computeFibLevels,
@@ -67,7 +67,7 @@ import type {
   PullbackTracker,
   SessionPhase,
   SessionState,
-  SignalTier,
+  SetupKind,
   OrbState,
   WatchlistSymbol,
   EnteredSymbolEntry,
@@ -81,7 +81,7 @@ import type {
   ImbalanceSignal,
   WsState,
 } from './types';
-import { resolveSymbolTier } from './types';
+import { formatSetupTag, parseEnteredSetup } from './types';
 import type { SessionDataEntry } from './riskManager';
 import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
@@ -108,11 +108,11 @@ let wsEnabled = false;
 // Set to true when circuit breaker or hard close triggers — blocks new entries
 let tradingHalted = false;
 
-// Symbols entered this session with portfolio tier (Core / Satellite)
-const enteredByTier = new Map<string, SignalTier>();
+// Symbols entered this session, keyed by the setup that filled
+const enteredBySetup = new Map<string, SetupKind>();
 
-// Watchlist tier and Satellite pre-market gap metadata
-const symbolTier = new Map<string, SignalTier>();
+// Play-Maker (V2) universe — ORB + V3 1m pullback. V1 names use VWAP_PULLBACK V7.
+const orbUniverse = new Set<string>();
 const preMarketGaps = new Map<string, number>();
 // Screener metadata per symbol — feeds the journal pre-trade context
 const screenerDataMap = new Map<string, WatchlistSymbol>();
@@ -198,7 +198,7 @@ let tradingDayFlag = false;
 let currentSessionPhase: SessionPhase | null = null;
 let sessionPhaseSince = botStartedAt;
 
-// Broker-sourced position count. The in-process `enteredByTier` map is cleared on
+// Broker-sourced position count. The in-process `enteredBySetup` map is cleared on
 // bar events, which stop flowing after the close — precisely when the overnight
 // exposure check matters — so the count is refreshed independently.
 let openPositionsCount = 0;
@@ -332,16 +332,16 @@ function getTodayDateStr(): string {
 }
 
 function hasEntered(symbol: string): boolean {
-  return enteredByTier.has(symbol);
+  return enteredBySetup.has(symbol);
 }
 
-function getSymbolTier(symbol: string): SignalTier {
-  return symbolTier.get(symbol) ?? 'core';
+function isOrbUniverse(symbol: string): boolean {
+  return orbUniverse.has(symbol);
 }
 
 async function saveSessionState(): Promise<void> {
-  const entries: EnteredSymbolEntry[] = [...enteredByTier.entries()].map(
-    ([symbol, tier]) => ({ symbol, tier }),
+  const entries: EnteredSymbolEntry[] = [...enteredBySetup.entries()].map(
+    ([symbol, setup]) => ({ symbol, setup }),
   );
   const state: SessionState = {
     date: getTodayDateStr(),
@@ -374,8 +374,8 @@ async function loadSessionState(): Promise<SessionState | null> {
 
 /**
  * At restart:
- *   1. Loads persisted state (enteredByTier) if date matches today
- *   2. Queries Alpaca for open positions → adds to enteredByTier
+ *   1. Loads persisted state (enteredBySetup) if date matches today
+ *   2. Queries Alpaca for open positions → adds to enteredBySetup
  *   3. Detects active trailing_stop orders → marks symbols as scaled-out in riskManager
  *      (prevents double scale-out post-crash)
  */
@@ -386,12 +386,12 @@ async function reconcileStateFromBroker(): Promise<void> {
   if (saved) {
     for (const entry of saved.enteredSymbols ?? []) {
       if (typeof entry === 'string') {
-        enteredByTier.set(entry, 'core');
+        enteredBySetup.set(entry, 'VWAP_PULLBACK');
       } else {
-        enteredByTier.set(entry.symbol, entry.tier);
+        enteredBySetup.set(entry.symbol, parseEnteredSetup(entry));
       }
     }
-    log.info(`Persisted state loaded: ${enteredByTier.size} symbol(s) already entered today`);
+    log.info(`Persisted state loaded: ${enteredBySetup.size} symbol(s) already entered today`);
   }
 
   const [positions, orders] = await Promise.all([
@@ -401,8 +401,8 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   // Any open broker position = symbol already traded this session
   for (const pos of positions) {
-    if (!enteredByTier.has(pos.symbol)) {
-      enteredByTier.set(pos.symbol, 'core');
+    if (!enteredBySetup.has(pos.symbol)) {
+      enteredBySetup.set(pos.symbol, 'VWAP_PULLBACK');
     }
   }
 
@@ -417,7 +417,7 @@ async function reconcileStateFromBroker(): Promise<void> {
 
   log.info(
     `Reconciliation done: ${positions.length} broker position(s), ` +
-    `${enteredByTier.size} session symbol(s), ` +
+    `${enteredBySetup.size} session symbol(s), ` +
     `${alreadyScaledOut.length} trailing stop(s) detected`,
   );
 
@@ -440,16 +440,17 @@ async function reconcileStateFromBroker(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function registerWatchlistSymbol(s: WatchlistSymbol): void {
-  const tier = resolveSymbolTier(s);
-  symbolTier.set(s.symbol, tier);
   screenerDataMap.set(s.symbol, s);
-  if (tier === 'satellite' && s.preMarketGapPct !== undefined) {
-    preMarketGaps.set(s.symbol, s.preMarketGapPct);
+  if (isV2Symbol(s)) {
+    orbUniverse.add(s.symbol);
+    if (s.preMarketGapPct !== undefined) {
+      preMarketGaps.set(s.symbol, s.preMarketGapPct);
+    }
   }
 }
 
 async function loadWatchlist(skipScreener = false): Promise<string[]> {
-  symbolTier.clear();
+  orbUniverse.clear();
   preMarketGaps.clear();
 
   requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
@@ -507,7 +508,6 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
   for (const s of v2Symbols) {
     v2PersistentSymbols.add(s.symbol);
   }
-  signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
 
   watchlistGeneratedAt = data.generatedAt;
   watchlistTradingDay = data.tradingDay ?? null;
@@ -533,7 +533,6 @@ function applyV2WatchlistSymbols(v2Symbols: WatchlistSymbol[]): string[] {
     }
   }
 
-  signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
   monitoredSymbols = [...new Set([...monitoredSymbols, ...v2PersistentSymbols])];
   return newSymbols;
 }
@@ -825,7 +824,7 @@ function updateSessionDataFromBars(symbol: string, bars: BarData[]): void {
 
 /** Seeds ORB range from opening 5-min window(s) after REST hydration. */
 function seedOrbState(symbol: string, bars: BarData[]): void {
-  if (getSymbolTier(symbol) !== 'satellite') return;
+  if (!isOrbUniverse(symbol)) return;
 
   const window = config.entry.orbWindowBars;
   if (bars.length < window) return;
@@ -897,7 +896,7 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
     if (!bars || bars.length === 0) continue;
 
     const latest = bars[bars.length - 1];
-    if (getSymbolTier(symbol) === 'satellite' && isBlackoutPeriod()) {
+    if (isOrbUniverse(symbol) && isBlackoutPeriod()) {
       evaluateOrbSignal(symbol, latest);
     }
     evaluateSignal(symbol, latest);
@@ -921,7 +920,7 @@ function queuePendingSignal(signal: PendingSignal): void {
 function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
-  if (getSymbolTier(symbol) !== 'satellite') return;
+  if (!isOrbUniverse(symbol)) return;
   // Restrict ORB to the 09:30–09:45 window; pre-market bars are excluded.
   if (!isOrbWindow()) return;
 
@@ -973,7 +972,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
     : null;
 
   log.info(
-    `${symbol}: Satellite ORB signal — ` +
+    `${symbol}: ${formatSetupTag('ORB')} signal — ` +
     `ORB high $${state.high.toFixed(2)} | close $${latestBar.close.toFixed(2)} | ` +
     `break ${(orbDeviation * 100).toFixed(2)}% | score ${Math.round(momentumScore).toLocaleString()}` +
     (orbFibProx ? ` | ${formatFibLog(orbFibProx)}` : '') +
@@ -982,7 +981,7 @@ function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
 
   queuePendingSignal({
     symbol,
-    tier: 'satellite',
+    setup: 'ORB',
     score: momentumScore,
     barData: latestBar,
     vwap,
@@ -1095,7 +1094,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
 
   queuePendingSignal({
     symbol,
-    tier: 'satellite',
+    setup: 'OPENING_DRIVE',
     score: decision.score,
     barData: bar1m,
     vwap: ctx.sessionVwap ?? bar1m.close,
@@ -1112,16 +1111,16 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   const existing = pullbackTrackers.get(symbol);
   if (existing) {
-    if (existing.tier === 'core') {
+    if (existing.setup === 'VWAP_PULLBACK' && !isOrbUniverse(symbol)) {
       evaluateCoreV7Pullback(symbol, latestBar);
     }
     return;
   }
 
-  const tier = getSymbolTier(symbol);
-  if (tier === 'satellite' && isBlackoutPeriod()) return;
+  const orbName = isOrbUniverse(symbol);
+  if (orbName && isBlackoutPeriod()) return;
 
-  if (tier === 'core') {
+  if (!orbName) {
     if (!isCoreEntryWindowOpen()) return;
   } else if (!config.entry.tradeDuringLunch && isLunchPeriod()) {
     return;
@@ -1141,8 +1140,8 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   if (currentPrice <= vwap) return;
 
-  // Satellite still arms on RVOL at breakout; Core confirms RVOL on the green 5m later.
-  if (tier === 'satellite' && !passesRvolForPullback(latestBar, bars)) {
+  // V2 still arms on RVOL at breakout; V1 confirms RVOL on the green 5m later.
+  if (orbName && !passesRvolForPullback(latestBar, bars)) {
     const rvol = computeIntradayRvol(latestBar, bars);
     log.info(
       `${symbol}: VWAP breakout below RVOL threshold — ` +
@@ -1164,7 +1163,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
     localHigh: latestBar.high,
     prevClose: currentPrice,
     vwapAtDetection: vwap,
-    tier,
+    setup: 'VWAP_PULLBACK',
     score: momentumScore,
     avgVolume,
     fibLevels: null,
@@ -1173,7 +1172,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
   });
 
   log.info(
-    `${symbol}: ${tier} VWAP breakout — tracking pullback | ` +
+    `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} breakout — tracking pullback | ` +
     `price $${currentPrice.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
     `deviation ${(vwapDeviation * 100).toFixed(2)}% | ` +
     `score ${Math.round(momentumScore).toLocaleString()}`,
@@ -1191,12 +1190,12 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   }
 
   const tracker = pullbackTrackers.get(symbol);
-  if (!tracker || tracker.tier !== 'core') return;
+  if (!tracker || tracker.setup !== 'VWAP_PULLBACK' || isOrbUniverse(symbol)) return;
 
   if (!isCoreEntryWindowOpen()) {
     if (!isBeforeCoreEntryWindow()) {
       pullbackTrackers.delete(symbol);
-      log.info(`${symbol}: Core pullback tracker cleared — entry window closed`);
+      log.info(`${symbol}: ${formatSetupTag('VWAP_PULLBACK')} tracker cleared — entry window closed`);
     }
     return;
   }
@@ -1237,7 +1236,7 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   // Once quotes have been seen for this symbol, require an armed wall (graceful if never seen).
   if (l2Enabled && l2QuotesSeen.has(symbol) && !wallArmed) {
     l2Log.info(
-      `${symbol}: Core confirm blocked — L2 wall not armed ` +
+      `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} confirm blocked — L2 wall not armed ` +
       `(imbalance=${l2WallSignals.get(symbol)?.imbalance?.toFixed(2) ?? 'N/A'})`,
     );
     return;
@@ -1270,7 +1269,7 @@ function confirmCoreV7Entry(
   pullbackTrackers.delete(symbol);
   l2WallSignals.delete(symbol);
   log.info(
-    `${symbol}: Core V7 pullback confirmed (${reason}) — ` +
+    `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} confirmed (${reason}) — ` +
     `close $${latestBar.close.toFixed(2)} | VWAP $${vwap.toFixed(2)} | ` +
     `rvol ${rvol === null ? 'N/A' : rvol.toFixed(2)}x` +
     (fibProx ? ` | ${formatFibLog(fibProx)}` : '') +
@@ -1278,7 +1277,7 @@ function confirmCoreV7Entry(
   );
   queuePendingSignal({
     symbol,
-    tier: 'core',
+    setup: 'VWAP_PULLBACK',
     score: tracker.score,
     barData: latestBar,
     vwap,
@@ -1298,7 +1297,7 @@ function evaluatePullbackState(symbol: string, bar1m: BarData): void {
   }
 
   const tracker = pullbackTrackers.get(symbol);
-  if (!tracker || tracker.tier !== 'satellite') return;
+  if (!tracker || tracker.setup !== 'VWAP_PULLBACK' || !isOrbUniverse(symbol)) return;
 
   const session = sessionData.get(symbol);
   const vwap = session?.vwap ?? tracker.vwapAtDetection;
@@ -1338,12 +1337,12 @@ function evaluatePullbackState(symbol: string, bar1m: BarData): void {
     if (bar1m.close > tracker.prevClose) {
       pullbackTrackers.delete(symbol);
       log.info(
-        `${symbol}: ${tracker.tier} pullback triggered — ` +
+        `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} tick-up — ` +
         `tick up $${tracker.prevClose.toFixed(2)} → $${bar1m.close.toFixed(2)} → queued`,
       );
       queuePendingSignal({
         symbol,
-        tier: tracker.tier,
+        setup: 'VWAP_PULLBACK',
         score: tracker.score,
         barData: bar1m,
         vwap,
@@ -1369,7 +1368,7 @@ function schedulePendingSignalFlush(): void {
   }, config.entry.signalBatchWindowMs);
 }
 
-async function executeSignalsForTier(
+async function executeSignals(
   signals: PendingSignal[],
   maxExecutions: number,
 ): Promise<string[]> {
@@ -1382,18 +1381,18 @@ async function executeSignalsForTier(
 
   rejected.forEach(s => {
     log.info(
-      `  rejected  ${s.symbol.padEnd(6)} [${s.tier}] | score ${Math.round(s.score).toLocaleString()}`,
+      `  rejected  ${s.symbol.padEnd(6)} ${formatSetupTag(s.setup)} | score ${Math.round(s.score).toLocaleString()}`,
     );
   });
 
   for (const signal of toExecute) {
-    const { symbol, barData, score, vwap, tier } = signal;
+    const { symbol, barData, score, vwap, setup } = signal;
 
-    if (tier === 'satellite') {
+    if (setup === 'ORB' || setup === 'OPENING_DRIVE') {
       const oneMinBars = oneMinBarHistory.get(symbol) ?? [];
       if (!trader.passesSatelliteVolumeConfirmation(barData, oneMinBars)) {
         log.info(
-          `${symbol}: Satellite entry blocked — break volume ${Math.round(barData.volume)} ` +
+          `${symbol}: ${formatSetupTag(setup)} entry blocked — break volume ${Math.round(barData.volume)} ` +
           `≤ VMA_${config.risk.volumeConfirmationVmaPeriod}`,
         );
         continue;
@@ -1401,14 +1400,14 @@ async function executeSignalsForTier(
     }
 
     log.info(
-      `  executing ${symbol.padEnd(6)} [${tier}] | score ${Math.round(score).toLocaleString()} ` +
+      `  executing ${symbol.padEnd(6)} ${formatSetupTag(setup)} | score ${Math.round(score).toLocaleString()} ` +
       `| deviation ${(((barData.close - vwap) / vwap) * 100).toFixed(2)}% ` +
       `| price $${barData.close.toFixed(2)}`,
     );
 
     try {
       const settledCash = await trader.getSettledCash();
-      const allocation = await riskManager.getPortfolioAllocation(tier, enteredByTier);
+      const allocation = await riskManager.getPortfolioAllocation();
       if (!allocation.canOpen) {
         log.warn(
           `${symbol}: no open slots ` +
@@ -1438,8 +1437,6 @@ async function executeSignalsForTier(
         symbol,
         referencePrice,
         settledCash,
-        tier,
-        enteredByTier,
         signal.stopPriceOverride ?? null,
       );
 
@@ -1452,9 +1449,9 @@ async function executeSignalsForTier(
       const spyTrend = await fetchSpyTrend5m();
       const filters = feedbackEngine.getFilters();
 
-      if (tier === 'core' && shouldHardBanSpyBearish(spyTrend)) {
+      if (setup === 'VWAP_PULLBACK' && shouldHardBanSpyBearish(spyTrend)) {
         traderLog.warn(
-          `${symbol}: Core entry hard-banned — SPY 5m trend bearish`,
+          `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} hard-banned — SPY 5m trend bearish`,
         );
         continue;
       }
@@ -1539,10 +1536,10 @@ async function executeSignalsForTier(
         referencePrice,
         stopLossPrice,
         takeProfitPrice,
-        tier,
+        setup,
         referencePrice,
       );
-      enteredByTier.set(symbol, tier);
+      enteredBySetup.set(symbol, setup);
 
       // Prefer the actual submitted limit price over the stale bar close (can diverge by
       // up to marketableLimitVwapMultiplier × live-ask slippage).
@@ -1592,8 +1589,8 @@ async function executeSignalsForTier(
 
 /**
  * Unified-pool flush: remaining slots = MAX_POSITIONS − open positions.
- * Eligible Core and Satellite candidates compete by score. Window rules stay:
- * Core waits for its entry window; Satellite waits for the regular session.
+ * VWAP_PULLBACK waits for 10:00–11:30; ORB / OPENING_DRIVE wait for the regular session.
+ * Eligible candidates compete by PendingSignal.score.
  */
 async function flushPendingSignals(): Promise<void> {
   signalFlushTimer = null;
@@ -1624,49 +1621,61 @@ async function flushPendingSignals(): Promise<void> {
       config.risk.maxPositions,
     );
 
-    const filterEntered = (signals: PendingSignal[]) =>
-      signals.filter(s => !hasEntered(s.symbol));
+    const pending = signalQueue.getPendingSignals().filter(s => !hasEntered(s.symbol));
+    const vwapCandidates = pending.filter(s => s.setup === 'VWAP_PULLBACK');
+    const sessionCandidates = pending.filter(s => s.setup !== 'VWAP_PULLBACK');
 
-    const satelliteCandidates = filterEntered(signalQueue.getSatelliteSignals());
-    const coreCandidates = filterEntered(signalQueue.getCoreSignals());
+    const vwapWindowOpen = isCoreEntryWindowOpen();
+    const beforeVwapWindow = isBeforeCoreEntryWindow();
 
-    const coreWindowOpen = isCoreEntryWindowOpen();
-    const beforeCoreWindow = isBeforeCoreEntryWindow();
-
-    if (!coreWindowOpen && coreCandidates.length > 0 && satelliteCandidates.length === 0) {
-      if (beforeCoreWindow) {
-        log.info(`Core entry window not open — ${coreCandidates.length} Core signal(s) deferred`);
+    if (!vwapWindowOpen && vwapCandidates.length > 0 && sessionCandidates.length === 0) {
+      if (beforeVwapWindow) {
+        log.info(
+          `${formatSetupTag('VWAP_PULLBACK')} window not open — ` +
+          `${vwapCandidates.length} signal(s) deferred`,
+        );
         schedulePendingSignalFlush();
         return;
       }
-      log.info(`Core entry window closed — dropping ${coreCandidates.length} Core signal(s)`);
-      signalQueue.clearCore();
+      log.info(
+        `${formatSetupTag('VWAP_PULLBACK')} window closed — dropping ${vwapCandidates.length} signal(s)`,
+      );
+      signalQueue.removeBySetup('VWAP_PULLBACK');
       return;
     }
 
     const executedSymbols: string[] = [];
 
     const eligible: PendingSignal[] = [];
-    if (coreWindowOpen) {
-      eligible.push(...coreCandidates);
-    } else if (coreCandidates.length > 0) {
-      if (beforeCoreWindow) {
-        log.info(`Core entry window not open — ${coreCandidates.length} Core signal(s) kept pending`);
+    if (vwapWindowOpen) {
+      eligible.push(...vwapCandidates);
+    } else if (vwapCandidates.length > 0) {
+      if (beforeVwapWindow) {
+        log.info(
+          `${formatSetupTag('VWAP_PULLBACK')} window not open — ` +
+          `${vwapCandidates.length} signal(s) kept pending`,
+        );
         schedulePendingSignalFlush();
       } else {
-        log.info(`Core entry window closed — dropping ${coreCandidates.length} Core signal(s)`);
-        signalQueue.clearCore();
+        log.info(
+          `${formatSetupTag('VWAP_PULLBACK')} window closed — dropping ${vwapCandidates.length} signal(s)`,
+        );
+        signalQueue.removeBySetup('VWAP_PULLBACK');
       }
     }
 
-    if (satelliteCandidates.length > 0) {
+    if (sessionCandidates.length > 0) {
       if (!isRegularSessionStarted()) {
-        log.info(`Pre-market — ${satelliteCandidates.length} Satellite signal(s) held until 09:30`);
+        log.info(
+          `Pre-market — ${sessionCandidates.length} ORB/OPENING_DRIVE signal(s) held until 09:30`,
+        );
         schedulePendingSignalFlush();
       } else {
-        eligible.push(...satelliteCandidates);
+        eligible.push(...sessionCandidates);
       }
     }
+
+    eligible.sort((a, b) => b.score - a.score);
 
     if (eligible.length > 0) {
       log.info(
@@ -1674,14 +1683,14 @@ async function flushPendingSignals(): Promise<void> {
         `slots ${slotsAvailable}/${config.risk.maxPositions} ` +
         `(@ ${estNow.getHours()}:${String(estNow.getMinutes()).padStart(2, '0')} EST)`,
       );
-      const executed = await executeSignalsForTier(eligible, slotsAvailable);
+      const executed = await executeSignals(eligible, slotsAvailable);
       executedSymbols.push(...executed);
     }
 
     signalQueue.remove(executedSymbols);
 
-    // Keep pending Core only while waiting for the 10:00 window; otherwise drain.
-    if (coreWindowOpen || !beforeCoreWindow) {
+    // Keep pending VWAP_PULLBACK only while waiting for 10:00; otherwise drain.
+    if (vwapWindowOpen || !beforeVwapWindow) {
       signalQueue.clear();
     }
   } finally {
@@ -1732,7 +1741,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
       await positionManager.handlePositionUpdate(
         symbol,
         barData.close,
-        enteredByTier.get(symbol) ?? 'core',
+        enteredBySetup.get(symbol) ?? 'VWAP_PULLBACK',
         {
           bar1m: barData,
           oneMinBars: oneMinBarHistory.get(symbol) ?? [barData],
@@ -1744,7 +1753,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
     }
 
     if (positionManager.consumeSessionExit(symbol)) {
-      enteredByTier.delete(symbol);
+      enteredBySetup.delete(symbol);
       atrAtEntry.delete(symbol);
       void saveSessionState();
     }
@@ -1813,8 +1822,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   const bars5m = upsertSignalBar(symbol, completed5m);
   updateSessionDataFromBars(symbol, bars5m);
 
-  const tier = getSymbolTier(symbol);
-  if (tier === 'satellite' && isOrbWindow()) {
+  if (isOrbUniverse(symbol) && isOrbWindow()) {
     evaluateOrbSignal(symbol, completed5m);
   }
   evaluateSignal(symbol, completed5m);
@@ -2084,9 +2092,9 @@ function scheduleEodReport(): void {
           await sendDailyReport({
             startEquity: sessionStartEquity,
             endEquity,
-            tradesEntered: enteredByTier.size,
+            tradesEntered: enteredBySetup.size,
             circuitBreakerFired: riskManager.isCircuitBreakerTriggered(),
-            symbols: [...enteredByTier.keys()],
+            symbols: [...enteredBySetup.keys()],
           });
         })
         .catch(() => { });
@@ -2107,8 +2115,8 @@ function scheduleDailyReset(): void {
 
     tradingHalted = false;
     lastEquityCheckMs = 0;
-    enteredByTier.clear();
-    symbolTier.clear();
+    enteredBySetup.clear();
+    orbUniverse.clear();
     preMarketGaps.clear();
     screenerDataMap.clear();
     orbState.clear();
@@ -2159,7 +2167,7 @@ function scheduleDailyReset(): void {
       try {
         requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
         const watchlist = await runScreener(requiredWatchlistTradingDay ?? undefined);
-        symbolTier.clear();
+        orbUniverse.clear();
         preMarketGaps.clear();
         for (const s of watchlist.symbols) {
           registerWatchlistSymbol(s);
@@ -2312,10 +2320,10 @@ async function main(): Promise<void> {
     );
   }
 
-  const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
-  const satCount = [...symbolTier.values()].filter(t => t === 'satellite').length;
+  const v1Count = symbols.length - orbUniverse.size;
+  const v2Count = orbUniverse.size;
   log.info(
-    `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
+    `Bot active — ${symbols.length} symbols (${v1Count} V1_CORE, ${v2Count} V2_PLAYMAKER) | ` +
     `pool ${config.risk.maxPositions} slot(s)`,
   );
   await sendTelegramAlert(
@@ -2323,7 +2331,7 @@ async function main(): Promise<void> {
   );
   await alertInfo(
     'Bot started',
-    `Monitoring ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
+    `Monitoring ${symbols.length} symbols (${v1Count} V1_CORE, ${v2Count} V2_PLAYMAKER) | ` +
     `Equity: $${sessionStartEquity.toFixed(2)}`,
   ).catch(() => { });
 

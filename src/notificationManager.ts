@@ -1,7 +1,7 @@
 import config from './config';
 import { createLogger } from './logger';
 import { sendTelegramMessage } from './telegramClient';
-import type { SignalTier, Watchlist } from './types';
+import type { SetupKind, Watchlist } from './types';
 
 const log = createLogger('NOTIFICATION');
 
@@ -41,13 +41,12 @@ export function formatStartupAlert(
 export function formatEntryAlert(
   qty: number,
   symbol: string,
-  tier: SignalTier,
+  setup: SetupKind,
   price: number,
   stopLoss: number,
 ): string {
-  const typeLabel = tier === 'satellite' ? 'Satellite' : 'Core';
   return (
-    `🚀 <b>[ENTRY]</b> Achat ${qty}x ${symbol} (${typeLabel}) ` +
+    `🚀 <b>[ENTRY]</b> Achat ${qty}x ${symbol} [${setup}] ` +
     `à $${price.toFixed(2)} | Stop Loss: $${stopLoss.toFixed(2)}`
   );
 }
@@ -68,24 +67,24 @@ export function formatErrorAlert(message: string): string {
 }
 
 export function formatWatchlistAlert(watchlist: Watchlist): string {
-  const coreTickers: string[] = [];
-  const satelliteTickers: string[] = [];
+  const v1Tickers: string[] = [];
+  const v2Tickers: string[] = [];
 
   for (const entry of watchlist.symbols) {
     if (entry.origin === 'V2_PLAYMAKER') {
-      satelliteTickers.push(entry.symbol);
+      v2Tickers.push(entry.symbol);
     } else {
-      coreTickers.push(entry.symbol);
+      v1Tickers.push(entry.symbol);
     }
   }
 
-  const coreLine = coreTickers.length > 0 ? coreTickers.join(', ') : '—';
-  const satLine = satelliteTickers.length > 0 ? satelliteTickers.join(', ') : '—';
+  const v1Line = v1Tickers.length > 0 ? v1Tickers.join(', ') : '—';
+  const v2Line = v2Tickers.length > 0 ? v2Tickers.join(', ') : '—';
 
   return (
     `📋 <b>[WATCHLIST DU JOUR]</b>\n` +
-    `🎯 <b>CORE (V1) :</b> ${coreLine}\n` +
-    `🚀 <b>SATELLITES (V2) :</b> ${satLine}`
+    `🎯 <b>V1_CORE :</b> ${v1Line}\n` +
+    `🚀 <b>V2_PLAYMAKER :</b> ${v2Line}`
   );
 }
 

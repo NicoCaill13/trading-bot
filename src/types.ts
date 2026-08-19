@@ -1,4 +1,29 @@
+/** @deprecated Watchlist `source` field only — not a capital bucket. */
 export type SignalTier = 'core' | 'satellite';
+
+/** Intraday playbook that produced a signal or fill (#31). */
+export type SetupKind = 'VWAP_PULLBACK' | 'ORB' | 'OPENING_DRIVE';
+
+const SETUP_KINDS: readonly SetupKind[] = ['VWAP_PULLBACK', 'ORB', 'OPENING_DRIVE'];
+
+export function isSetupKind(value: unknown): value is SetupKind {
+  return typeof value === 'string' && (SETUP_KINDS as readonly string[]).includes(value);
+}
+
+export function formatSetupTag(setup: SetupKind): string {
+  return `[${setup}]`;
+}
+
+/**
+ * Reads a session_state row. Pre-#31 files stored `tier: core|satellite`;
+ * unknown or missing values fail closed onto VWAP_PULLBACK.
+ */
+export function parseEnteredSetup(entry: EnteredSymbolEntry | string): SetupKind {
+  if (typeof entry === 'string') return 'VWAP_PULLBACK';
+  if (isSetupKind(entry.setup)) return entry.setup;
+  if (entry.tier === 'satellite') return 'ORB';
+  return 'VWAP_PULLBACK';
+}
 
 // ---------------------------------------------------------------------------
 // Fibonacci retracement types
@@ -43,9 +68,6 @@ export type SpyTrend = 'bullish' | 'bearish' | 'neutral' | 'unknown';
 /** Strategy lineage tag persisted on the daily watchlist. */
 export type SignalOrigin = 'V1_CORE' | 'V2_PLAYMAKER';
 
-/** Portfolio bucket origin for capital allocation (Core / Satellite). */
-export type PortfolioOrigin = SignalTier;
-
 export function resolveSymbolTier(entry: Pick<WatchlistSymbol, 'origin' | 'source'>): SignalTier {
   if (entry.origin === 'V2_PLAYMAKER') return 'satellite';
   if (entry.origin === 'V1_CORE') return 'core';
@@ -53,7 +75,6 @@ export function resolveSymbolTier(entry: Pick<WatchlistSymbol, 'origin' | 'sourc
 }
 
 export interface PortfolioAllocation {
-  origin: PortfolioOrigin;
   totalCapital: number;
   maxCapital: number;
   deployed: number;
@@ -84,7 +105,7 @@ export interface PullbackTracker {
   localHigh: number;
   prevClose: number;
   vwapAtDetection: number;
-  tier: SignalTier;
+  setup: SetupKind;
   score: number;
   avgVolume: number;
   fibLevels: FibLevels | null;
@@ -96,7 +117,7 @@ export interface PullbackTracker {
 
 export interface PendingSignal {
   symbol: string;
-  tier: SignalTier;
+  setup: SetupKind;
   score: number;
   barData: BarData;
   vwap: number;
@@ -352,7 +373,9 @@ export interface PositionSizeResult {
 
 export interface EnteredSymbolEntry {
   symbol: string;
-  tier: SignalTier;
+  setup?: SetupKind;
+  /** @deprecated Pre-#31 session_state — mapped by parseEnteredSetup. */
+  tier?: SignalTier;
 }
 
 export interface AdaptiveFilters {

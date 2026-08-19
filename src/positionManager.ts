@@ -8,7 +8,7 @@ import { createLogger } from './logger';
 import { getESTDate, toErrorMessage } from './utils';
 import { sendTelegramAlert, formatExitAlert } from './notificationManager';
 import { shouldActivateAtrTrail, shouldTriggerTimeStop } from './exitPredicates';
-import type { BarData, ExitReason, SignalTier } from './types';
+import type { BarData, ExitReason, SetupKind } from './types';
 import type { AlpacaPosition } from '@alpacahq/alpaca-trade-api';
 
 const log = createLogger('POSITION_MANAGER');
@@ -190,7 +190,7 @@ async function applyAtrTrailing(symbol: string, atrHint: number | null): Promise
 export async function handlePositionUpdate(
   symbol: string,
   currentPrice: number,
-  tier: SignalTier,
+  setup: SetupKind,
   context: PositionUpdateContext,
 ): Promise<void> {
   let position: AlpacaPosition;
@@ -303,15 +303,13 @@ export async function handlePositionUpdate(
   const sellQty = Math.floor(totalQty / 2);
   if (sellQty < 1) return;
 
-  const tierLabel: 'Core' | 'Satellite' = tier === 'satellite' ? 'Satellite' : 'Core';
-
   try {
     await trader.executeBreakEvenScaleOut(
       symbol,
       sellQty,
       entryPrice,
       targetPct,
-      tierLabel,
+      setup,
     );
     scaledOutPositions.add(symbol);
 

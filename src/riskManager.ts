@@ -19,9 +19,7 @@ import {
 } from './regimeModel';
 import type {
   PortfolioAllocation,
-  PortfolioOrigin,
   PositionSizeResult,
-  SignalTier,
 } from './types';
 import type { AlpacaPosition } from '@alpacahq/alpaca-trade-api';
 
@@ -80,10 +78,7 @@ function resolvePositionMarketValue(pos: AlpacaPosition): number {
  * (equity % / stop distance), not from an equal CTPO capital envelope.
  * Effective risk may be scaled by the morning regime model (VIX / CHOPPY).
  */
-export async function getPortfolioAllocation(
-  origin: PortfolioOrigin,
-  _positionTiers: Map<string, SignalTier>,
-): Promise<PortfolioAllocation> {
+export async function getPortfolioAllocation(): Promise<PortfolioAllocation> {
   const totalCapital = await trader.getAccountEquity();
 
   const positions = await trader.getOpenPositions();
@@ -99,7 +94,6 @@ export async function getPortfolioAllocation(
   const riskBudget = totalCapital * getEffectiveRiskPerTradePct();
 
   return {
-    origin,
     totalCapital,
     maxCapital: totalCapital,
     deployed,
@@ -128,8 +122,6 @@ export async function computePositionSize(
   symbol: string,
   entryPrice: number,
   settledCash: number,
-  tier: SignalTier = 'core',
-  positionTiers: Map<string, SignalTier> = new Map(),
   stopPriceOverride: number | null = null,
 ): Promise<PositionSizeResult> {
   const atr = await fetchAtr5m(symbol);
@@ -146,7 +138,7 @@ export async function computePositionSize(
   );
   const stopLossPrice = entryPrice - stopDistance;
 
-  const allocation = await getPortfolioAllocation(tier, positionTiers);
+  const allocation = await getPortfolioAllocation();
   if (!allocation.canOpen) {
     throw new Error(
       `${symbol}: no slots available — ${config.risk.maxPositions} max, ` +
@@ -208,7 +200,7 @@ export async function computePositionSize(
   }
 
   log.info(
-    `${symbol} sizing [${tier}] — ATR(5m):${atr.toFixed(4)} | ` +
+    `${symbol} sizing — ATR(5m):${atr.toFixed(4)} | ` +
     `risk ${(riskPct * 100).toFixed(1)}% equity ` +
     `($${(totalEquity * riskPct).toFixed(0)}) | ` +
     `notional $${(qty * entryPrice).toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +

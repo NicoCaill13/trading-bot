@@ -1,7 +1,6 @@
 import alpaca from './alpacaClient';
 import config from './config';
 import { getDynamicUniverse } from './screener';
-import { registerSatelliteWatchlist } from './signalQueue';
 import { createLogger } from './logger';
 import { getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
 import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin } from './watchlistIO';
@@ -266,7 +265,6 @@ export async function runPremarketScreener(): Promise<Watchlist> {
   });
 
   const watchlist = await mergeV2IntoWatchlist(v2Symbols);
-  registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
 
   log.info(
     `${v2Symbols.length} V2_PLAYMAKER symbol(s) merged into watchlist.json ` +

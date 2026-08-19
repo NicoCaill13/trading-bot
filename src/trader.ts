@@ -12,7 +12,7 @@ import {
   humanizeExitReason,
 } from './notificationManager';
 import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
-import type { BarData, SignalTier } from './types';
+import type { BarData, SetupKind } from './types';
 
 const log = createLogger('TRADER');
 
@@ -30,8 +30,8 @@ let queueProcessing = false;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** V7 Core entries only inside configured EST window (default 10:00–11:30). */
-function isOutsideCoreEntryWindow(): boolean {
+/** VWAP_PULLBACK entries only inside configured EST window (default 10:00–11:30). */
+function isOutsideVwapEntryWindow(): boolean {
   return !isVwapPullbackEntryWindow(getESTDate(), {
     startHour: config.entry.entryWindowStartHour,
     startMinute: config.entry.entryWindowStartMinute,
@@ -220,14 +220,14 @@ export async function cancelOrdersForSymbol(symbol: string): Promise<number> {
  * @param sellQty    - Math.floor(totalQty / 2) — no fractional shares
  * @param entryPrice - avg_entry_price for break-even floor calculation and logging
  * @param targetPct  - scale-out threshold that triggered this call (SCALE_OUT_TARGET_PCT)
- * @param tierLabel  - 'Core' or 'Satellite' — used in the log line only
+ * @param setup      - playbook that hit the scale-out (log line only)
  */
 export async function executeBreakEvenScaleOut(
   symbol: string,
   sellQty: number,
   entryPrice: number,
   targetPct: number,
-  tierLabel: 'Core' | 'Satellite',
+  setup: SetupKind,
 ): Promise<void> {
   const targetLabel = `${(targetPct * 100).toFixed(0)}%`;
   const breakEvenFloor = parseFloat(
@@ -235,7 +235,7 @@ export async function executeBreakEvenScaleOut(
   );
 
   log.info(
-    `[UT1M] ${tierLabel} Target ${targetLabel} hit for ${symbol}. ` +
+    `[UT1M] [${setup}] Target ${targetLabel} hit for ${symbol}. ` +
     `Selling 50% (qty: ${sellQty}). Moving remaining stop to Break-Even.`,
   );
 
@@ -402,7 +402,8 @@ function computeMarketableLimitPrice(askPrice: number): number {
 
 /**
  * Bracket order on entry: aggressive marketable limit + stop-loss + take-profit (R:R).
- * Core entries respect V7 window 10:00–11:30 EST; Satellite (ORB) may enter during morning blackout.
+ * VWAP_PULLBACK respects the 10:00–11:30 EST window; ORB / OPENING_DRIVE may enter
+ * from the regular open, including the morning blackout.
  */
 export async function placeBracketOrder(
   symbol: string,
@@ -411,18 +412,18 @@ export async function placeBracketOrder(
   signalPrice: number,
   stopLossPrice: number,
   takeProfitPrice: number,
-  tier: SignalTier = 'core',
+  setup: SetupKind = 'VWAP_PULLBACK',
   prefetchedAskPrice?: number,
 ): Promise<AlpacaOrder> {
-  if (tier === 'core' && isOutsideCoreEntryWindow()) {
+  if (setup === 'VWAP_PULLBACK' && isOutsideVwapEntryWindow()) {
     throw new Error(
-      `Core entry window closed — order ${symbol} blocked outside ` +
+      `VWAP_PULLBACK entry window closed — order ${symbol} blocked outside ` +
       `${config.entry.entryWindowStartHour}:${String(config.entry.entryWindowStartMinute).padStart(2, '0')}` +
       `–${config.entry.entryWindowEndHour}:${String(config.entry.entryWindowEndMinute).padStart(2, '0')} EST`,
     );
   }
-  if (tier === 'satellite' && isPreMarketPeriod()) {
-    throw new Error(`Pre-market — Satellite order ${symbol} blocked before 09:30 EST`);
+  if ((setup === 'ORB' || setup === 'OPENING_DRIVE') && isPreMarketPeriod()) {
+    throw new Error(`Pre-market — ${setup} order ${symbol} blocked before 09:30 EST`);
   }
 
   // Fetch live ask price at submission time — bar close can be 0-5 min stale + 10s debounce.
@@ -477,7 +478,7 @@ export async function placeBracketOrder(
   };
 
   log.info(
-    `Bracket entry [${tier}] — ${symbol} qty:${qty} ` +
+    `Bracket entry [${setup}] — ${symbol} qty:${qty} ` +
     `limit:$${limitPrice.toFixed(2)} (ask $${liveAskPrice.toFixed(2)} × ${config.entry.marketableLimitVwapMultiplier}) ` +
     `stop-loss:$${stopLossPrice.toFixed(2)} take-profit:$${takeProfitPrice.toFixed(2)}`,
   );
@@ -485,7 +486,7 @@ export async function placeBracketOrder(
   const order = await enqueueOrder(orderParams);
 
   void sendTelegramAlert(
-    formatEntryAlert(qty, symbol, tier, limitPrice, stopLossPrice),
+    formatEntryAlert(qty, symbol, setup, limitPrice, stopLossPrice),
   );
 
   return order;

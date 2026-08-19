@@ -135,15 +135,6 @@ const config = {
     shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
   },
 
-  // Legacy 80/20 labels. Unused for allocation since #30 (unified pool).
-  // Kept so an existing .env still loads; shares must still sum to 1.0.
-  portfolio: {
-    coreRiskShare: parseFloatEnv('CORE_RISK_SHARE', 0.80),
-    satelliteRiskShare: parseFloatEnv('SATELLITE_RISK_SHARE', 0.20),
-    coreMaxPositions: parseIntEnv('CORE_MAX_POSITIONS', 0),
-    satelliteMaxPositions: parseIntEnv('SATELLITE_MAX_POSITIONS', 0),
-  },
-
   premarket: {
     minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.04),
     // Share volume summed on 1Min bars in EST [04:00, 09:30) — previously 100k
@@ -380,18 +371,6 @@ const config = {
     throw new Error(
       `[SYSTEM] ENTRY_WINDOW start must be < end: ${entryStartMins} >= ${entryEndMins}`,
     );
-  }
-
-  const p = config.portfolio;
-  const shareSum = p.coreRiskShare + p.satelliteRiskShare;
-  if (Math.abs(shareSum - 1.0) > 0.001) {
-    throw new Error(
-      `[SYSTEM] CORE_RISK_SHARE + SATELLITE_RISK_SHARE must equal 1.0: ${shareSum}`,
-    );
-  }
-
-  if (p.coreRiskShare <= 0 || p.satelliteRiskShare <= 0) {
-    throw new Error('[SYSTEM] CORE_RISK_SHARE and SATELLITE_RISK_SHARE must be > 0');
   }
 
   const s = config.screener;

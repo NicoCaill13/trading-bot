@@ -1,83 +1,36 @@
-import { createLogger } from './logger';
-import type { PendingSignal, SignalTier } from './types';
+import type { PendingSignal, SetupKind } from './types';
 
-const log = createLogger('SIGNAL_QUEUE');
+const pendingSignals = new Map<string, PendingSignal>();
 
-// Satellite (Play-Maker / V2) — high-priority bucket, flushed first
-const satelliteQueue = new Map<string, PendingSignal>();
-
-// Core (V1) — standard bucket
-const coreQueue = new Map<string, PendingSignal>();
-
-// Symbols registered at 09:15 pre-market scan (priority within Satellite bucket)
-const satellitePrioritySymbols = new Set<string>();
-
-/**
- * Routes a signal into the correct priority queue by tier.
- */
-export function enqueue(signal: PendingSignal): void {
-  if (signal.tier === 'satellite') {
-    satelliteQueue.set(signal.symbol, signal);
-  } else {
-    coreQueue.set(signal.symbol, signal);
-  }
-}
-
-/**
- * Called by the 09:15 pre-market module after watchlist generation.
- * Marks symbols for priority handling within the Satellite bucket.
- */
-export function registerSatelliteWatchlist(symbols: string[]): void {
-  satellitePrioritySymbols.clear();
-  for (const symbol of symbols) {
-    satellitePrioritySymbols.add(symbol);
-  }
-  log.info(`Satellite priority watchlist registered — ${symbols.length} symbol(s)`);
-}
-
-export function getSatellitePrioritySymbols(): ReadonlySet<string> {
-  return satellitePrioritySymbols;
-}
-
-export function getSatelliteSignals(): PendingSignal[] {
-  return [...satelliteQueue.values()].sort(compareSatellitePriority);
-}
-
-export function getCoreSignals(): PendingSignal[] {
-  return [...coreQueue.values()];
-}
-
-function compareSatellitePriority(a: PendingSignal, b: PendingSignal): number {
-  const aPri = satellitePrioritySymbols.has(a.symbol) ? 1 : 0;
-  const bPri = satellitePrioritySymbols.has(b.symbol) ? 1 : 0;
-  if (bPri !== aPri) return bPri - aPri;
+function byScoreDesc(a: PendingSignal, b: PendingSignal): number {
   return b.score - a.score;
+}
+
+export function enqueue(signal: PendingSignal): void {
+  pendingSignals.set(signal.symbol, signal);
+}
+
+/** Pending signals ranked by `PendingSignal.score` descending. */
+export function getPendingSignals(): PendingSignal[] {
+  return [...pendingSignals.values()].sort(byScoreDesc);
 }
 
 export function remove(symbols: string[]): void {
   for (const sym of symbols) {
-    satelliteQueue.delete(sym);
-    coreQueue.delete(sym);
+    pendingSignals.delete(sym);
+  }
+}
+
+export function removeBySetup(setup: SetupKind): void {
+  for (const [sym, signal] of pendingSignals) {
+    if (signal.setup === setup) pendingSignals.delete(sym);
   }
 }
 
 export function clear(): void {
-  satelliteQueue.clear();
-  coreQueue.clear();
-}
-
-export function clearCore(): void {
-  coreQueue.clear();
+  pendingSignals.clear();
 }
 
 export function size(): number {
-  return satelliteQueue.size + coreQueue.size;
-}
-
-export function satelliteSize(): number {
-  return satelliteQueue.size;
-}
-
-export function coreSize(): number {
-  return coreQueue.size;
+  return pendingSignals.size;
 }

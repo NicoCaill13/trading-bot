@@ -1,6 +1,6 @@
-import fs from 'fs/promises';
 import path from 'path';
 import config from './config';
+import { readJson, writeJsonAtomic } from './jsonStore';
 import type { SignalOrigin, Watchlist, WatchlistSymbol } from './types';
 
 export function getSymbolOrigin(entry: WatchlistSymbol): SignalOrigin {
@@ -14,24 +14,24 @@ export function isV2Symbol(entry: WatchlistSymbol): boolean {
   return getSymbolOrigin(entry) === 'V2_PLAYMAKER';
 }
 
+function isWatchlistShape(value: unknown): value is Watchlist {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record['generatedAt'] === 'string' && Array.isArray(record['symbols']);
+}
+
 export async function readWatchlist(): Promise<Watchlist | null> {
-  const watchlistPath = path.resolve(config.paths.watchlist);
-  try {
-    const raw = await fs.readFile(watchlistPath, 'utf8');
-    return JSON.parse(raw) as Watchlist;
-  } catch {
-    return null;
-  }
+  const parsed = await readJson(path.resolve(config.paths.watchlist));
+  return isWatchlistShape(parsed) ? parsed : null;
 }
 
 export async function writeWatchlist(watchlist: Watchlist): Promise<void> {
-  const outputPath = path.resolve(config.paths.watchlist);
-  await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, JSON.stringify(watchlist, null, 2));
+  await writeJsonAtomic(path.resolve(config.paths.watchlist), watchlist, { pretty: true });
 }
 
 /**
  * Merges V2 Play-Maker symbols into the daily watchlist without dropping V1 Core entries.
+ * Preserves the Core `tradingDay` — a pre-market merge must not look like a fresh EOD run.
  */
 export async function mergeV2IntoWatchlist(
   v2Symbols: WatchlistSymbol[],
@@ -46,7 +46,8 @@ export async function mergeV2IntoWatchlist(
   });
 
   const watchlist: Watchlist = {
-    generatedAt: new Date().toISOString(),
+    generatedAt: existing?.generatedAt ?? new Date().toISOString(),
+    tradingDay: existing?.tradingDay,
     benchmarkReturn: existing?.benchmarkReturn ?? null,
     universeSize: existing?.universeSize ?? dedupedV2.length,
     liquidFiltered: existing?.liquidFiltered ?? 0,

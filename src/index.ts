@@ -13,7 +13,7 @@ import * as journalManager from './journalManager';
 import * as feedbackEngine from './feedbackEngine';
 import * as shadowJournal from './shadowJournal';
 import { runPostMortem } from './analyzer';
-import { isTradingDay } from './marketCalendar';
+import { isTradingDay, queryRequiredWatchlistTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import {
@@ -34,6 +34,7 @@ import {
   formatErrorAlert,
 } from './notificationManager';
 import { extractV2Symbols, readWatchlist } from './watchlistIO';
+import { isWatchlistCurrent } from './watchlistFreshness';
 import {
   computeFibLevels,
   deriveFibLevelsFromBars,
@@ -68,7 +69,6 @@ import type {
   SessionState,
   SignalTier,
   OrbState,
-  Watchlist,
   WatchlistSymbol,
   EnteredSymbolEntry,
   WsMessage,
@@ -192,6 +192,8 @@ const botStartedAt = new Date().toISOString();
 let wsState: WsState = 'disabled';
 let lastBarAt: string | null = null;
 let watchlistGeneratedAt: string | null = null;
+let watchlistTradingDay: string | null = null;
+let requiredWatchlistTradingDay: string | null = null;
 let tradingDayFlag = false;
 let currentSessionPhase: SessionPhase | null = null;
 let sessionPhaseSince = botStartedAt;
@@ -236,6 +238,8 @@ function buildHeartbeatSnapshot(): HeartbeatSnapshot {
     openPositions: openPositionsCount,
     openPositionsCheckedAt,
     watchlistGeneratedAt,
+    watchlistTradingDay,
+    requiredWatchlistTradingDay,
   };
 }
 
@@ -444,33 +448,59 @@ function registerWatchlistSymbol(s: WatchlistSymbol): void {
   }
 }
 
-async function loadWatchlistFromFile(): Promise<Watchlist | null> {
-  const data = await readWatchlist();
-  if (!data) return null;
-  for (const s of data.symbols) {
-    registerWatchlistSymbol(s);
-  }
-  return data;
-}
-
 async function loadWatchlist(skipScreener = false): Promise<string[]> {
   symbolTier.clear();
   preMarketGaps.clear();
 
-  let data = await loadWatchlistFromFile();
+  requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
 
-  if (!data || data.symbols.length === 0) {
+  let data = await readWatchlist();
+  watchlistGeneratedAt = data?.generatedAt ?? null;
+  watchlistTradingDay = data?.tradingDay ?? null;
+
+  if (!isWatchlistCurrent(data, requiredWatchlistTradingDay)) {
     if (skipScreener) {
-      log.warn('Watchlist empty — screener skipped (market closed today)');
+      log.warn(
+        `Watchlist not current (have ${watchlistTradingDay ?? 'none'}, ` +
+        `need ${requiredWatchlistTradingDay ?? 'unknown'}) — screener skipped (market closed)`,
+      );
       return [];
     }
-    log.info('Watchlist missing or empty — running Core screener...');
-    data = await runScreener();
-    symbolTier.clear();
-    preMarketGaps.clear();
-    for (const s of data.symbols) {
-      registerWatchlistSymbol(s);
+
+    log.info(
+      `Watchlist stale or missing (have ${watchlistTradingDay ?? 'none'}, ` +
+      `need ${requiredWatchlistTradingDay ?? 'unknown'}) — running Core screener...`,
+    );
+    try {
+      data = await runScreener(requiredWatchlistTradingDay ?? undefined);
+      watchlistGeneratedAt = data.generatedAt;
+      watchlistTradingDay = data.tradingDay ?? null;
+    } catch (err: unknown) {
+      const message = toErrorMessage(err);
+      log.error(`Watchlist rescreen failed: ${message}`);
+      void sendTelegramAlert(formatErrorAlert(`Watchlist rescreen failed: ${message}`));
+      return [];
     }
+
+    if (!isWatchlistCurrent(data, requiredWatchlistTradingDay)) {
+      log.error(
+        `Screener wrote a watchlist that is still not current ` +
+        `(have ${data.tradingDay ?? 'none'}, need ${requiredWatchlistTradingDay ?? 'unknown'})`,
+      );
+      void sendTelegramAlert(
+        formatErrorAlert('Watchlist still stale after screener — failing closed'),
+      );
+      return [];
+    }
+  }
+
+  if (data === null || data.symbols.length === 0) {
+    log.warn('Watchlist empty after load');
+    return [];
+  }
+
+  for (const s of data.symbols) {
+    registerWatchlistSymbol(s);
   }
 
   const v2Symbols = extractV2Symbols(data);
@@ -480,11 +510,13 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
   signalQueue.registerSatelliteWatchlist(v2Symbols.map(s => s.symbol));
 
   watchlistGeneratedAt = data.generatedAt;
+  watchlistTradingDay = data.tradingDay ?? null;
 
   const v1Count = data.symbols.length - v2Symbols.length;
   log.info(
     `Watchlist loaded: ${data.symbols.length} symbol(s) ` +
-    `(${v1Count} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER) — generated ${data.generatedAt}`,
+    `(${v1Count} V1_CORE, ${v2Symbols.length} V2_PLAYMAKER) ` +
+    `— tradingDay ${data.tradingDay ?? 'unknown'} generated ${data.generatedAt}`,
   );
 
   return data.symbols.map(s => s.symbol);
@@ -2125,7 +2157,8 @@ function scheduleDailyReset(): void {
       }
 
       try {
-        const watchlist = await runScreener();
+        requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
+        const watchlist = await runScreener(requiredWatchlistTradingDay ?? undefined);
         symbolTier.clear();
         preMarketGaps.clear();
         for (const s of watchlist.symbols) {
@@ -2134,11 +2167,15 @@ function scheduleDailyReset(): void {
         const newSymbols = watchlist.symbols.map(s => s.symbol);
         monitoredSymbols = newSymbols;
         ensureV2SymbolsMonitored();
+        watchlistGeneratedAt = watchlist.generatedAt;
+        watchlistTradingDay = watchlist.tradingDay ?? null;
         log.info(`Core screener done — ${newSymbols.length} symbol(s) ready for next session`);
         haltMarketDataIngest();
         log.info('Post-session screener done — WebSocket remains closed until next trading day boot');
       } catch (err: unknown) {
-        log.error(`Post-session screener failed: ${toErrorMessage(err)}`);
+        const message = toErrorMessage(err);
+        log.error(`Post-session screener failed: ${message}`);
+        void sendTelegramAlert(formatErrorAlert(`Post-session screener failed: ${message}`));
       }
     })();
 

@@ -318,6 +318,11 @@ export interface WatchlistSymbol {
 
 export interface Watchlist {
   generatedAt: string;
+  /**
+   * NY calendar day of the EOD close this list was screened from — same key as
+   * `data/eod/<day>/`. Absent on pre-#31 files; treat as stale.
+   */
+  tradingDay?: string;
   benchmarkReturn: number | null;
   universeSize: number;
   liquidFiltered: number;
@@ -384,6 +389,10 @@ export interface HeartbeatSnapshot {
   openPositions: number;
   openPositionsCheckedAt: string | null;
   watchlistGeneratedAt: string | null;
+  /** NY day stamped on the loaded watchlist; null when the file has no field. */
+  watchlistTradingDay: string | null;
+  /** NY day the session is required to trade; null when the calendar is unavailable. */
+  requiredWatchlistTradingDay: string | null;
 }
 
 export type WatchdogFindingCode =

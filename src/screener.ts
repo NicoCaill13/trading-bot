@@ -3,7 +3,8 @@ import alpaca from './alpacaClient';
 import config, { getSma150SlopeLookbackBars } from './config';
 import { createFloatProvider, isFloatFilterActive } from './floatProvider';
 import { createLogger } from './logger';
-import { estCalendarDayKey, getESTDate, toErrorMessage } from './utils';
+import { queryRequiredWatchlistTradingDay } from './marketCalendar';
+import { estCalendarDayKey, toErrorMessage } from './utils';
 import { applySplits, loadSplitIndex, type SplitIndex } from './corporateActions';
 import { readEodBars, writeEodBars } from './eodCache';
 import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
@@ -228,13 +229,24 @@ interface EodContext {
  * on a split ex-date the 200-bar window slid across it and the SMA200 jumped
  * (NFLX, 10-for-1 on 2025-11-17).
  */
-function resolveEodWindow(limit: number): { startDay: string; tradingDay: string } {
-  const end = getESTDate();
-  // Plain clone: `end` is already a wall-clock carrier, re-projecting it through
-  // toESTDate would apply the NY offset twice and shift the calendar day.
+function parseNyCalendarDay(day: string): Date {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (match === null) {
+    throw new Error(`[SCREENER] Invalid EOD trading day ${day}`);
+  }
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function resolveEodWindow(
+  limit: number,
+  tradingDay: string,
+): { startDay: string; tradingDay: string } {
+  // Civil-date carrier: YYYY-MM-DD already resolved in NY. Local midnight of
+  // that date is used only for day arithmetic — not as an instant.
+  const end = parseNyCalendarDay(tradingDay);
   const start = new Date(end.getTime());
   start.setDate(start.getDate() - Math.ceil(limit * CALENDAR_DAYS_PER_TRADING_DAY) + 1);
-  return { startDay: estCalendarDayKey(start), tradingDay: estCalendarDayKey(end) };
+  return { startDay: estCalendarDayKey(start), tradingDay };
 }
 
 async function fetchDailyBarsFromApi(
@@ -687,11 +699,16 @@ async function computeBenchmarkStats(
 // 6. Main entry point
 // ---------------------------------------------------------------------------
 
-export async function runScreener(): Promise<Watchlist> {
+export async function runScreener(asOfTradingDay?: string): Promise<Watchlist> {
   log.info('Starting post-session screening...');
   const lookbackDays = config.screener.relativeStrengthLookbackDays;
 
-  const window = resolveEodWindow(dailyBarsNeeded(lookbackDays));
+  const tradingDay = asOfTradingDay ?? await queryRequiredWatchlistTradingDay();
+  if (tradingDay === null) {
+    throw new Error('[SCREENER] Cannot resolve required EOD trading day — calendar unavailable');
+  }
+
+  const window = resolveEodWindow(dailyBarsNeeded(lookbackDays), tradingDay);
   const splits = await loadSplitIndex(window.startDay, window.tradingDay);
   const eod: EodContext = { ...window, splits };
   log.info(
@@ -706,26 +723,12 @@ export async function runScreener(): Promise<Watchlist> {
   const liquidUniverse = await preFilterByLiquidity(rawUniverse);
 
   if (liquidUniverse.length === 0) {
-    log.warn('Empty universe after liquidity pre-filter — screening aborted');
-    return {
-      generatedAt: new Date().toISOString(),
-      benchmarkReturn: null,
-      universeSize: rawUniverse.length,
-      liquidFiltered: 0,
-      symbols: [],
-    };
+    throw new Error('[SCREENER] Empty universe after liquidity pre-filter — aborting without writing watchlist');
   }
 
   const benchmark = await computeBenchmarkStats(lookbackDays, eod);
   if (benchmark === null) {
-    log.warn('Failed to compute benchmark return — screening aborted');
-    return {
-      generatedAt: new Date().toISOString(),
-      benchmarkReturn: null,
-      universeSize: rawUniverse.length,
-      liquidFiltered: liquidUniverse.length,
-      symbols: [],
-    };
+    throw new Error('[SCREENER] Failed to compute benchmark return — aborting without writing watchlist');
   }
 
   log.info(
@@ -791,6 +794,7 @@ export async function runScreener(): Promise<Watchlist> {
 
   const watchlist: Watchlist = {
     generatedAt: new Date().toISOString(),
+    tradingDay: eod.tradingDay,
     benchmarkReturn: benchmark.ret,
     universeSize: rawUniverse.length,
     liquidFiltered: liquidUniverse.length,

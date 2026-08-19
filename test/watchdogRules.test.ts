@@ -37,6 +37,8 @@ function buildSnapshot(
     openPositions: 0,
     openPositionsCheckedAt: new Date(now.getTime() - 20_000).toISOString(),
     watchlistGeneratedAt: new Date(now.getTime() - 12 * 3_600_000).toISOString(),
+    watchlistTradingDay: null,
+    requiredWatchlistTradingDay: null,
     ...overrides,
   };
 }
@@ -150,6 +152,36 @@ describe('evaluateHeartbeat — watchlist freshness', () => {
     const now = estInstant(10, 0);
     const snapshot = buildSnapshot(now, { watchlistGeneratedAt: null });
     assert.deepEqual(codes(evaluateHeartbeat(snapshot, now, THRESHOLDS)), ['WATCHLIST_STALE']);
+  });
+
+  it('rejects a calendar mismatch even when generatedAt is only 14h old', () => {
+    const now = estInstant(10, 0);
+    const snapshot = buildSnapshot(now, {
+      watchlistGeneratedAt: new Date(now.getTime() - 14 * 3_600_000).toISOString(),
+      watchlistTradingDay: '2026-08-14',
+      requiredWatchlistTradingDay: '2026-08-18',
+    });
+    assert.deepEqual(codes(evaluateHeartbeat(snapshot, now, THRESHOLDS)), ['WATCHLIST_STALE']);
+  });
+
+  it('rejects a missing tradingDay when the required day is known', () => {
+    const now = estInstant(10, 0);
+    const snapshot = buildSnapshot(now, {
+      watchlistGeneratedAt: new Date(now.getTime() - 47 * 3_600_000).toISOString(),
+      watchlistTradingDay: null,
+      requiredWatchlistTradingDay: '2026-08-18',
+    });
+    assert.deepEqual(codes(evaluateHeartbeat(snapshot, now, THRESHOLDS)), ['WATCHLIST_STALE']);
+  });
+
+  it('accepts a 47h-old generatedAt when the calendar day matches (prod silent-fail)', () => {
+    const now = estInstant(10, 0);
+    const snapshot = buildSnapshot(now, {
+      watchlistGeneratedAt: new Date(now.getTime() - 47 * 3_600_000).toISOString(),
+      watchlistTradingDay: '2026-08-18',
+      requiredWatchlistTradingDay: '2026-08-18',
+    });
+    assert.deepEqual(evaluateHeartbeat(snapshot, now, THRESHOLDS), []);
   });
 });
 

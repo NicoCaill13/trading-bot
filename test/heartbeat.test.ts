@@ -25,6 +25,8 @@ const SNAPSHOT: HeartbeatSnapshot = {
   openPositions: 1,
   openPositionsCheckedAt: '2026-08-17T13:59:40.000Z',
   watchlistGeneratedAt: '2026-08-17T00:01:00.000Z',
+  watchlistTradingDay: null,
+  requiredWatchlistTradingDay: null,
 };
 
 let tmpDir: string;
@@ -87,6 +89,15 @@ describe('isHeartbeatSnapshot', () => {
   it('accepts null optional instants', () => {
     const withNulls = { ...SNAPSHOT, lastBarAt: null, openPositionsCheckedAt: null };
     assert.equal(isHeartbeatSnapshot(withNulls), true);
+  });
+
+  it('accepts a legacy snapshot without calendar watchlist fields', () => {
+    const {
+      watchlistTradingDay: _have,
+      requiredWatchlistTradingDay: _need,
+      ...legacy
+    } = SNAPSHOT;
+    assert.equal(isHeartbeatSnapshot(legacy), true);
   });
 });
 

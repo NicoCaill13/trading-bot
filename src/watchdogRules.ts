@@ -62,9 +62,8 @@ function evaluateMarketDataFreshness(
 }
 
 /**
- * Coarse on purpose: the Core screener runs at 20:00 EST the previous session,
- * and weekends or holidays legitimately stretch that age. The rule targets the
- * gross failure — trading a watchlist generated weeks ago — not day precision.
+ * Calendar match is the source of truth. Age in hours only covers legacy
+ * heartbeats that predate watchlistTradingDay / requiredWatchlistTradingDay.
  */
 function evaluateWatchlistFreshness(
   snapshot: HeartbeatSnapshot,
@@ -72,6 +71,22 @@ function evaluateWatchlistFreshness(
   thresholds: WatchdogThresholds,
 ): WatchdogFinding | null {
   if (!snapshot.tradingDay) return null;
+
+  const have = snapshot.watchlistTradingDay;
+  const need = snapshot.requiredWatchlistTradingDay;
+  const calendarArmed = typeof have === 'string' || typeof need === 'string';
+
+  if (calendarArmed) {
+    if (typeof have !== 'string' || typeof need !== 'string' || have !== need) {
+      return {
+        code: 'WATCHLIST_STALE',
+        message:
+          `Watchlist trading day ${have ?? 'none'} != required ${need ?? 'unknown'} ` +
+          `— screener missed or crashed before write`,
+      };
+    }
+    return null;
+  }
 
   const generatedMs = parseInstant(snapshot.watchlistGeneratedAt);
   if (generatedMs === null) {

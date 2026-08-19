@@ -28,6 +28,10 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === 'string';
 }
 
+function isOptionalNullableString(value: unknown): boolean {
+  return value === undefined || isNullableString(value);
+}
+
 /**
  * Structural validation of an untrusted file. A partially written or
  * schema-drifted snapshot must be treated as "no heartbeat" rather than
@@ -47,6 +51,8 @@ export function isHeartbeatSnapshot(value: unknown): value is HeartbeatSnapshot 
     isNullableString(value['lastBarAt']) &&
     isNullableString(value['openPositionsCheckedAt']) &&
     isNullableString(value['watchlistGeneratedAt']) &&
+    isOptionalNullableString(value['watchlistTradingDay']) &&
+    isOptionalNullableString(value['requiredWatchlistTradingDay']) &&
     SESSION_PHASES.includes(value['sessionPhase'] as SessionPhase) &&
     WS_STATES.includes(value['wsState'] as WsState)
   );

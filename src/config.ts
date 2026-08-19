@@ -60,6 +60,7 @@ const config = {
   },
 
   screener: {
+    // Annotate + rank only — not hard gates. Universe = liquidity + ADR + Weinstein.
     minRelativeVolume: parseFloatEnv('MIN_RELATIVE_VOLUME', 2.0),
     minGapUpPct: parseFloatEnv('MIN_GAP_UP_PCT', 0.02),
     gapHoldTolerance: parseFloatEnv('GAP_HOLD_TOLERANCE', 0.01),
@@ -136,7 +137,7 @@ const config = {
   },
 
   premarket: {
-    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.04),
+    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.02),
     // Share volume summed on 1Min bars in EST [04:00, 09:30) — previously 100k
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 10),

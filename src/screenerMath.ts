@@ -69,3 +69,19 @@ export function isAllowedExchange(
 export function sumShareVolume(bars: readonly VolumeBar[]): number {
   return bars.reduce((sum, b) => sum + (b.volume > 0 ? b.volume : 0), 0);
 }
+
+/**
+ * Watchlist rank after the hard universe gates (liquidity, ADR, Weinstein).
+ * Alpha vs SPY first; RVOL then gap as tie-breakers — never as rejects.
+ */
+export function compareWatchlistRank(
+  a: { relativeReturn?: number; relativeVolume?: number; gapUp?: number },
+  b: { relativeReturn?: number; relativeVolume?: number; gapUp?: number },
+): number {
+  const alpha = (b.relativeReturn ?? 0) - (a.relativeReturn ?? 0);
+  if (Math.abs(alpha) > 1e-12) return alpha;
+  const rvol = (b.relativeVolume ?? 0) - (a.relativeVolume ?? 0);
+  if (Math.abs(rvol) > 1e-12) return rvol;
+  return (b.gapUp ?? 0) - (a.gapUp ?? 0);
+}
+

@@ -10,6 +10,7 @@ import { readEodBars, writeEodBars } from './eodCache';
 import { readWatchlist, writeWatchlist, isV2Symbol } from './watchlistIO';
 import { notifyWatchlistSaved } from './notificationManager';
 import {
+  compareWatchlistRank,
   computeAdrPct,
   isAllowedExchange,
   passesAdrGate,
@@ -570,42 +571,6 @@ async function analyzeSymbol(
       return null;
     }
 
-    if (symbolReturn <= benchmark.ret) {
-      log.info(
-        `${ticker} REJECTED — relative strength: ` +
-        `symbol ${(symbolReturn * 100).toFixed(2)}% vs SPY ${(benchmark.ret * 100).toFixed(2)}% ` +
-        `(alpha ${((symbolReturn - benchmark.ret) * 100).toFixed(2)}%)`,
-      );
-      return null;
-    }
-
-    if (gapUp < config.screener.minGapUpPct) {
-      log.info(
-        `${ticker} REJECTED — gap up ${(gapUp * 100).toFixed(2)}% ` +
-        `below ${(config.screener.minGapUpPct * 100).toFixed(1)}% minimum`,
-      );
-      return null;
-    }
-
-    if (!isGapHeld(bars)) {
-      const today = bars[bars.length - 1];
-      const floorPrice = today.OpenPrice * (1 - config.screener.gapHoldTolerance);
-      log.info(
-        `${ticker} REJECTED — gap not held: ` +
-        `close $${today.ClosePrice.toFixed(2)} fell below open floor $${floorPrice.toFixed(2)} ` +
-        `(open $${today.OpenPrice.toFixed(2)}, tolerance ${(config.screener.gapHoldTolerance * 100).toFixed(1)}%)`,
-      );
-      return null;
-    }
-
-    if (relativeVolume < config.screener.minRelativeVolume) {
-      log.info(
-        `${ticker} REJECTED — RVOL ${relativeVolume.toFixed(2)}x ` +
-        `below ${config.screener.minRelativeVolume}x minimum`,
-      );
-      return null;
-    }
-
     return {
       symbol: ticker,
       origin: 'V1_CORE',
@@ -613,7 +578,7 @@ async function analyzeSymbol(
       relativeReturn: symbolReturn - benchmark.ret,
       symbolReturn,
       gapUp,
-      gapHeld: true,
+      gapHeld: isGapHeld(bars),
       relativeVolume,
       dollarVolume: lastClose * lastVolume,
       lastClose,
@@ -752,7 +717,7 @@ export async function runScreener(asOfTradingDay?: string): Promise<Watchlist> {
   );
 
   const filtered = (candidates.filter(Boolean) as WatchlistSymbol[])
-    .sort((a, b) => (b.relativeReturn ?? 0) - (a.relativeReturn ?? 0));
+    .sort(compareWatchlistRank);
 
   // When catalyst gate is on, score a wider alpha pool then hard-filter; else top-N only.
   const poolSize = config.sentiment.enabled

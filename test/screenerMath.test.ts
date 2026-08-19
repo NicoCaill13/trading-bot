@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  compareWatchlistRank,
   computeAdrPct,
   isAllowedExchange,
   passesAdrGate,
@@ -92,3 +93,22 @@ describe('sumShareVolume', () => {
     assert.equal(sumShareVolume([{ volume: 100 }, { volume: 200 }, { volume: -1 }]), 300);
   });
 });
+
+describe('compareWatchlistRank', () => {
+  it('ranks higher alpha first even with a weaker gap', () => {
+    const ranked = [
+      { relativeReturn: 0.01, relativeVolume: 3, gapUp: 0.10 },
+      { relativeReturn: 0.05, relativeVolume: 0.5, gapUp: -0.01 },
+    ].sort(compareWatchlistRank);
+    assert.equal(ranked[0]?.relativeReturn, 0.05);
+  });
+
+  it('breaks an alpha tie on RVOL then gap', () => {
+    const ranked = [
+      { relativeReturn: 0.02, relativeVolume: 1.0, gapUp: 0.08 },
+      { relativeReturn: 0.02, relativeVolume: 1.4, gapUp: 0.00 },
+    ].sort(compareWatchlistRank);
+    assert.equal(ranked[0]?.relativeVolume, 1.4);
+  });
+});
+

@@ -219,8 +219,8 @@ export async function cancelOrdersForSymbol(symbol: string): Promise<number> {
  *
  * @param sellQty    - Math.floor(totalQty / 2) — no fractional shares
  * @param entryPrice - avg_entry_price for break-even floor calculation and logging
- * @param targetPct  - 0.05 or 0.07 — the threshold that triggered this call
- * @param tierLabel  - 'Core' or 'Satellite' — used in the log line
+ * @param targetPct  - scale-out threshold that triggered this call (SCALE_OUT_TARGET_PCT)
+ * @param tierLabel  - 'Core' or 'Satellite' — used in the log line only
  */
 export async function executeBreakEvenScaleOut(
   symbol: string,

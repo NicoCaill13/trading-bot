@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import WebSocket from 'ws';
 import { RSI } from 'technicalindicators';
-import config, { getTimedecaySlotLimits } from './config';
+import config from './config';
 import { runScreener } from './screener';
 import { runPremarketScreener } from './premarket_screener';
 import * as signalQueue from './signalQueue';
@@ -51,6 +51,7 @@ import {
   type EntryWindowBounds,
 } from './vwapSetup';
 import { resolveRiskDollarsAtEntry } from './expectancy';
+import { remainingPositionSlots } from './riskSizing';
 import { createMarketDataBus } from './marketDataBus';
 import { createHeartbeatWriter } from './heartbeat';
 import { assessQuoteForWall } from './orderBook';
@@ -1336,19 +1337,6 @@ function schedulePendingSignalFlush(): void {
   }, config.entry.signalBatchWindowMs);
 }
 
-function countOpenPositionsByTier(
-  positions: Awaited<ReturnType<typeof trader.getOpenPositions>>,
-): { core: number; satellite: number } {
-  let core = 0;
-  let satellite = 0;
-  for (const pos of positions) {
-    const tier = enteredByTier.get(pos.symbol) ?? 'core';
-    if (tier === 'satellite') satellite++;
-    else core++;
-  }
-  return { core, satellite };
-}
-
 async function executeSignalsForTier(
   signals: PendingSignal[],
   maxExecutions: number,
@@ -1571,8 +1559,9 @@ async function executeSignalsForTier(
 }
 
 /**
- * V3 dual-bucket flush: time-decay slots, Core-first priority, serialized execution.
- * During opening blackout, only Satellite (ORB) signals may execute; Core is deferred.
+ * Unified-pool flush: remaining slots = MAX_POSITIONS − open positions.
+ * Eligible Core and Satellite candidates compete by score. Window rules stay:
+ * Core waits for its entry window; Satellite waits for the regular session.
  */
 async function flushPendingSignals(): Promise<void> {
   signalFlushTimer = null;
@@ -1598,12 +1587,10 @@ async function flushPendingSignals(): Promise<void> {
     }
 
     const estNow = getESTDate();
-    const openCounts = countOpenPositionsByTier(currentPositions);
-    const slotLimits = getTimedecaySlotLimits(estNow, openCounts.core);
-    const coreSlotsAvailable =
-      slotLimits.coreMaxPositions - openCounts.core;
-    const satelliteSlotsAvailable =
-      slotLimits.satelliteMaxPositions - openCounts.satellite;
+    const slotsAvailable = remainingPositionSlots(
+      currentPositions.length,
+      config.risk.maxPositions,
+    );
 
     const filterEntered = (signals: PendingSignal[]) =>
       signals.filter(s => !hasEntered(s.symbol));
@@ -1627,18 +1614,10 @@ async function flushPendingSignals(): Promise<void> {
 
     const executedSymbols: string[] = [];
 
-    if (coreWindowOpen && coreCandidates.length > 0) {
-      log.info(
-        `Flush Core — ${coreCandidates.length} candidate(s), ` +
-        `slots ${coreSlotsAvailable}/${slotLimits.coreMaxPositions} ` +
-        `(time-decay @ ${estNow.getHours()}:${String(estNow.getMinutes()).padStart(2, '0')} EST)`,
-      );
-      const coreExecuted = await executeSignalsForTier(
-        coreCandidates,
-        coreSlotsAvailable,
-      );
-      executedSymbols.push(...coreExecuted);
-    } else if (!coreWindowOpen && coreCandidates.length > 0) {
+    const eligible: PendingSignal[] = [];
+    if (coreWindowOpen) {
+      eligible.push(...coreCandidates);
+    } else if (coreCandidates.length > 0) {
       if (beforeCoreWindow) {
         log.info(`Core entry window not open — ${coreCandidates.length} Core signal(s) kept pending`);
         schedulePendingSignalFlush();
@@ -1650,20 +1629,21 @@ async function flushPendingSignals(): Promise<void> {
 
     if (satelliteCandidates.length > 0) {
       if (!isRegularSessionStarted()) {
-        // Market not yet open — keep Satellite signals pending until 09:30.
         log.info(`Pre-market — ${satelliteCandidates.length} Satellite signal(s) held until 09:30`);
         schedulePendingSignalFlush();
       } else {
-        log.info(
-          `Flush Satellite — ${satelliteCandidates.length} candidate(s), ` +
-          `slots ${satelliteSlotsAvailable}/${slotLimits.satelliteMaxPositions}`,
-        );
-        const satExecuted = await executeSignalsForTier(
-          satelliteCandidates,
-          satelliteSlotsAvailable,
-        );
-        executedSymbols.push(...satExecuted);
+        eligible.push(...satelliteCandidates);
       }
+    }
+
+    if (eligible.length > 0) {
+      log.info(
+        `Flush pool — ${eligible.length} candidate(s), ` +
+        `slots ${slotsAvailable}/${config.risk.maxPositions} ` +
+        `(@ ${estNow.getHours()}:${String(estNow.getMinutes()).padStart(2, '0')} EST)`,
+      );
+      const executed = await executeSignalsForTier(eligible, slotsAvailable);
+      executedSymbols.push(...executed);
     }
 
     signalQueue.remove(executedSymbols);
@@ -2181,10 +2161,8 @@ function scheduleMarketOpenAlert(): void {
       if (monitoredSymbols.length > 0 && !ws) {
         connectWebSocket(monitoredSymbols);
       }
-      const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
-      const slots = getTimedecaySlotLimits(getESTDate(), openCore);
       void sendTelegramAlert(
-        formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
+        formatStartupAlert(sessionStartEquity, config.risk.maxPositions),
       );
       scheduleMarketOpenAlert();
     });
@@ -2299,14 +2277,12 @@ async function main(): Promise<void> {
 
   const coreCount = [...symbolTier.values()].filter(t => t === 'core').length;
   const satCount = [...symbolTier.values()].filter(t => t === 'satellite').length;
-  const openCore = [...enteredByTier.values()].filter(t => t === 'core').length;
-  const slots = getTimedecaySlotLimits(getESTDate(), openCore);
   log.info(
     `Bot active — ${symbols.length} symbols (${coreCount} Core, ${satCount} Satellite) | ` +
-    `slots ${slots.coreMaxPositions} Core / ${slots.satelliteMaxPositions} Satellite`,
+    `pool ${config.risk.maxPositions} slot(s)`,
   );
   await sendTelegramAlert(
-    formatStartupAlert(sessionStartEquity, slots.coreMaxPositions, slots.satelliteMaxPositions),
+    formatStartupAlert(sessionStartEquity, config.risk.maxPositions),
   );
   await alertInfo(
     'Bot started',

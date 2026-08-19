@@ -29,13 +29,12 @@ export async function sendTelegramAlert(message: string): Promise<void> {
 
 export function formatStartupAlert(
   baseline: number,
-  coreSlots: number,
-  satelliteSlots: number,
+  maxPositions: number,
 ): string {
   return (
     `🟢 <b>[SYSTEM]</b> Bot V4 Démarré | ` +
     `Baseline: $${baseline.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })} | ` +
-    `Slots: ${coreSlots} Core / ${satelliteSlots} Satellite`
+    `Slots: ${maxPositions} (pool unique)`
   );
 }
 

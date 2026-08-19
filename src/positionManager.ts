@@ -101,16 +101,13 @@ function resolveTimeDecayWindow(estNow: Date): 'normal' | 'halved' | 'afternoon'
 function resolveEffectiveTargetPct(
   atrAtEntry: number,
   entryPrice: number,
-  tier: SignalTier,
   estNow: Date,
 ): number | null {
   const window = resolveTimeDecayWindow(estNow);
   if (window === 'afternoon') return null;
 
   const atrTargetPct = (config.risk.atrTakeProfitMultiplier * atrAtEntry) / entryPrice;
-  const fixedTargetPct = tier === 'satellite'
-    ? config.risk.scaleOutTargetPctSatellite
-    : config.risk.scaleOutTargetPctCore;
+  const fixedTargetPct = config.risk.scaleOutTargetPct;
 
   let targetPct = Math.min(atrTargetPct, fixedTargetPct);
   if (window === 'halved') targetPct /= 2;
@@ -300,7 +297,7 @@ export async function handlePositionUpdate(
   const atr = atrAtEntry;
   if (atr === null || atr <= 0) return;
 
-  const targetPct = resolveEffectiveTargetPct(atr, entryPrice, tier, estNow);
+  const targetPct = resolveEffectiveTargetPct(atr, entryPrice, estNow);
   if (targetPct === null || unrealizedPct < targetPct) return;
 
   const sellQty = Math.floor(totalQty / 2);
@@ -318,13 +315,11 @@ export async function handlePositionUpdate(
     );
     scaledOutPositions.add(symbol);
 
-    const fixedTarget = tier === 'satellite'
-      ? config.risk.scaleOutTargetPctSatellite
-      : config.risk.scaleOutTargetPctCore;
+    const fixedTarget = config.risk.scaleOutTargetPct;
     const atrTargetPct = (config.risk.atrTakeProfitMultiplier * atr) / entryPrice;
     const scaleOutReason = atrTargetPct <= fixedTarget
       ? 'target-atr' as const
-      : (tier === 'satellite' ? 'target-7pct' as const : 'target-5pct' as const);
+      : 'target-5pct' as const;
     const scaleOutPrice = parseFloat((entryPrice * (1 + targetPct)).toFixed(2));
     journalManager.recordScaleOut(symbol, scaleOutReason, scaleOutPrice, sellQty);
   } catch (err) {

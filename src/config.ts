@@ -19,9 +19,9 @@ const config = {
   },
 
   risk: {
-    maxPositions: parseIntEnv('MAX_POSITIONS', 5),
+    maxPositions: parseIntEnv('MAX_POSITIONS', 3),
     // Cash-account notional ceiling: qty * entry <= equity * maxPositionPct (no leverage).
-    maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.20),
+    maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.40),
     riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.05),
     minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
     atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.015),
@@ -29,12 +29,17 @@ const config = {
     timeStopMinutes: parseIntEnv('TIME_STOP_MINUTES', 45),
     atrStopMultiplier: parseFloatEnv('ATR_STOP_MULTIPLIER', 1.5),
     hardStopFloorPct: parseFloatEnv('HARD_STOP_FLOOR_PCT', 0.015),
-    scaleOutTargetPctCore: parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.05),
-    scaleOutTargetPctSatellite: parseFloatEnv('SCALE_OUT_TARGET_PCT_SATELLITE', 0.07),
-    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.015),
+    // Single scale-out target for the unified 3-slot pool (#30).
+    // SCALE_OUT_TARGET_PCT_CORE is accepted as a fallback so an old .env still boots.
+    scaleOutTargetPct: parseFloatEnv(
+      'SCALE_OUT_TARGET_PCT',
+      parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.05),
+    ),
+    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.025),
     scaleOutSettlementDelayMs: parseIntEnv('SCALE_OUT_SETTLEMENT_DELAY_MS', 3000),
     eodTightTrailPct: parseFloatEnv('EOD_TIGHT_TRAIL_PCT', 0.005),
-    dailyProfitTargetPct: parseFloatEnv('DAILY_PROFIT_TARGET_PCT', 0.01),
+    // 0 disables the daily profit circuit breaker (drawdown kill-switch stays).
+    dailyProfitTargetPct: parseFloatEnv('DAILY_PROFIT_TARGET_PCT', 0),
     dailyDrawdownLimitDollars: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_DOLLARS', -1500),
     dailyDrawdownLimitPct: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_PCT', -0.015),
     atrTakeProfitMultiplier: parseFloatEnv('ATR_TP_MULTIPLIER', 1.5),
@@ -130,6 +135,8 @@ const config = {
     shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
   },
 
+  // Legacy 80/20 labels. Unused for allocation since #30 (unified pool).
+  // Kept so an existing .env still loads; shares must still sum to 1.0.
   portfolio: {
     coreRiskShare: parseFloatEnv('CORE_RISK_SHARE', 0.80),
     satelliteRiskShare: parseFloatEnv('SATELLITE_RISK_SHARE', 0.20),
@@ -210,7 +217,8 @@ const config = {
     screenerMinute: 0,
     preMarketHour: 9,
     preMarketMinute: 15,
-    // V3 time-decay slot cascade (EST) — was hardcoded in getTimedecaySlotLimits
+    // Legacy V3 cascade hours — unused since #30 (unified 3-slot pool).
+    // Kept so an existing .env still loads.
     decayTier1Hour: parseIntEnv('DECAY_TIER1_HOUR', 10),
     decayTier1Minute: parseIntEnv('DECAY_TIER1_MINUTE', 15),
     decayTier2Hour: parseIntEnv('DECAY_TIER2_HOUR', 11),
@@ -320,13 +328,11 @@ const config = {
   if (r.hardStopFloorPct < 0.005 || r.hardStopFloorPct > 0.1)
     throw new Error(`[SYSTEM] HARD_STOP_FLOOR_PCT out of bounds (0.5%–10%): ${r.hardStopFloorPct}`);
 
-  if (r.scaleOutTargetPctCore <= r.hardStopFloorPct)
-    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT_CORE must be > HARD_STOP_FLOOR_PCT');
+  if (r.scaleOutTargetPct <= r.hardStopFloorPct)
+    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT must be > HARD_STOP_FLOOR_PCT');
 
-  if (r.scaleOutTargetPctSatellite <= r.scaleOutTargetPctCore)
-    throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT_SATELLITE must be > SCALE_OUT_TARGET_PCT_CORE');
-
-  if (r.dailyProfitTargetPct <= 0 || r.dailyProfitTargetPct > 0.1)
+  // 0 disables the daily profit circuit breaker; the drawdown kill-switch is independent.
+  if (r.dailyProfitTargetPct < 0 || r.dailyProfitTargetPct > 0.1)
     throw new Error(`[SYSTEM] DAILY_PROFIT_TARGET_PCT out of bounds (0–10%): ${r.dailyProfitTargetPct}`);
 
   // Below 1s the writer would thrash the disk; above 60s the watchdog cannot
@@ -386,14 +392,6 @@ const config = {
 
   if (p.coreRiskShare <= 0 || p.satelliteRiskShare <= 0) {
     throw new Error('[SYSTEM] CORE_RISK_SHARE and SATELLITE_RISK_SHARE must be > 0');
-  }
-
-  const slots = getPortfolioSlotLimits();
-  if (slots.coreMaxPositions + slots.satelliteMaxPositions > r.maxPositions) {
-    throw new Error(
-      `[SYSTEM] Core + Satellite slots (${slots.coreMaxPositions + slots.satelliteMaxPositions}) ` +
-      `exceed MAX_POSITIONS (${r.maxPositions})`,
-    );
   }
 
   const s = config.screener;
@@ -666,65 +664,9 @@ const config = {
   }
 }());
 
-export function getPortfolioSlotLimits(): {
-  coreMaxPositions: number;
-  satelliteMaxPositions: number;
-} {
-  const max = config.risk.maxPositions;
-  let core = config.portfolio.coreMaxPositions;
-  let satellite = config.portfolio.satelliteMaxPositions;
-
-  if (core <= 0) {
-    core = Math.floor(max * config.portfolio.coreRiskShare);
-  }
-  if (satellite <= 0) {
-    satellite = max - core;
-  }
-
-  return { coreMaxPositions: core, satelliteMaxPositions: satellite };
-}
-
 /** Trading sessions approximating N calendar weeks (5 sessions/week). */
 export function getSma150SlopeLookbackBars(): number {
   return config.screener.sma150SlopeWeeks * 5;
-}
-
-/**
- * V3 time-decay slot allocation. Cascades forward only when activeCore is below
- * the threshold for each tier; otherwise the previous tier limits remain.
- */
-export function getTimedecaySlotLimits(
-  estNow: Date,
-  activeCoreCount: number,
-): { coreMaxPositions: number; satelliteMaxPositions: number } {
-  const max = config.risk.maxPositions;
-  const minutesSinceMidnight = estNow.getHours() * 60 + estNow.getMinutes();
-  const sess = config.session;
-  const tTier1 = sess.decayTier1Hour * 60 + sess.decayTier1Minute;
-  const tTier2 = sess.decayTier2Hour * 60 + sess.decayTier2Minute;
-  const tTier3 = sess.decayTier3Hour * 60 + sess.decayTier3Minute;
-
-  let core = 4;
-  let satellite = max - core;
-
-  if (minutesSinceMidnight >= tTier1 && activeCoreCount < 4) {
-    core = 3;
-    satellite = 2;
-  }
-  if (minutesSinceMidnight >= tTier2 && activeCoreCount < 3) {
-    core = 2;
-    satellite = 3;
-  }
-  if (minutesSinceMidnight >= tTier3 && activeCoreCount < 2) {
-    core = 1;
-    satellite = 4;
-  }
-
-  if (core + satellite !== max) {
-    satellite = max - core;
-  }
-
-  return { coreMaxPositions: core, satelliteMaxPositions: satellite };
 }
 
 /**
@@ -734,17 +676,6 @@ export function getTimedecaySlotLimits(
  */
 export function getSlotCapitalShare(): number {
   return 1 / config.risk.maxPositions;
-}
-
-export function getRiskShareForTier(tier: 'core' | 'satellite'): number {
-  return tier === 'core'
-    ? config.portfolio.coreRiskShare
-    : config.portfolio.satelliteRiskShare;
-}
-
-export function getMaxPositionPctForTier(tier: 'core' | 'satellite'): number {
-  const share = getRiskShareForTier(tier);
-  return config.risk.maxPositionPct * share;
 }
 
 export default config;

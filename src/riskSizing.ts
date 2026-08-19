@@ -60,3 +60,18 @@ export function capQtyByMaxNotional(
   const maxNotional = equity * maxPositionPct;
   return Math.min(qty, Math.floor(maxNotional / entryPrice));
 }
+
+/** Open slots in the unified pool. Never negative. */
+export function remainingPositionSlots(openCount: number, maxPositions: number): number {
+  if (maxPositions < 1) return 0;
+  return Math.max(0, maxPositions - openCount);
+}
+
+/**
+ * Daily profit circuit. A target of 0 (or negative) is inactive — the drawdown
+ * kill-switch is a separate gate and must not be overloaded onto this check.
+ */
+export function isDailyProfitTargetReached(dailyPnlPct: number, targetPct: number): boolean {
+  if (targetPct <= 0) return false;
+  return dailyPnlPct >= targetPct;
+}

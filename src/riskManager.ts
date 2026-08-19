@@ -10,6 +10,7 @@ import {
   capQtyBySettledCash,
   computeRiskBasedQty,
   computeTakeProfitPrice,
+  isDailyProfitTargetReached,
   passesMinRiskReward,
 } from './riskSizing';
 import {
@@ -172,12 +173,13 @@ export async function computePositionSize(
   );
 
   if (qty < 1) {
+    log.warn(
+      `REJECTED — Insufficient allocated capital for 1 whole share ` +
+      `(${symbol} @ $${entryPrice.toFixed(2)}, ` +
+      `equity $${totalEquity.toFixed(2)}, settled $${settledCash.toFixed(2)})`,
+    );
     throw new Error(
-      `${symbol}: risk sizing insufficient — ` +
-      `equity $${totalEquity.toFixed(2)} × ${(riskPct * 100).toFixed(1)}% ` +
-      `/ stopDist $${stopDistance.toFixed(4)} ` +
-      `(settled cash $${settledCash.toFixed(2)}, ` +
-      `maxNotional ${(config.risk.maxPositionPct * 100).toFixed(0)}%)`,
+      `${symbol}: REJECTED — Insufficient allocated capital for 1 whole share`,
     );
   }
 
@@ -232,19 +234,20 @@ export async function checkCircuitBreaker(currentEquity: number): Promise<boolea
 
   const dailyPnlPct = (currentEquity - startOfDayEquity) / startOfDayEquity;
 
-  if (dailyPnlPct >= config.risk.dailyProfitTargetPct) {
-    circuitBreakerTriggered = true;
-    log.warn(
-      `*** DAILY CIRCUIT BREAKER *** ` +
-      `Net PnL +${(dailyPnlPct * 100).toFixed(2)}% — ` +
-      `target ${(config.risk.dailyProfitTargetPct * 100).toFixed(1)}% reached`,
-    );
-    log.warn('Immediate liquidation of all positions...');
-    journalManager.closeAllOpenTrades('circuit-breaker');
-    await trader.liquidateAll('circuit-breaker-daily-target');
-    return true;
+  if (!isDailyProfitTargetReached(dailyPnlPct, config.risk.dailyProfitTargetPct)) {
+    return false;
   }
-  return false;
+
+  circuitBreakerTriggered = true;
+  log.warn(
+    `*** DAILY CIRCUIT BREAKER *** ` +
+    `Net PnL +${(dailyPnlPct * 100).toFixed(2)}% — ` +
+    `target ${(config.risk.dailyProfitTargetPct * 100).toFixed(1)}% reached`,
+  );
+  log.warn('Immediate liquidation of all positions...');
+  journalManager.closeAllOpenTrades('circuit-breaker');
+  await trader.liquidateAll('circuit-breaker-daily-target');
+  return true;
 }
 
 // ---------------------------------------------------------------------------

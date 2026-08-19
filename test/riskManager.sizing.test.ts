@@ -5,7 +5,9 @@ import {
   capQtyBySettledCash,
   computeRiskBasedQty,
   computeTakeProfitPrice,
+  isDailyProfitTargetReached,
   passesMinRiskReward,
+  remainingPositionSlots,
 } from '../src/riskSizing';
 
 describe('computeRiskBasedQty', () => {
@@ -50,20 +52,44 @@ describe('capQtyBySettledCash', () => {
 
 describe('capQtyByMaxNotional', () => {
   it('caps qty so notional <= equity * maxPositionPct', () => {
-    // equity 100k, max 20% → 20k notional @ $50 → max 400 shares
-    assert.equal(capQtyByMaxNotional(500, 50, 100_000, 0.20), 400);
+    // equity 100k, max 40% → 40k notional @ $50 → max 800 shares
+    assert.equal(capQtyByMaxNotional(900, 50, 100_000, 0.40), 800);
   });
 
   it('leaves qty unchanged when already under the ceiling', () => {
-    assert.equal(capQtyByMaxNotional(100, 50, 100_000, 0.20), 100);
+    assert.equal(capQtyByMaxNotional(100, 50, 100_000, 0.40), 100);
   });
 
   it('prevents leverage from a tight-stop inflated risk qty', () => {
-    // 5% risk / $0.10 stop on $100 stock → huge share count → capped to 20% equity
+    // 5% risk / $0.10 stop on $100 stock → huge share count → capped to 40% equity
     const riskQty = computeRiskBasedQty(100_000, 0.05, 100, 99.9);
     assert.ok(riskQty > 1000);
-    const capped = capQtyByMaxNotional(riskQty, 100, 100_000, 0.20);
-    assert.equal(capped, 200);
-    assert.ok(capped * 100 <= 100_000 * 0.20);
+    const capped = capQtyByMaxNotional(riskQty, 100, 100_000, 0.40);
+    assert.equal(capped, 400);
+    assert.ok(capped * 100 <= 100_000 * 0.40);
+  });
+});
+
+describe('remainingPositionSlots', () => {
+  it('returns the unused seats in the unified pool', () => {
+    assert.equal(remainingPositionSlots(0, 3), 3);
+    assert.equal(remainingPositionSlots(2, 3), 1);
+    assert.equal(remainingPositionSlots(3, 3), 0);
+  });
+
+  it('never goes negative when the book is over the cap', () => {
+    assert.equal(remainingPositionSlots(5, 3), 0);
+  });
+});
+
+describe('isDailyProfitTargetReached', () => {
+  it('is inactive when the target is 0', () => {
+    assert.equal(isDailyProfitTargetReached(0.05, 0), false);
+    assert.equal(isDailyProfitTargetReached(1, 0), false);
+  });
+
+  it('fires at or above a positive target', () => {
+    assert.equal(isDailyProfitTargetReached(0.01, 0.01), true);
+    assert.equal(isDailyProfitTargetReached(0.009, 0.01), false);
   });
 });

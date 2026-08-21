@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  hasImpulseExtension,
   hasVolumeDryUp,
   isGreenBarWithRvol,
   isNearVwap,
+  isVwapLagger,
   isVwapPullbackEntryWindow,
   minutesSinceMidnight,
   shouldHardBanSpyBearish,
@@ -42,6 +44,43 @@ describe('isVwapPullbackEntryWindow', () => {
 
   it('minutesSinceMidnight matches hour*60+minute', () => {
     assert.equal(minutesSinceMidnight(estAt(11, 30)), 11 * 60 + 30);
+  });
+});
+
+describe('hasImpulseExtension', () => {
+  it('rejects a VWAP hug (TWLO 20/08: high 0.19% above VWAP)', () => {
+    assert.equal(hasImpulseExtension(220.28, 219.86, 0.005), false);
+  });
+
+  it('accepts at the 0.5% boundary', () => {
+    assert.equal(hasImpulseExtension(100.5, 100, 0.005), true);
+  });
+
+  it('accepts a real thrust then measured vs current VWAP', () => {
+    assert.equal(hasImpulseExtension(116.5, 115.15, 0.005), true);
+  });
+
+  it('rejects non-positive vwap', () => {
+    assert.equal(hasImpulseExtension(101, 0, 0.005), false);
+  });
+});
+
+describe('isVwapLagger', () => {
+  it('flags DOCN 20/08 (gap -1.2%, alpha -15%)', () => {
+    assert.equal(isVwapLagger(-0.0119, -0.1531, -0.10), true);
+  });
+
+  it('does not flag TWLO (gap up, positive alpha)', () => {
+    assert.equal(isVwapLagger(0.0024, 0.1568, -0.10), false);
+  });
+
+  it('does not flag a gap-down name that only mildly lagged', () => {
+    assert.equal(isVwapLagger(-0.06, -0.029, -0.10), false);
+  });
+
+  it('fails open when screener fields are missing', () => {
+    assert.equal(isVwapLagger(null, -0.20, -0.10), false);
+    assert.equal(isVwapLagger(-0.02, undefined, -0.10), false);
   });
 });
 

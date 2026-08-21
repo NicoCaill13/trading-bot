@@ -36,6 +36,34 @@ export function isNearVwap(price: number, vwap: number, tolPct: number): boolean
   return Math.abs(price - vwap) / vwap <= tolPct;
 }
 
+/**
+ * True when the tracked high has extended at least `minExtensionPct` above VWAP.
+ * A VWAP hug (cross of a few bps, never leaving the line) fails this gate.
+ */
+export function hasImpulseExtension(
+  localHigh: number,
+  vwap: number,
+  minExtensionPct: number,
+): boolean {
+  if (vwap <= 0 || minExtensionPct < 0) return false;
+  return (localHigh - vwap) / vwap >= minExtensionPct;
+}
+
+/**
+ * Gap-down name that also lagged the benchmark by more than `alphaFloor`
+ * (e.g. -10%). Fail-open when either input is missing so a V2/ORB path
+ * without screener alpha is not blocked here.
+ */
+export function isVwapLagger(
+  gap: number | null | undefined,
+  relativeReturn: number | null | undefined,
+  alphaFloor: number,
+): boolean {
+  if (gap === null || gap === undefined) return false;
+  if (relativeReturn === null || relativeReturn === undefined) return false;
+  return gap < 0 && relativeReturn < alphaFloor;
+}
+
 function averagePositive(values: number[]): number | null {
   if (values.length === 0) return null;
   const sum = values.reduce((a, b) => a + b, 0);

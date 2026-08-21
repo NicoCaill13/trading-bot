@@ -155,6 +155,10 @@ const config = {
     pullbackSupportPct: parseFloatEnv('PULLBACK_SUPPORT_PCT', 0.002),
     // V7 Core: |price - vwap| / vwap <= 0.3%.
     vwapProximityPct: parseFloatEnv('VWAP_PROXIMITY_PCT', 0.003),
+    // Tracker high must reach this far above VWAP before a near-VWAP confirm (#32).
+    vwapMinExtensionPct: parseFloatEnv('VWAP_MIN_EXTENSION_PCT', 0.005),
+    // VWAP path only: gap-down AND alpha below this floor is a lagger (DOCN 20/08).
+    vwapLaggerAlphaFloor: parseFloatEnv('VWAP_LAGGER_ALPHA_FLOOR', -0.10),
     // V7 Core entry window EST [start, end).
     entryWindowStartHour: parseIntEnv('ENTRY_WINDOW_START_HOUR', 10),
     entryWindowStartMinute: parseIntEnv('ENTRY_WINDOW_START_MINUTE', 0),
@@ -345,6 +349,22 @@ const config = {
   if (e.vwapProximityPct <= 0 || e.vwapProximityPct > 0.05) {
     throw new Error(
       `[SYSTEM] VWAP_PROXIMITY_PCT out of bounds (0–5%]: ${e.vwapProximityPct}`,
+    );
+  }
+  if (e.vwapMinExtensionPct <= 0 || e.vwapMinExtensionPct > 0.05) {
+    throw new Error(
+      `[SYSTEM] VWAP_MIN_EXTENSION_PCT out of bounds (0–5%]: ${e.vwapMinExtensionPct}`,
+    );
+  }
+  if (e.vwapMinExtensionPct <= e.vwapProximityPct) {
+    throw new Error(
+      `[SYSTEM] VWAP_MIN_EXTENSION_PCT (${e.vwapMinExtensionPct}) must be > ` +
+      `VWAP_PROXIMITY_PCT (${e.vwapProximityPct})`,
+    );
+  }
+  if (e.vwapLaggerAlphaFloor < -1 || e.vwapLaggerAlphaFloor > 0) {
+    throw new Error(
+      `[SYSTEM] VWAP_LAGGER_ALPHA_FLOOR out of bounds [-1, 0]: ${e.vwapLaggerAlphaFloor}`,
     );
   }
   if (e.minRvolForPullback <= 0) {

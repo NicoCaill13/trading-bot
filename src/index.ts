@@ -42,9 +42,11 @@ import {
   formatFibLog,
 } from './fibonacci';
 import {
+  hasImpulseExtension,
   hasVolumeDryUp,
   isGreenBarWithRvol,
   isNearVwap,
+  isVwapLagger,
   isVwapPullbackEntryWindow,
   minutesSinceMidnight,
   shouldHardBanSpyBearish,
@@ -1140,6 +1142,25 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   if (currentPrice <= vwap) return;
 
+  if (!orbName) {
+    const meta = screenerDataMap.get(symbol);
+    if (
+      isVwapLagger(
+        meta?.gapUp,
+        meta?.relativeReturn,
+        config.entry.vwapLaggerAlphaFloor,
+      )
+    ) {
+      log.info(
+        `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} skipped — lagger ` +
+        `(gap ${((meta?.gapUp ?? 0) * 100).toFixed(1)}%, ` +
+        `alpha ${((meta?.relativeReturn ?? 0) * 100).toFixed(1)}% ` +
+        `< floor ${(config.entry.vwapLaggerAlphaFloor * 100).toFixed(0)}%)`,
+      );
+      return;
+    }
+  }
+
   // V2 still arms on RVOL at breakout; V1 confirms RVOL on the green 5m later.
   if (orbName && !passesRvolForPullback(latestBar, bars)) {
     const rvol = computeIntradayRvol(latestBar, bars);
@@ -1210,6 +1231,16 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   const vwap = computeVwap(bars) ?? tracker.vwapAtDetection;
 
   if (!isNearVwap(latestBar.close, vwap, config.entry.vwapProximityPct)) return;
+
+  if (
+    !hasImpulseExtension(
+      tracker.localHigh,
+      vwap,
+      config.entry.vwapMinExtensionPct,
+    )
+  ) {
+    return;
+  }
 
   const wallArmed = l2WallSignals.get(symbol)?.wall === true;
   const l2Enabled = config.level2.enabled;
@@ -1452,6 +1483,22 @@ async function executeSignals(
       if (setup === 'VWAP_PULLBACK' && shouldHardBanSpyBearish(spyTrend)) {
         traderLog.warn(
           `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} hard-banned — SPY 5m trend bearish`,
+        );
+        continue;
+      }
+
+      if (
+        setup === 'VWAP_PULLBACK' &&
+        isVwapLagger(
+          screenerData?.gapUp,
+          screenerData?.relativeReturn,
+          config.entry.vwapLaggerAlphaFloor,
+        )
+      ) {
+        log.warn(
+          `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} entry blocked — lagger ` +
+          `(gap ${((screenerData?.gapUp ?? 0) * 100).toFixed(1)}%, ` +
+          `alpha ${((screenerData?.relativeReturn ?? 0) * 100).toFixed(1)}%)`,
         );
         continue;
       }

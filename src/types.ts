@@ -56,6 +56,9 @@ export type ExitReason =
   | 'trailing-stop'
   | 'rsi-overbought-exit'
   | 'volume-exhaustion-trailing'
+  // Operational incident, not a strategy outcome: the protective stop was
+  // cancelled and its trailing replacement could not be placed.
+  | 'trail-placement-failed'
   | 'time-stop'
   | 'eod-liquidation'
   | 'hard-close'
@@ -219,6 +222,8 @@ export type OpeningDriveRejection =
   | 'outside_window'
   | 'insufficient_data'
   | 'gap_down'
+  | 'orb_not_ready'
+  | 'no_breakout'
   | 'open_broken'
   | 'no_momentum'
   | 'no_impulse_body'
@@ -305,6 +310,8 @@ export interface WatchlistSymbol {
   dollarVolume?: number;
   lastClose?: number;
   lastOpen?: number;
+  /** Previous session close — Opening Drive gap-down gate (V2). */
+  previousClose?: number;
   preMarketGapPct?: number;
   catalystScore?: number;
   /** Lexicon sentiment of the strongest recent catalyst headline. */

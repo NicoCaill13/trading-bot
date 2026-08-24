@@ -143,8 +143,29 @@ async function executeFullMarketExit(
   return true;
 }
 
+/**
+ * The trail swap cancelled the protective stop and could not replace it. Waiting
+ * for the next bar would leave the position naked for a full minute, so it is
+ * closed at market — a forfeited runner beats an uncovered micro-cap.
+ */
+async function bailOutUnprotected(
+  symbol: string,
+  position: AlpacaPosition,
+  logReason: string,
+  err: trader.UnprotectedPositionError,
+): Promise<void> {
+  log.error(`${symbol}: ${logReason} — ${err.message}`);
+  await executeFullMarketExit(
+    symbol,
+    position,
+    'trail-placement-failed',
+    'trail-placement-failed',
+  );
+}
+
 async function applyTightTrailing(
   symbol: string,
+  position: AlpacaPosition,
   trailPct: number,
   logReason: string,
   appliedSet: Set<string>,
@@ -159,11 +180,19 @@ async function applyTightTrailing(
     );
     void sendTelegramAlert(formatExitAlert(symbol, logReason));
   } catch (err) {
+    if (err instanceof trader.UnprotectedPositionError) {
+      await bailOutUnprotected(symbol, position, logReason, err);
+      return;
+    }
     log.error(`${symbol}: ${logReason} trailing failed — ${toErrorMessage(err)}`);
   }
 }
 
-async function applyAtrTrailing(symbol: string, atrHint: number | null): Promise<void> {
+async function applyAtrTrailing(
+  symbol: string,
+  position: AlpacaPosition,
+  atrHint: number | null,
+): Promise<void> {
   if (atrTrailApplied.has(symbol)) return;
 
   try {
@@ -179,6 +208,10 @@ async function applyAtrTrailing(symbol: string, atrHint: number | null): Promise
     );
     void sendTelegramAlert(formatExitAlert(symbol, 'ATR Trailing Stop'));
   } catch (err) {
+    if (err instanceof trader.UnprotectedPositionError) {
+      await bailOutUnprotected(symbol, position, 'ATR trail', err);
+      return;
+    }
     log.error(`${symbol}: ATR trail failed — ${toErrorMessage(err)}`);
   }
 }
@@ -234,15 +267,29 @@ export async function handlePositionUpdate(
     return;
   }
 
-  // 2 — ATR trailing stop once MFE / unrealized >= trigger (default +1.5%)
+  // 2 — Loose trailing stop once MFE / unrealized >= trigger (default +10%)
   if (
     shouldActivateAtrTrail(unrealizedPct, config.risk.atrTrailTriggerPct) &&
     !atrTrailApplied.has(symbol)
   ) {
-    await applyAtrTrailing(symbol, atrAtEntry);
+    if (config.risk.usePercentTrail) {
+      await applyTightTrailing(
+        symbol,
+        position,
+        config.risk.trailingStopPct,
+        `loose trail ${(config.risk.trailingStopPct * 100).toFixed(0)}%`,
+        atrTrailApplied,
+      );
+    } else {
+      await applyAtrTrailing(symbol, position, atrAtEntry);
+    }
   }
 
-  // 3 — RSI Overbought (full exit)
+  if (!config.risk.smartExitsEnabled) {
+    return;
+  }
+
+  // 3 — RSI Overbought (full exit) — disabled on Hyper-Growth (cuts runners)
   if (unrealizedPct > config.risk.smartExitMinPnlPct) {
     const closes = oneMinBars.map(b => b.close);
     const rsi = computeRsi(closes);
@@ -266,6 +313,7 @@ export async function handlePositionUpdate(
       ) {
         await applyTightTrailing(
           symbol,
+          position,
           config.risk.volumeExhaustionTrailPct,
           'VOLUME_EXHAUSTION_TRAILING',
           volumeExhaustionTrailApplied,
@@ -286,6 +334,7 @@ export async function handlePositionUpdate(
   ) {
     await applyTightTrailing(
       symbol,
+      position,
       config.risk.timeDecayAfternoonTrailPct,
       'Time-Decay afternoon trail',
       afternoonTrailApplied,
@@ -293,7 +342,9 @@ export async function handlePositionUpdate(
     return;
   }
 
-  // 6 — Legacy ATR / fixed 5%/7% scale-out (secondary to V7 bracket TP + ATR trail)
+  if (!config.risk.scaleOutEnabled) return;
+
+  // 6 — Legacy ATR / fixed scale-out (off on Hyper-Growth)
   const atr = atrAtEntry;
   if (atr === null || atr <= 0) return;
 

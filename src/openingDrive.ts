@@ -1,12 +1,9 @@
 /**
- * Opening Drive entry path (#29) — pure decision logic, no I/O, no state.
+ * Opening Drive — ORB 1-min, pure decision logic, no I/O, no state.
  *
- * Arms only on symbols the screener tagged `isStraightRun`: names that grind up
- * daily without offering the VWAP pullback Core V7 waits for. Everything Core
- * relies on (pullback tracking, Fibonacci support, VWAP proximity) is absent
- * here by design — this path buys continuation, not mean reversion.
- *
- * The caller owns all session state; this module only judges a snapshot.
+ * Hyper-Growth cash path: buy the break of the first regular-session 1-min
+ * high between 09:30 and 09:45 EST, only when volume or the book accelerates.
+ * The caller owns session state; this module only judges a snapshot.
  */
 
 import type { BarData, OpeningDriveDecision, OpeningDriveRejection } from './types';
@@ -15,14 +12,16 @@ export interface OpeningDriveContext {
   symbol: string;
   /** Minutes since NY midnight for the impulse bar's own timestamp. */
   barMinutesSinceMidnight: number;
-  isStraightRun: boolean;
-  /** 0..1 quality of the daily run, used to rank competing candidates. */
-  straightRunScore: number;
-  /** Previous session close, from the screener snapshot. */
+  /**
+   * First regular-session 1-min bar (the opening range). Null until captured.
+   * The impulse bar must be a later bar — the range bar itself never arms.
+   */
+  rangeBar: BarData | null;
+  /** Previous session close, from the pre-market snapshot. */
   previousClose: number | null;
   /** Open of the first regular-session 1-min bar of the day. */
   sessionOpen: number | null;
-  /** Session VWAP — the anti-chase reference; required to reach a decision. */
+  /** Session VWAP — anti-chase reference; required to reach a decision. */
   sessionVwap: number | null;
   /** The 1-min bar being evaluated; must be the last of `oneMinBars`. */
   impulseBar: BarData;
@@ -36,14 +35,18 @@ export interface OpeningDriveOptions {
   windowEndMinutes: number;
   minRvol1m: number;
   minImbalance: number;
-  /** Max tolerated distance above session VWAP, not above the session open. */
+  /** Max tolerated distance above session VWAP. */
   maxExtensionPct: number;
   rvolBaselineBars: number;
   /**
+   * Break-bar volume must be at least this multiple of the first-minute volume
+   * when 1-min RVOL and book imbalance are both unavailable or short.
+   */
+  minOrbVolumeMultiple: number;
+  /**
    * Minimum stop distance, as a fraction of entry. Applied here so the decision
-   * reports the stop that will actually be used: impulse-bar lows are routinely
-   * a few basis points away, and a shadow verdict measured against the raw low
-   * would report stop-outs the live path would never take.
+   * reports the stop that will actually be used: a first-minute low a few
+   * basis points away would otherwise inflate size.
    */
   hardStopFloorPct: number;
 }
@@ -67,9 +70,8 @@ function reject(
 /**
  * Volume of the impulse bar over the mean of the bars preceding it.
  *
- * Deliberately not reusing the 5-minute RVOL helper: that one runs on a 5-bar
- * baseline suited to the Core path, which on 1-minute data would be a 5-minute
- * reference — far too short to tell an opening drive from ordinary noise.
+ * Premarket bars in `oneMinBars` are a valid baseline at 09:31 — that is the
+ * only history the opening print has.
  */
 export function computeOneMinuteRvol(
   bars: readonly BarData[],
@@ -87,70 +89,76 @@ export function computeOneMinuteRvol(
   return impulse.volume / meanVolume;
 }
 
+export function computeOrbVolumeMultiple(
+  impulseVolume: number,
+  rangeVolume: number,
+): number | null {
+  if (impulseVolume < 0 || rangeVolume <= 0) return null;
+  return impulseVolume / rangeVolume;
+}
+
 /**
  * Checks run cheapest-first, with one hard constraint: `max_extension` is last.
- * Shadow mode counts setups carrying that code to decide whether the anti-chase
- * cap is rejecting winners, so the code must mean "only the cap stopped this".
+ * A setup carrying that code satisfied every other condition.
  */
 export function evaluateOpeningDrive(
   ctx: OpeningDriveContext,
   opts: OpeningDriveOptions,
 ): OpeningDriveDecision {
-  if (!ctx.isStraightRun) return reject('not_straight_run');
-
   const { barMinutesSinceMidnight: minutes } = ctx;
   if (minutes < opts.windowStartMinutes || minutes > opts.windowEndMinutes) {
     return reject('outside_window');
   }
 
-  const { sessionOpen, sessionVwap, impulseBar } = ctx;
+  const { sessionOpen, sessionVwap, impulseBar, rangeBar } = ctx;
   if (sessionOpen === null || sessionOpen <= 0) return reject('insufficient_data');
   if (sessionVwap === null || sessionVwap <= 0) return reject('insufficient_data');
 
   const price = impulseBar.close;
   if (price <= 0) return reject('insufficient_data');
 
-  // The tag was earned on yesterday's closes. An open below that close means the
-  // run is already broken, so the tag is stale and must not arm anything.
   if (ctx.previousClose !== null && sessionOpen < ctx.previousClose) {
     return reject('gap_down');
   }
 
-  // Holding above either reference is enough: a name that gapped up and drifted
-  // under its open can still be leading if it sits above session VWAP.
-  if (price <= sessionOpen && price <= sessionVwap) return reject('open_broken');
+  if (rangeBar === null || rangeBar.high <= 0) return reject('orb_not_ready');
+  if (impulseBar.timestamp === rangeBar.timestamp) return reject('orb_not_ready');
+
+  if (price <= sessionOpen) return reject('open_broken');
 
   const rvol1m = computeOneMinuteRvol(ctx.oneMinBars, opts.rvolBaselineBars);
   const imbalance = ctx.imbalance;
-  // Measured against VWAP, not the session open. An open-anchored cap grows
-  // stale by construction: the window starts 15 minutes after the open, which on
-  // a genuine drive is long enough to clear any tight cap, so the cap would
-  // reject exactly the moves this path exists to take. VWAP rises with the
-  // drive, which keeps the guard meaningful at any point in the window.
   const extensionPct = (price - sessionVwap) / sessionVwap;
   const observed = { extensionPct, rvol1m, imbalance, entryPrice: price };
 
-  const hasVolumeSurge = rvol1m !== null && rvol1m > opts.minRvol1m;
-  const hasBuyPressure = imbalance !== null && imbalance >= opts.minImbalance;
-  if (!hasVolumeSurge && !hasBuyPressure) return reject('no_momentum', observed);
+  if (price <= rangeBar.high) return reject('no_breakout', observed);
 
-  // An impulse bar with no upward body is not an impulse, whatever its volume.
+  const vsRange = computeOrbVolumeMultiple(impulseBar.volume, rangeBar.volume);
+  const hasRvolSurge = rvol1m !== null && rvol1m > opts.minRvol1m;
+  const hasOrbVolumeSurge =
+    vsRange !== null && vsRange >= opts.minOrbVolumeMultiple;
+  const hasBuyPressure = imbalance !== null && imbalance >= opts.minImbalance;
+  if (!hasRvolSurge && !hasOrbVolumeSurge && !hasBuyPressure) {
+    return reject('no_momentum', observed);
+  }
+
   if (!(impulseBar.low > 0) || impulseBar.low >= price) {
     return reject('no_impulse_body', observed);
   }
 
-  // The wider of the structural low and the floor, matching what
-  // `computePositionSize` will derive, so shadow and live agree on the risk.
-  const stopPrice = Math.min(impulseBar.low, price * (1 - opts.hardStopFloorPct));
+  const floorStop = price * (1 - opts.hardStopFloorPct);
+  const structuralStop = rangeBar.low > 0 && rangeBar.low < price
+    ? rangeBar.low
+    : impulseBar.low;
+  const stopPrice = Math.min(structuralStop, floorStop);
 
   if (extensionPct > opts.maxExtensionPct) {
     return reject('max_extension', { ...observed, stopPrice });
   }
 
-  // Volume-weighted conviction, same magnitude family as the ORB score so both
-  // Satellite paths remain comparable if they ever land in the same flush.
-  const conviction = Math.max(0, (rvol1m ?? 1) - 1);
-  const score = impulseBar.volume * conviction * Math.max(ctx.straightRunScore, 0.1);
+  const breakPct = (price - rangeBar.high) / rangeBar.high;
+  const volumeConviction = Math.max(vsRange ?? 1, rvol1m ?? 1);
+  const score = impulseBar.volume * Math.max(breakPct, 0) * volumeConviction;
 
   return {
     armed: true,

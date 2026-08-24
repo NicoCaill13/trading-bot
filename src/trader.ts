@@ -52,9 +52,20 @@ function isPreMarketPeriod(): boolean {
   );
 }
 
-export async function getSettledCash(): Promise<number> {
+/**
+ * Cash the broker will accept for a new order right now.
+ *
+ * Reads `buying_power`, not `cash`: `cash` only moves once an order fills, so
+ * sizing ticket #2 against it double-spends the money already committed by an
+ * unfilled ticket #1. `buying_power` nets open orders.
+ *
+ * Alpaca has no true cash accounts — this figure carries the account multiplier
+ * and can exceed equity. Staying unleveraged is the notional cap's job
+ * (capQtyByMaxNotional against equity × MAX_POSITION_PCT), not this function's.
+ */
+export async function getAvailableBuyingPower(): Promise<number> {
   const account = await alpaca.getAccount();
-  return parseFloat(account.cash);
+  return parseFloat(account.buying_power);
 }
 
 export async function getAccountEquity(): Promise<number> {
@@ -452,8 +463,8 @@ export async function placeBracketOrder(
       ? prefetchedAskPrice
       : await fetchLiveAskPrice(symbol, signalPrice);
 
-  const [settledCash, positions] = await Promise.all([
-    getSettledCash(),
+  const [availableBuyingPower, positions] = await Promise.all([
+    getAvailableBuyingPower(),
     getOpenPositions(),
   ]);
 
@@ -470,14 +481,16 @@ export async function placeBracketOrder(
   const limitPrice = computeMarketableLimitPrice(liveAskPrice);
 
   const requiredCash = limitPrice * qty;
-  if (requiredCash > settledCash) {
+  if (requiredCash > availableBuyingPower) {
     throw new Error(
-      `Insufficient cash for ${symbol}: need $${requiredCash.toFixed(2)}, ` +
-      `available $${settledCash.toFixed(2)}`,
+      `Insufficient buying power for ${symbol}: need $${requiredCash.toFixed(2)}, ` +
+      `available $${availableBuyingPower.toFixed(2)}`,
     );
   }
 
-  // order_class 'bracket': entry + stop_loss + take_profit (V7 R:R objective).
+  // Hyper-Growth: OTO (entry + hard stop) so a bracket TP cannot cap a runner.
+  // Legacy V7 keeps the full bracket when TAKE_PROFIT_ENABLED=true.
+  const stopPrice = parseFloat(stopLossPrice.toFixed(2));
   const orderParams: AlpacaOrderParams = {
     symbol,
     qty: String(qty),
@@ -485,19 +498,20 @@ export async function placeBracketOrder(
     type: 'limit',
     time_in_force: 'day',
     limit_price: String(limitPrice),
-    order_class: 'bracket',
+    order_class: config.risk.takeProfitEnabled ? 'bracket' : 'oto',
     stop_loss: {
-      stop_price: String(parseFloat(stopLossPrice.toFixed(2))),
+      stop_price: String(stopPrice),
     },
-    take_profit: {
-      limit_price: String(parseFloat(takeProfitPrice.toFixed(2))),
-    },
+    ...(config.risk.takeProfitEnabled
+      ? { take_profit: { limit_price: String(parseFloat(takeProfitPrice.toFixed(2))) } }
+      : {}),
   };
 
   log.info(
-    `Bracket entry [${setup}] — ${symbol} qty:${qty} ` +
+    `${config.risk.takeProfitEnabled ? 'Bracket' : 'OTO'} entry [${setup}] — ${symbol} qty:${qty} ` +
     `limit:$${limitPrice.toFixed(2)} (ask $${liveAskPrice.toFixed(2)} × ${config.entry.marketableLimitVwapMultiplier}) ` +
-    `stop-loss:$${stopLossPrice.toFixed(2)} take-profit:$${takeProfitPrice.toFixed(2)}`,
+    `stop-loss:$${stopPrice.toFixed(2)}` +
+    (config.risk.takeProfitEnabled ? ` take-profit:$${takeProfitPrice.toFixed(2)}` : ' (no TP cap)'),
   );
 
   const order = await enqueueOrder(orderParams);
@@ -537,14 +551,34 @@ export async function placeSellOrder(
 }
 
 /**
- * Cancels all open orders for a symbol, then places a trailing stop
- * on the remaining position.
- *
- * @param trailPercent - distance as decimal (e.g. 0.015 = 1.5%)
+ * Signals that the protective stop is gone and its trailing replacement could
+ * not be placed: the position is live and naked. Callers must exit it rather
+ * than wait for the next bar — retrying leaves the position uncovered meanwhile.
  */
-export async function replaceWithTrailingStop(
+export class UnprotectedPositionError extends Error {
+  constructor(symbol: string, cause: string) {
+    super(
+      `${symbol}: protective stop cancelled but trailing stop could not be placed — ${cause}`,
+    );
+    this.name = 'UnprotectedPositionError';
+  }
+}
+
+const TRAIL_PLACEMENT_ATTEMPTS = 3;
+const TRAIL_RETRY_BACKOFF_MS = 400;
+
+/**
+ * Swaps the protective stop for a trailing stop on the whole remaining position.
+ *
+ * Alpaca rejects a second sell order while `held_for_orders` still covers the
+ * position, so the existing stop must be cancelled first. That opens a window
+ * where nothing protects the position: placement is retried before giving up,
+ * and giving up raises UnprotectedPositionError rather than returning quietly.
+ */
+async function replaceProtectiveStopWithTrailing(
   symbol: string,
-  trailPercent: number,
+  trail: { trail_percent: string } | { trail_price: string },
+  label: string,
 ): Promise<AlpacaOrder | null> {
   await cancelOrdersForSymbol(symbol);
 
@@ -565,18 +599,50 @@ export async function replaceWithTrailingStop(
     side: 'sell',
     type: 'trailing_stop',
     time_in_force: 'gtc',
-    trail_percent: String((trailPercent * 100).toFixed(2)),
+    ...trail,
   };
 
-  log.info(
-    `Trailing stop activated — ${symbol} ${(trailPercent * 100).toFixed(2)}% ` +
-    `on ${remainingQty} shares`,
-  );
-  return enqueueOrder(orderParams);
+  let lastError = 'unknown error';
+  for (let attempt = 1; attempt <= TRAIL_PLACEMENT_ATTEMPTS; attempt++) {
+    try {
+      const order = await enqueueOrder(orderParams);
+      log.info(
+        `Trailing stop activated — ${symbol} ${label} on ${remainingQty} shares`,
+      );
+      return order;
+    } catch (err) {
+      lastError = toErrorMessage(err);
+      log.warn(
+        `${symbol}: trailing stop placement failed ` +
+        `(attempt ${attempt}/${TRAIL_PLACEMENT_ATTEMPTS}) — ${lastError}`,
+      );
+      if (attempt < TRAIL_PLACEMENT_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, TRAIL_RETRY_BACKOFF_MS * attempt));
+      }
+    }
+  }
+
+  throw new UnprotectedPositionError(symbol, lastError);
 }
 
 /**
- * Cancels open orders, then places a dollar trailing stop (Alpaca trail_price).
+ * Percent trailing stop (Alpaca trail_percent).
+ *
+ * @param trailPercent - distance as decimal (e.g. 0.015 = 1.5%)
+ */
+export async function replaceWithTrailingStop(
+  symbol: string,
+  trailPercent: number,
+): Promise<AlpacaOrder | null> {
+  return replaceProtectiveStopWithTrailing(
+    symbol,
+    { trail_percent: String((trailPercent * 100).toFixed(2)) },
+    `${(trailPercent * 100).toFixed(2)}%`,
+  );
+}
+
+/**
+ * Dollar trailing stop (Alpaca trail_price).
  * Used for V7 ATR trail: trailDollars = atrTrailMultiplier × ATR_5m.
  */
 export async function replaceWithAtrTrailingStop(
@@ -587,33 +653,11 @@ export async function replaceWithAtrTrailingStop(
     throw new Error(`${symbol}: ATR trail dollars must be > 0 (got ${trailDollars})`);
   }
 
-  await cancelOrdersForSymbol(symbol);
-
-  let position: AlpacaPosition;
-  try {
-    position = await alpaca.getPosition(symbol);
-  } catch {
-    log.info(`${symbol}: no position found for ATR trailing stop`);
-    return null;
-  }
-
-  const remainingQty = parseInt(position.qty, 10);
-  if (remainingQty <= 0) return null;
-
-  const orderParams: AlpacaOrderParams = {
+  return replaceProtectiveStopWithTrailing(
     symbol,
-    qty: String(remainingQty),
-    side: 'sell',
-    type: 'trailing_stop',
-    time_in_force: 'gtc',
-    trail_price: String(parseFloat(trailDollars.toFixed(2))),
-  };
-
-  log.info(
-    `ATR trailing stop activated — ${symbol} trail_price:$${trailDollars.toFixed(2)} ` +
-    `on ${remainingQty} shares`,
+    { trail_price: String(parseFloat(trailDollars.toFixed(2))) },
+    `trail_price:$${trailDollars.toFixed(2)}`,
   );
-  return enqueueOrder(orderParams);
 }
 
 // ---------------------------------------------------------------------------

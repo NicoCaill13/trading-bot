@@ -1,7 +1,6 @@
 /**
- * Throwaway calibration harness (#29): replays the Opening Drive decision over
- * real 1-min IEX bars, forcing the STRAIGHT_RUN tag so the path can be exercised
- * before tonight's screener writes it.
+ * Calibration harness: replays the Opening Drive ORB 1-min decision over
+ * real 1-min IEX bars.
  *
  * Usage: npx tsx scripts/replayOpeningDrive.ts WDC 2026-08-17
  */
@@ -29,6 +28,7 @@ const opts = {
   minImbalance: config.openingDrive.minImbalance,
   maxExtensionPct: config.openingDrive.maxExtensionPct,
   rvolBaselineBars: config.openingDrive.rvolBaselineBars,
+  minOrbVolumeMultiple: config.openingDrive.minOrbVolumeMultiple,
   hardStopFloorPct: config.risk.hardStopFloorPct,
 };
 
@@ -38,7 +38,7 @@ async function main(): Promise<void> {
     start: `${day}T08:00:00Z`,
     end: `${day}T21:00:00Z`,
     timeframe: '1Min',
-    feed: 'iex',
+    feed: config.alpaca.dataFeed,
     limit: 1000,
   });
 
@@ -55,6 +55,7 @@ async function main(): Promise<void> {
 
   const openMinutes = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
   let sessionOpen: number | null = null;
+  let rangeBar: BarData | null = null;
   const history: BarData[] = [];
   const rth: BarData[] = [];
 
@@ -90,8 +91,9 @@ async function main(): Promise<void> {
     if (minutes < openMinutes) continue;
     if (sessionOpen === null) {
       sessionOpen = bar.open;
+      rangeBar = bar;
       console.log(
-        `  session open $${sessionOpen.toFixed(2)} at ` +
+        `  session open $${sessionOpen.toFixed(2)} ORB1m high $${bar.high.toFixed(2)} at ` +
         `${String(minutes / 60 | 0).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')} EST`,
       );
     }
@@ -105,8 +107,7 @@ async function main(): Promise<void> {
     const ctx: OpeningDriveContext = {
       symbol,
       barMinutesSinceMidnight: minutes,
-      isStraightRun: true,
-      straightRunScore: 0.8,
+      rangeBar,
       previousClose: null,
       sessionOpen,
       sessionVwap: vwap,
@@ -143,7 +144,7 @@ async function main(): Promise<void> {
             symbol,
             signalAt: bar.timestamp,
             decision: d,
-            straightRunScore: ctx.straightRunScore,
+            straightRunScore: 0,
             rejectedBy,
             horizonMinutes: config.openingDrive.shadowHorizonMinutes,
           }),

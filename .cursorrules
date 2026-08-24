@@ -13,7 +13,7 @@ Le projet doit être strictement découpé en 5 modules :
 ### 📂 `config.ts` (Le Centre de Contrôle)
 Centralise les variables d'environnement (`process.env`) et les constantes mathématiques.
 - **Validation :** Utilise une IIFE pour valider la présence et la cohérence des variables au démarrage.
-- **Paramètres :** Max 5 positions, Sizing basé sur 1% du capital avec distance ATR, Target Scale-Out +3%, Stop-Loss plancher -1.5%, Circuit Breaker +1% PnL.
+- **Paramètres (Hyper-Growth Cash) :** Max 2 positions (T+1), sizing 20% equity / stop, pas de TP bracket, trailing lâche 12% après +10%, stop plancher -2.5%, kill-switch -20% / -$40.
 
 ## 2. STANDARDS DE SÉCURITÉ, LATENCE ET OBSERVABILITÉ
 - **Asynchronisme pur & Non-Blocking :** Syntaxe `async/await`. L'Event Loop de Node/Bun ne doit jamais être bloquée. Les calculs lourds doivent être optimisés.

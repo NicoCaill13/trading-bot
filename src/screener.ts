@@ -14,9 +14,9 @@ import {
   computeAdrPct,
   isAllowedExchange,
   passesAdrGate,
-  passesClosePrice,
   passesDollarVolume,
   passesFloatGate,
+  passesPriceBand,
 } from './screenerMath';
 import {
   assessWeinsteinPhase2,
@@ -52,11 +52,15 @@ const SNAPSHOT_BATCH_SIZE = 100;
 const ANALYSIS_CONCURRENCY = 5;
 
 function dailyBarsNeeded(lookbackDays: number): number {
-  const slopeBars = getSma150SlopeLookbackBars();
+  const weinsteinBars = config.screener.weinsteinGateEnabled
+    ? config.screener.sma200Period + getSma150SlopeLookbackBars()
+    : 0;
+  const adrBars = config.screener.adrGateEnabled ? config.screener.adrLookbackDays : 0;
   return Math.max(
     lookbackDays + config.screener.volumeAverageDays + 2,
-    config.screener.adrLookbackDays,
-    config.screener.sma200Period + slopeBars,
+    adrBars,
+    weinsteinBars,
+    2,
   );
 }
 
@@ -120,8 +124,8 @@ export async function getDynamicUniverse(): Promise<string[]> {
 export async function preFilterByLiquidity(symbols: string[]): Promise<string[]> {
   log.info(
     `Liquidity pre-filter on ${symbols.length} symbols ` +
-    `(close ≥ $${config.screener.minClosePrice}, ` +
-    `DV ≥ $${(config.screener.minDollarVolume / 1_000_000).toFixed(0)}M)...`,
+    `(close $${config.screener.minClosePrice}–$${config.screener.maxClosePrice}, ` +
+    `DV ≥ $${(config.screener.minDollarVolume / 1_000_000).toFixed(1)}M)...`,
   );
 
   const qualified: string[] = [];
@@ -149,7 +153,7 @@ export async function preFilterByLiquidity(symbols: string[]): Promise<string[]>
         const close = bar.ClosePrice;
         const volume = bar.Volume;
 
-        if (!passesClosePrice(close, config.screener.minClosePrice)) {
+        if (!passesPriceBand(close, config.screener.minClosePrice, config.screener.maxClosePrice)) {
           rejectedPrice++;
           continue;
         }
@@ -259,7 +263,7 @@ async function fetchDailyBarsFromApi(
     start: eod.startDay,
     end: eod.tradingDay,
     timeframe: '1Day',
-    feed: 'iex',
+    feed: config.alpaca.dataFeed,
     // Raw when we own the rescaling: the broker's own split adjustment is
     // applied relative to the requested range, so it moves when the range does.
     adjustment: eod.splits.mode === 'own' ? 'raw' : 'split',
@@ -361,11 +365,10 @@ async function analyzeSymbol(
     const lastClose = lastBar.ClosePrice;
     const lastVolume = lastBar.Volume;
 
-    // Double liquidity check on actual historical data
-    if (!passesClosePrice(lastClose, config.screener.minClosePrice)) {
+    if (!passesPriceBand(lastClose, config.screener.minClosePrice, config.screener.maxClosePrice)) {
       log.info(
         `${ticker} REJECTED — price $${lastClose.toFixed(2)} ` +
-        `below $${config.screener.minClosePrice} floor`,
+        `outside $${config.screener.minClosePrice}–$${config.screener.maxClosePrice}`,
       );
       return null;
     }
@@ -385,19 +388,21 @@ async function analyzeSymbol(
       bars.map(b => ({ high: b.HighPrice, low: b.LowPrice, close: b.ClosePrice })),
       config.screener.adrLookbackDays,
     );
-    if (adrPct === null) {
-      log.info(
-        `${ticker} REJECTED — ADR unavailable ` +
-        `(need ${config.screener.adrLookbackDays} daily bars)`,
-      );
-      return null;
-    }
-    if (!passesAdrGate(adrPct, config.screener.minAdrPct)) {
-      log.info(
-        `${ticker} REJECTED — ADR ${adrPct.toFixed(2)}% ` +
-        `<= ${config.screener.minAdrPct.toFixed(1)}% floor`,
-      );
-      return null;
+    if (config.screener.adrGateEnabled) {
+      if (adrPct === null) {
+        log.info(
+          `${ticker} REJECTED — ADR unavailable ` +
+          `(need ${config.screener.adrLookbackDays} daily bars)`,
+        );
+        return null;
+      }
+      if (!passesAdrGate(adrPct, config.screener.minAdrPct)) {
+        log.info(
+          `${ticker} REJECTED — ADR ${adrPct.toFixed(2)}% ` +
+          `<= ${config.screener.minAdrPct.toFixed(1)}% floor`,
+        );
+        return null;
+      }
     }
 
     tally.clearedAdr++;
@@ -420,37 +425,41 @@ async function analyzeSymbol(
     }
 
     const closes = bars.map(b => b.ClosePrice);
-    const weinstein = assessWeinsteinPhase2(closes, {
-      sma150Period: config.screener.sma150Period,
-      sma200Period: config.screener.sma200Period,
-      slopeLookbackBars: getSma150SlopeLookbackBars(),
-    });
-    if (weinstein === null) {
-      weinsteinLog.info(
-        `${ticker} REJECTED — insufficient history for SMA150/200 + slope ` +
-        `(need ${config.screener.sma200Period + getSma150SlopeLookbackBars()} closes)`,
-      );
-      return null;
-    }
-    if (!passesWeinsteinGate(weinstein)) {
-      const reasons: string[] = [];
-      if (!weinstein.priceAboveSmas) {
-        reasons.push(
-          `close $${weinstein.lastClose.toFixed(2)} <= SMA150 $${weinstein.sma150.toFixed(2)} ` +
-          `or SMA200 $${weinstein.sma200.toFixed(2)}`,
+    const weinstein = config.screener.weinsteinGateEnabled
+      ? assessWeinsteinPhase2(closes, {
+          sma150Period: config.screener.sma150Period,
+          sma200Period: config.screener.sma200Period,
+          slopeLookbackBars: getSma150SlopeLookbackBars(),
+        })
+      : null;
+    if (config.screener.weinsteinGateEnabled) {
+      if (weinstein === null) {
+        weinsteinLog.info(
+          `${ticker} REJECTED — insufficient history for SMA150/200 + slope ` +
+          `(need ${config.screener.sma200Period + getSma150SlopeLookbackBars()} closes)`,
         );
+        return null;
       }
-      if (!weinstein.slopeNonNegative) {
-        reasons.push(`SMA150 slope ${weinstein.sma150Slope.toFixed(4)} < 0`);
+      if (!passesWeinsteinGate(weinstein)) {
+        const reasons: string[] = [];
+        if (!weinstein.priceAboveSmas) {
+          reasons.push(
+            `close $${weinstein.lastClose.toFixed(2)} <= SMA150 $${weinstein.sma150.toFixed(2)} ` +
+            `or SMA200 $${weinstein.sma200.toFixed(2)}`,
+          );
+        }
+        if (!weinstein.slopeNonNegative) {
+          reasons.push(`SMA150 slope ${weinstein.sma150Slope.toFixed(4)} < 0`);
+        }
+        weinsteinLog.info(`${ticker} REJECTED — ${reasons.join('; ')}`);
+        return null;
       }
-      weinsteinLog.info(`${ticker} REJECTED — ${reasons.join('; ')}`);
-      return null;
+      weinsteinLog.info(
+        `${ticker} PASS — close $${weinstein.lastClose.toFixed(2)} ` +
+        `> SMA150 $${weinstein.sma150.toFixed(2)} & SMA200 $${weinstein.sma200.toFixed(2)} ` +
+        `| slope ${weinstein.sma150Slope.toFixed(4)}`,
+      );
     }
-    weinsteinLog.info(
-      `${ticker} PASS — close $${weinstein.lastClose.toFixed(2)} ` +
-      `> SMA150 $${weinstein.sma150.toFixed(2)} & SMA200 $${weinstein.sma200.toFixed(2)} ` +
-      `| slope ${weinstein.sma150Slope.toFixed(4)}`,
-    );
     tally.clearedPhase2++;
 
     const straightRun = assessStraightRun(
@@ -583,12 +592,12 @@ async function analyzeSymbol(
       dollarVolume: lastClose * lastVolume,
       lastClose,
       lastOpen: lastBar.OpenPrice,
-      adrPct,
+      adrPct: adrPct ?? undefined,
       floatShares,
       exchange,
-      sma150: weinstein.sma150,
-      sma200: weinstein.sma200,
-      sma150Slope: weinstein.sma150Slope,
+      sma150: weinstein?.sma150,
+      sma200: weinstein?.sma200,
+      sma150Slope: weinstein?.sma150Slope,
       reversalPattern,
       reversalDetail,
       continuationPattern,

@@ -1,6 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldActivateAtrTrail, shouldTriggerTimeStop } from '../src/exitPredicates';
+import {
+  computeTrailLockedPct,
+  shouldActivateAtrTrail,
+  shouldTriggerTimeStop,
+} from '../src/exitPredicates';
 
 describe('shouldTriggerTimeStop', () => {
   const entry = '2026-08-08T14:00:00.000Z';
@@ -31,5 +35,26 @@ describe('shouldActivateAtrTrail', () => {
 
   it('stays inactive below trigger', () => {
     assert.equal(shouldActivateAtrTrail(0.014, 0.015), false);
+  });
+});
+
+describe('computeTrailLockedPct', () => {
+  it('reports a loss when the trail is armed below its own width', () => {
+    // The rejected Hyper-Growth pairing: +10% trigger with a 12% trail lands the
+    // stop under entry, looser than the 2.5% hard floor it replaces.
+    const locked = computeTrailLockedPct(0.10, 0.12);
+    assert.ok(locked < 0, `expected a negative lock, got ${locked}`);
+    assert.ok(Math.abs(locked - -0.032) < 1e-9);
+  });
+
+  it('is flat exactly at trail / (1 - trail)', () => {
+    const trail = 0.12;
+    const breakEvenTrigger = trail / (1 - trail);
+    assert.ok(Math.abs(computeTrailLockedPct(breakEvenTrigger, trail)) < 1e-12);
+  });
+
+  it('locks a gain at the shipped 20% / 12% pairing', () => {
+    const locked = computeTrailLockedPct(0.20, 0.12);
+    assert.ok(Math.abs(locked - 0.056) < 1e-9, `got ${locked}`);
   });
 });

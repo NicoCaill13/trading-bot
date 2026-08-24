@@ -1,6 +1,7 @@
 import { ATR } from 'technicalindicators';
 import alpaca from './alpacaClient';
 import config from './config';
+import { clampQueryEnd } from './utils';
 
 /** Calendar days of 5m history — prior sessions included for ATR warmup at the open. */
 const ATR_5M_LOOKBACK_DAYS = 7;
@@ -8,7 +9,11 @@ const ATR_5M_LOOKBACK_DAYS = 7;
 export async function fetchAtr5m(symbol: string): Promise<number> {
   const period = config.indicators.atrPeriod;
   const minBars = period + 1;
-  const end = new Date();
+  const end = clampQueryEnd(
+    new Date(),
+    config.alpaca.streamFeed,
+    config.alpaca.sipDelayMs,
+  );
   const start = new Date();
   start.setDate(start.getDate() - ATR_5M_LOOKBACK_DAYS);
 
@@ -20,7 +25,7 @@ export async function fetchAtr5m(symbol: string): Promise<number> {
     start: start.toISOString(),
     end: end.toISOString(),
     timeframe: '5Min',
-    feed: 'iex',
+    feed: config.alpaca.streamFeed,
   });
 
   for await (const bar of iter) {

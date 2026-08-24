@@ -41,6 +41,15 @@ export function passesClosePrice(close: number, minPrice: number): boolean {
   return close >= minPrice;
 }
 
+/** Inclusive price band [minPrice, maxPrice]. */
+export function passesPriceBand(
+  price: number,
+  minPrice: number,
+  maxPrice: number,
+): boolean {
+  return price >= minPrice && price <= maxPrice;
+}
+
 export function passesDollarVolume(
   close: number,
   volume: number,

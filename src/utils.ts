@@ -75,6 +75,38 @@ function nyOffsetMsAt(instant: Date): number {
   return asUtc - instant.getTime();
 }
 
+/**
+ * Latest instant a feed will actually serve, for a requested query end.
+ *
+ * A SIP plan without real-time entitlement rejects any window whose end falls
+ * inside the delay period, and rejects the whole request with 403 rather than
+ * truncating it. Callers must clamp up front: the failure is indistinguishable
+ * from a credentials problem once it surfaces.
+ */
+export function clampQueryEnd(
+  requestedEnd: Date,
+  feed: 'iex' | 'sip',
+  sipDelayMs: number,
+  now: Date = new Date(),
+): Date {
+  if (feed !== 'sip') return requestedEnd;
+  const latest = new Date(now.getTime() - sipDelayMs);
+  return requestedEnd.getTime() > latest.getTime() ? latest : requestedEnd;
+}
+
+/**
+ * True when the stock stream refused the feed for licensing, not credentials.
+ * Alpaca returns this on `v2/sip` without Algo Trader Plus (code 409).
+ */
+export function isSipStreamDenied(code: number, message: string): boolean {
+  if (code === 409) return true;
+  const text = message.toLowerCase();
+  return (
+    text.includes('insufficient subscription') ||
+    text.includes('subscription does not permit')
+  );
+}
+
 /** Order failures that must not be retried on the next flush (blackout defer loop). */
 export function isNonRetryableOrderError(message: string): boolean {
   return (

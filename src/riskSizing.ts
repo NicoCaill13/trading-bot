@@ -2,6 +2,25 @@
  * Pure V7 risk sizing helpers — no I/O, unit-testable.
  */
 
+/**
+ * Capital this strategy is allowed to deploy.
+ *
+ * A paper account funded far above the live account silently invalidates every
+ * session test: tickets grow to a size no micro-cap book can absorb, and the
+ * integer-share rounding that dominates at small size never shows up. Clamping
+ * here keeps sizing, the notional cap and the dollar drawdown limit consistent
+ * with the account the strategy is actually meant to run on.
+ *
+ * A cap of 0 means "use the whole account".
+ */
+export function resolveSizingCapital(
+  accountEquity: number,
+  strategyCapitalUsd: number,
+): number {
+  if (strategyCapitalUsd <= 0) return accountEquity;
+  return Math.min(accountEquity, strategyCapitalUsd);
+}
+
 export function computeRiskBasedQty(
   equity: number,
   riskPct: number,
@@ -37,13 +56,13 @@ export function passesMinRiskReward(
   return rewardDistance / stopDistance >= minRiskRewardRatio;
 }
 
-export function capQtyBySettledCash(
+export function capQtyByBuyingPower(
   qty: number,
   entryPrice: number,
-  settledCash: number,
+  availableBuyingPower: number,
 ): number {
-  if (qty < 1 || entryPrice <= 0 || settledCash <= 0) return 0;
-  return Math.min(qty, Math.floor(settledCash / entryPrice));
+  if (qty < 1 || entryPrice <= 0 || availableBuyingPower <= 0) return 0;
+  return Math.min(qty, Math.floor(availableBuyingPower / entryPrice));
 }
 
 /**

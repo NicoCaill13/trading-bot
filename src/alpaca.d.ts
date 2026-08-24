@@ -73,6 +73,16 @@ declare module '@alpacahq/alpaca-trade-api' {
   export interface AlpacaAccount {
     cash: string;
     equity: string;
+    /**
+     * Cash available for new orders, net of open orders. Alpaca opens every
+     * account as margin or limited-margin, so this is `multiplier × equity` and
+     * may exceed `cash` — the notional cap is what keeps sizing unleveraged.
+     */
+    buying_power: string;
+    /** Buying power excluding leverage. Equals equity on a flat account. */
+    non_marginable_buying_power: string;
+    /** "1" on a cash-like account, "2" or "4" once margin is granted. */
+    multiplier: string;
   }
 
   export interface AlpacaOrderParams {

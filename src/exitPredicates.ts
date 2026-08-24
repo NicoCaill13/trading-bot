@@ -26,3 +26,19 @@ export function shouldActivateAtrTrail(
 ): boolean {
   return unrealizedPct >= atrTrailTriggerPct;
 }
+
+/**
+ * Gain locked in, as a fraction of entry, the moment a percent trail is armed.
+ *
+ * The broker anchors `trail_percent` on the high-water mark, so arming at +T
+ * with a trail of R immediately places the stop at (1+T)(1−R) − 1 relative to
+ * entry. A non-positive result means arming the trail replaces the protective
+ * stop with a looser one: the position can then travel from a gain to a loss
+ * without any exit firing.
+ */
+export function computeTrailLockedPct(
+  triggerPct: number,
+  trailPct: number,
+): number {
+  return (1 + triggerPct) * (1 - trailPct) - 1;
+}

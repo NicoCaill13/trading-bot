@@ -2,10 +2,11 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getDynamicUniverse } from './screener';
 import { createLogger } from './logger';
-import { getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
-import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin } from './watchlistIO';
+import { clampQueryEnd, getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
+import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin, writePremarketWatchlist } from './watchlistIO';
+import { queryRequiredWatchlistTradingDay } from './marketCalendar';
 import { notifyWatchlistSaved } from './notificationManager';
-import { passesClosePrice, sumShareVolume } from './screenerMath';
+import { passesPriceBand, sumShareVolume } from './screenerMath';
 import { createNewsProvider } from './newsProvider';
 import { filterWatchlistByBullishCatalyst } from './sentiment';
 import type { Watchlist, WatchlistSymbol } from './types';
@@ -62,14 +63,19 @@ function extractPreviousClose(snap: AlpacaSnapshot): number | null {
 async function fetchPremarketShareVolume(symbol: string): Promise<number> {
   const estDay = getESTDate();
   const start = nyWallTimeToUtc(estDay, 4, 0);
-  const end = nyWallTimeToUtc(estDay, 9, 30);
+  // Runs at ~09:15, so a delayed SIP plan would 403 on a 09:30 end boundary.
+  const end = clampQueryEnd(
+    nyWallTimeToUtc(estDay, 9, 30),
+    config.alpaca.dataFeed,
+    config.alpaca.sipDelayMs,
+  );
 
   const bars: AlpacaBar[] = [];
   const iter = alpaca.getBarsV2(symbol, {
     start: start.toISOString(),
     end: end.toISOString(),
     timeframe: '1Min',
-    feed: 'iex',
+    feed: config.alpaca.dataFeed,
   });
 
   for await (const bar of iter) {
@@ -108,6 +114,7 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
   const gapHits: SnapshotGapHit[] = [];
   const minGap = config.premarket.minGapUpPct;
   const minClose = config.screener.minClosePrice;
+  const maxClose = config.screener.maxClosePrice;
   const minShares = config.premarket.minPreMarketShareVolume;
 
   let rejectedMissingPrice = 0;
@@ -116,8 +123,8 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
 
   log.info(
     `Snapshot scan on ${universe.length} tradable symbols ` +
-    `(close ≥ $${minClose}, gap ≥ ${(minGap * 100).toFixed(1)}%, ` +
-    `then pre-market vol ≥ ${(minShares / 1000).toFixed(0)}k shares before 09:30 EST)...`,
+    `(price $${minClose}–$${maxClose}, gap ≥ ${(minGap * 100).toFixed(1)}%, ` +
+    `then pre-market vol ≥ ${(minShares / 1_000_000).toFixed(1)}M shares before 09:30 EST)...`,
   );
 
   for (let i = 0; i < universe.length; i += SNAPSHOT_BATCH_SIZE) {
@@ -137,7 +144,7 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
           continue;
         }
 
-        if (!passesClosePrice(previousClose, minClose)) {
+        if (!passesPriceBand(preMarketPrice, minClose, maxClose)) {
           rejectedPrice++;
           continue;
         }
@@ -208,6 +215,7 @@ function toWatchlistEntries(candidates: GapCandidate[]): WatchlistSymbol[] {
       preMarketGapPct: c.preMarketGapPct,
       gapUp: c.preMarketGapPct,
       lastClose: c.preMarketPrice,
+      previousClose: c.previousClose,
       dollarVolume: c.preMarketPrice * c.preMarketShareVolume,
     }));
 }
@@ -264,7 +272,13 @@ export async function runPremarketScreener(): Promise<Watchlist> {
     );
   });
 
-  const watchlist = await mergeV2IntoWatchlist(v2Symbols);
+  const tradingDay = await queryRequiredWatchlistTradingDay();
+  if (!config.screener.eveningScreenerEnabled && tradingDay === null) {
+    throw new Error('[PREMARKET_SCREENER] Cannot resolve required EOD trading day');
+  }
+  const watchlist = config.screener.eveningScreenerEnabled
+    ? await mergeV2IntoWatchlist(v2Symbols)
+    : await writePremarketWatchlist(v2Symbols, tradingDay as string);
 
   log.info(
     `${v2Symbols.length} V2_PLAYMAKER symbol(s) merged into watchlist.json ` +

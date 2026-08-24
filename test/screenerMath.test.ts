@@ -7,6 +7,7 @@ import {
   passesAdrGate,
   passesClosePrice,
   passesDollarVolume,
+  passesPriceBand,
   passesFloatGate,
   sumShareVolume,
   type OhlcBar,
@@ -53,6 +54,13 @@ describe('passesClosePrice + passesDollarVolume', () => {
   it('enforces price floor', () => {
     assert.equal(passesClosePrice(5, 5), true);
     assert.equal(passesClosePrice(4.99, 5), false);
+  });
+
+  it('enforces an inclusive [min, max] price band', () => {
+    assert.equal(passesPriceBand(5, 5, 50), true);
+    assert.equal(passesPriceBand(50, 5, 50), true);
+    assert.equal(passesPriceBand(4.99, 5, 50), false);
+    assert.equal(passesPriceBand(50.01, 5, 50), false);
   });
 
   it('enforces dollar volume via close * volume', () => {

@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "watchdog": "tsx src/watchdog.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc -p tsconfig.scripts.json",
     "screener": "tsx src/screener.ts",
     "premarket-screener": "tsx src/premarket_screener.ts",
     "replay": "tsx src/scripts/replay.ts",

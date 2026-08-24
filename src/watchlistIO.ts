@@ -61,3 +61,24 @@ export async function mergeV2IntoWatchlist(
 export function extractV2Symbols(watchlist: Watchlist): WatchlistSymbol[] {
   return watchlist.symbols.filter(isV2Symbol);
 }
+
+/**
+ * Hyper-Growth universe write: V2-only list stamped with the required EOD
+ * trading day so `isWatchlistCurrent` accepts it for the next cash session.
+ * Replaces any leftover Core names — they are not traded on this path.
+ */
+export async function writePremarketWatchlist(
+  v2Symbols: WatchlistSymbol[],
+  tradingDay: string,
+): Promise<Watchlist> {
+  const watchlist: Watchlist = {
+    generatedAt: new Date().toISOString(),
+    tradingDay,
+    benchmarkReturn: null,
+    universeSize: v2Symbols.length,
+    liquidFiltered: v2Symbols.length,
+    symbols: v2Symbols,
+  };
+  await writeWatchlist(watchlist);
+  return watchlist;
+}

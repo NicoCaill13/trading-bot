@@ -8,7 +8,7 @@
 import config from './config';
 import { createLogger } from './logger';
 import { computeAdrPct } from './screenerMath';
-import { getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
+import { clampQueryEnd, getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
 import type {
   MarketRegime,
   RegimeFeatures,
@@ -186,7 +186,7 @@ async function fetchDailyOhlc(
     start: start.toISOString().split('T')[0],
     end: end.toISOString().split('T')[0],
     timeframe: '1Day',
-    feed: 'iex',
+    feed: config.alpaca.dataFeed,
   });
 
   for await (const bar of iter) {
@@ -203,14 +203,18 @@ async function fetchPremarketShareVolume(symbol: string): Promise<number> {
   const alpaca = await getAlpacaClient();
   const estDay = getESTDate();
   const start = nyWallTimeToUtc(estDay, 4, 0);
-  const end = nyWallTimeToUtc(estDay, 9, 30);
+  const end = clampQueryEnd(
+    nyWallTimeToUtc(estDay, 9, 30),
+    config.alpaca.dataFeed,
+    config.alpaca.sipDelayMs,
+  );
 
   let sum = 0;
   const iter = alpaca.getBarsV2(symbol, {
     start: start.toISOString(),
     end: end.toISOString(),
     timeframe: '1Min',
-    feed: 'iex',
+    feed: config.alpaca.dataFeed,
   });
 
   for await (const bar of iter) {

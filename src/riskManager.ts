@@ -6,8 +6,9 @@ import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
 import { fetchAtr5m } from './atr5m';
 import {
+  capQtyByBuyingPower,
   capQtyByMaxNotional,
-  capQtyBySettledCash,
+  resolveSizingCapital,
   computeRiskBasedQty,
   computeTakeProfitPrice,
   isDailyProfitTargetReached,
@@ -79,7 +80,17 @@ function resolvePositionMarketValue(pos: AlpacaPosition): number {
  * Effective risk may be scaled by the morning regime model (VIX / CHOPPY).
  */
 export async function getPortfolioAllocation(): Promise<PortfolioAllocation> {
-  const totalCapital = await trader.getAccountEquity();
+  const accountEquity = await trader.getAccountEquity();
+  const totalCapital = resolveSizingCapital(
+    accountEquity,
+    config.risk.strategyCapitalUsd,
+  );
+  if (totalCapital < accountEquity) {
+    log.info(
+      `Sizing capped at allocated capital $${totalCapital.toFixed(2)} ` +
+      `(account equity $${accountEquity.toFixed(2)})`,
+    );
+  }
 
   const positions = await trader.getOpenPositions();
   let deployed = 0;
@@ -111,7 +122,7 @@ export async function getPortfolioAllocation(): Promise<PortfolioAllocation> {
  * Take-profit is set at minRiskRewardRatio × stop distance (default 1:2).
  * Risk % and R:R come from RegimeRiskScaler when the morning model is applied.
  *
- * @param settledCash - cash available to cap notional (cash account)
+ * @param availableBuyingPower - broker buying power, already net of open orders
  * @param stopPriceOverride - structural stop supplied by a strategy (Opening
  *   Drive impulse-bar low) in place of the ATR-derived distance. The hard stop
  *   floor is still applied on top: a structural stop only basis points away
@@ -121,7 +132,7 @@ export async function getPortfolioAllocation(): Promise<PortfolioAllocation> {
 export async function computePositionSize(
   symbol: string,
   entryPrice: number,
-  settledCash: number,
+  availableBuyingPower: number,
   stopPriceOverride: number | null = null,
 ): Promise<PositionSizeResult> {
   const atr = await fetchAtr5m(symbol);
@@ -156,7 +167,7 @@ export async function computePositionSize(
     entryPrice,
     stopLossPrice,
   );
-  qty = capQtyBySettledCash(qty, entryPrice, settledCash);
+  qty = capQtyByBuyingPower(qty, entryPrice, availableBuyingPower);
   qty = capQtyByMaxNotional(
     qty,
     entryPrice,
@@ -168,20 +179,19 @@ export async function computePositionSize(
     log.warn(
       `REJECTED — Insufficient allocated capital for 1 whole share ` +
       `(${symbol} @ $${entryPrice.toFixed(2)}, ` +
-      `equity $${totalEquity.toFixed(2)}, settled $${settledCash.toFixed(2)})`,
+      `equity $${totalEquity.toFixed(2)}, buying power $${availableBuyingPower.toFixed(2)})`,
     );
     throw new Error(
       `${symbol}: REJECTED — Insufficient allocated capital for 1 whole share`,
     );
   }
 
-  const takeProfitPrice = computeTakeProfitPrice(
-    entryPrice,
-    stopLossPrice,
-    minRr,
-  );
+  const takeProfitPrice = config.risk.takeProfitEnabled
+    ? computeTakeProfitPrice(entryPrice, stopLossPrice, minRr)
+    : entryPrice * 10;
 
   if (
+    config.risk.takeProfitEnabled &&
     !passesMinRiskReward(
       entryPrice,
       stopLossPrice,
@@ -205,8 +215,10 @@ export async function computePositionSize(
     `($${(totalEquity * riskPct).toFixed(0)}) | ` +
     `notional $${(qty * entryPrice).toFixed(0)} / $${totalEquity.toFixed(0)} equity | ` +
     `stopDist:$${stopDistance.toFixed(4)} | qty:${qty} | ` +
-    `stopLoss:$${stopLossPrice.toFixed(2)} | takeProfit:$${takeProfitPrice.toFixed(2)} ` +
-    `(R:R ${minRr}:1)`,
+    `stopLoss:$${stopLossPrice.toFixed(2)}` +
+    (config.risk.takeProfitEnabled
+      ? ` | takeProfit:$${takeProfitPrice.toFixed(2)} (R:R ${minRr}:1)`
+      : ' | no TP cap — loose trail'),
   );
 
   return { qty, stopLossPrice, takeProfitPrice, atr };

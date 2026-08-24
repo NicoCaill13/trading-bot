@@ -10,6 +10,7 @@ import {
   resolveRegimeScaling,
   setRegimeSnapshotForTests,
 } from '../src/regimeModel';
+import config from '../src/config';
 import type { RegimeFeatures } from '../src/types';
 
 const classifier = new HeuristicRegimeClassifier({
@@ -149,7 +150,7 @@ describe('RegimeRiskScaler getters', () => {
   });
 
   it('defaults to config nominal when no applied snapshot', () => {
-    assert.equal(getEffectiveRiskPerTradePct(), 0.05);
+    assert.equal(getEffectiveRiskPerTradePct(), config.risk.riskPerTradePct);
     assert.equal(getMinRiskRewardRatio(), 2);
     assert.equal(getRegime(), 'UNKNOWN');
   });
@@ -171,7 +172,7 @@ describe('RegimeRiskScaler getters', () => {
         choppyRr: 1.5,
       }),
     );
-    assert.equal(getEffectiveRiskPerTradePct(), 0.05);
+    assert.equal(getEffectiveRiskPerTradePct(), config.risk.riskPerTradePct);
     assert.equal(getMinRiskRewardRatio(), 2);
     assert.equal(getRegime(), 'UNKNOWN');
   });

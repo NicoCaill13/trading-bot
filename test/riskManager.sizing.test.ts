@@ -2,13 +2,28 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   capQtyByMaxNotional,
-  capQtyBySettledCash,
+  capQtyByBuyingPower,
   computeRiskBasedQty,
   computeTakeProfitPrice,
   isDailyProfitTargetReached,
   passesMinRiskReward,
   remainingPositionSlots,
+  resolveSizingCapital,
 } from '../src/riskSizing';
+
+describe('resolveSizingCapital', () => {
+  it('clamps an over-funded paper account to the allocated capital', () => {
+    assert.equal(resolveSizingCapital(94_052.45, 200), 200);
+  });
+
+  it('uses the account when it holds less than the allocation', () => {
+    assert.equal(resolveSizingCapital(150, 200), 150);
+  });
+
+  it('is inert when no allocation is configured', () => {
+    assert.equal(resolveSizingCapital(94_052.45, 0), 94_052.45);
+  });
+});
 
 describe('computeRiskBasedQty', () => {
   it('sizes by equity * riskPct / stop distance', () => {
@@ -40,13 +55,13 @@ describe('computeTakeProfitPrice + passesMinRiskReward', () => {
   });
 });
 
-describe('capQtyBySettledCash', () => {
-  it('caps notional by settled cash', () => {
-    assert.equal(capQtyBySettledCash(500, 50, 10_000), 200);
+describe('capQtyByBuyingPower', () => {
+  it('caps notional by available buying power', () => {
+    assert.equal(capQtyByBuyingPower(500, 50, 10_000), 200);
   });
 
-  it('returns 0 when cash cannot buy one share', () => {
-    assert.equal(capQtyBySettledCash(10, 50, 40), 0);
+  it('returns 0 when buying power cannot cover one share', () => {
+    assert.equal(capQtyByBuyingPower(10, 50, 40), 0);
   });
 });
 

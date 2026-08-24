@@ -7,6 +7,16 @@ export type ExpectancyScenario =
   | 'Standard'
   | 'Sniper';
 
+/**
+ * Everything the expectancy maths needs from a trade. Narrower than TradeRecord
+ * on purpose: backtests and replays can feed it without fabricating a full
+ * journal row, and TradeRecord satisfies it structurally.
+ */
+export interface ExpectancyInput {
+  exit_time: string | null;
+  pnl_r: number | null;
+}
+
 export interface ExpectancyMetrics {
   n: number;
   winRate: number;
@@ -116,10 +126,10 @@ export function classifyScenario(winRate: number, eR: number): ExpectancyScenari
  * Only trades with non-null pnl_r are included (soft migration).
  */
 export function computeExpectancyMetrics(
-  trades: readonly TradeRecord[],
+  trades: readonly ExpectancyInput[],
 ): ExpectancyMetrics {
   const withR = trades.filter(
-    (t): t is TradeRecord & { pnl_r: number } =>
+    (t): t is ExpectancyInput & { pnl_r: number } =>
       t.exit_time !== null && t.pnl_r !== null && Number.isFinite(t.pnl_r),
   );
 

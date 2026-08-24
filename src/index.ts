@@ -17,8 +17,10 @@ import { isTradingDay, queryRequiredWatchlistTradingDay } from './marketCalendar
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
 import {
+  clampQueryEnd,
   getESTDate,
   isNonRetryableOrderError,
+  isSipStreamDenied,
   toESTDate,
   toErrorMessage,
 } from './utils';
@@ -82,6 +84,7 @@ import type {
   SpyTrend,
   ImbalanceSignal,
   WsState,
+  MarketDataEvent,
 } from './types';
 import { formatSetupTag, parseEnteredSetup } from './types';
 import type { SessionDataEntry } from './riskManager';
@@ -139,6 +142,8 @@ const l2QuotesSeen = new Set<string>();
 // Captured from the first 1-min bar timestamped at or after 09:30 EST, never
 // from a pre-market bar, and never from wall-clock time (hydration replays bars).
 const sessionOpenPrice = new Map<string, number>();
+// First RTH 1-min bar — the ORB 1-min range. Later bars may break its high.
+const openingRangeBar = new Map<string, BarData>();
 // Symbols already evaluated-and-armed by the Opening Drive path this session.
 const openingDriveTriggered = new Set<string>();
 // Symbols whose audited rejection was already recorded. Tracked apart from the
@@ -184,7 +189,12 @@ const EQUITY_CHECK_INTERVAL_MS = 60_000;
 // Starting equity captured at boot — required for daily report
 let sessionStartEquity = 0;
 
-const WS_URL = 'wss://stream.data.alpaca.markets/v2/iex';
+let activeStreamFeed: 'iex' | 'sip' = config.alpaca.streamFeed;
+let sipStreamFallbackUsed = false;
+
+function streamUrl(): string {
+  return `wss://stream.data.alpaca.markets/v2/${activeStreamFeed}`;
+}
 
 // ---------------------------------------------------------------------------
 // Liveness telemetry — produced for the standalone watchdog, never read back
@@ -470,6 +480,33 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
       return [];
     }
 
+    if (!config.screener.eveningScreenerEnabled) {
+      const nowMins = minutesSinceMidnight(getESTDate());
+      const preMarketMins =
+        config.session.preMarketHour * 60 + config.session.preMarketMinute;
+      if (!skipScreener && nowMins >= preMarketMins) {
+        log.info(
+          `Watchlist stale — evening screener off; running Hyper-Growth pre-market scan...`,
+        );
+        try {
+          data = await runPremarketScreener();
+          watchlistGeneratedAt = data.generatedAt;
+          watchlistTradingDay = data.tradingDay ?? null;
+        } catch (err: unknown) {
+          const message = toErrorMessage(err);
+          log.error(`Premarket rescreen failed: ${message}`);
+          void sendTelegramAlert(formatErrorAlert(`Premarket rescreen failed: ${message}`));
+          return [];
+        }
+      } else {
+        log.warn(
+          `Watchlist not current (have ${watchlistTradingDay ?? 'none'}, ` +
+          `need ${requiredWatchlistTradingDay ?? 'unknown'}) — ` +
+          `evening screener disabled; waiting for 09:15 pre-market scan`,
+        );
+        return [];
+      }
+    } else {
     log.info(
       `Watchlist stale or missing (have ${watchlistTradingDay ?? 'none'}, ` +
       `need ${requiredWatchlistTradingDay ?? 'unknown'}) — running Core screener...`,
@@ -494,6 +531,7 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
         formatErrorAlert('Watchlist still stale after screener — failing closed'),
       );
       return [];
+    }
     }
   }
 
@@ -588,6 +626,41 @@ function haltMarketDataIngest(): void {
   marketDataBus.clear();
 }
 
+async function consumeMarketData(event: MarketDataEvent): Promise<void> {
+  if (event.kind === 'bar_1m') {
+    await handleOneMinuteBarEvent(event.bar);
+    return;
+  }
+  if (event.kind === 'quote') {
+    handleQuoteEvent(event.quote, event.receivedAt);
+  }
+}
+
+/**
+ * Arms the live path on a trading day even when the watchlist is still empty.
+ * Hyper-Growth fills the universe at 09:15; aborting here used to leave the
+ * bus unstarted so 09:30 bars arrived with nobody listening.
+ */
+async function armLivePipeline(): Promise<void> {
+  wsEnabled = true;
+  if (sessionStartEquity <= 0) {
+    sessionStartEquity = await trader.getAccountEquity();
+    riskManager.initDailyBaseline(sessionStartEquity);
+  }
+  marketDataBus.start(consumeMarketData);
+}
+
+function connectWatchlistStream(extraSymbols: string[] = []): void {
+  if (!wsEnabled || monitoredSymbols.length === 0) return;
+  if (!ws) {
+    connectWebSocket(monitoredSymbols);
+    return;
+  }
+  if (extraSymbols.length > 0) {
+    ws.send(buildSubscribeMessage(extraSymbols));
+  }
+}
+
 function pushEma9Close(symbol: string, close: number): void {
   const history = ema9ClosePrices.get(symbol) ?? [];
   history.push(close);
@@ -646,14 +719,18 @@ async function fetchSpyTrend5m(): Promise<SpyTrend> {
       return 'neutral';
     }
 
-    const now = new Date();
+    const now = clampQueryEnd(
+      new Date(),
+      config.alpaca.streamFeed,
+      config.alpaca.sipDelayMs,
+    );
     const start = new Date(now.getTime() - 30 * 60 * 1000);
     const bars: BarData[] = [];
     const iter = alpaca.getBarsV2('SPY', {
       start: start.toISOString(),
       end: now.toISOString(),
       timeframe: '5Min',
-      feed: 'iex',
+      feed: config.alpaca.streamFeed,
     });
     for await (const bar of iter) {
       bars.push(alpacaBarToBarData(bar));
@@ -716,6 +793,16 @@ function captureSessionOpen(symbol: string, bar: BarData): void {
   if (minutesSinceMidnight(barEst) < openMinutes) return;
 
   sessionOpenPrice.set(symbol, bar.open);
+}
+
+function captureOpeningRange(symbol: string, bar: BarData): void {
+  if (openingRangeBar.has(symbol)) return;
+
+  const barEst = toESTDate(new Date(bar.timestamp));
+  const openMinutes = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
+  if (minutesSinceMidnight(barEst) < openMinutes) return;
+
+  openingRangeBar.set(symbol, bar);
 }
 
 function isRegularSessionStarted(): boolean {
@@ -847,10 +934,15 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
   }
 
   const sessionDate = getSessionDateStr();
-  const end = new Date().toISOString();
+  const end = clampQueryEnd(
+    new Date(),
+    config.alpaca.streamFeed,
+    config.alpaca.sipDelayMs,
+  ).toISOString();
 
   log.info(
-    `Hydrating 5-min bars (${sessionDate} session) for ${symbols.length} symbols...`,
+    `Hydrating 5-min bars (${sessionDate} session, ${config.alpaca.streamFeed}) ` +
+    `for ${symbols.length} symbols...`,
   );
 
   let symbolsWithBars = 0;
@@ -864,7 +956,7 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
         start: sessionDate,
         end,
         timeframe: '5Min',
-        feed: 'iex',
+        feed: config.alpaca.streamFeed,
         limit: 80,
       });
 
@@ -920,6 +1012,7 @@ function queuePendingSignal(signal: PendingSignal): void {
 }
 
 function evaluateOrbSignal(symbol: string, latestBar: BarData): void {
+  if (!config.entry.orbFiveMinEnabled) return;
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
   if (!isOrbUniverse(symbol)) return;
@@ -1001,11 +1094,8 @@ function openingDriveWindowMinutes(): { start: number; end: number } {
 }
 
 /**
- * Opening Drive path — evaluated on 1-min bars, only for STRAIGHT_RUN symbols.
- *
- * Runs entirely outside the Core pullback state machine: no tracker, no VWAP
- * proximity, no Fibonacci gate. Ships in shadow mode, where a decision is logged
- * and no order is ever queued.
+ * Opening Drive path — ORB 1-min high break on Hyper-Growth runners.
+ * No straight-run tag, no VWAP pullback, no Fibonacci gate.
  */
 function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   if (tradingHalted) return;
@@ -1013,15 +1103,12 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   if (openingDriveTriggered.has(symbol)) return;
 
   const screenerData = screenerDataMap.get(symbol);
-  if (screenerData?.isStraightRun !== true) return;
-
   const window = openingDriveWindowMinutes();
   const ctx: OpeningDriveContext = {
     symbol,
     barMinutesSinceMidnight: minutesSinceMidnight(toESTDate(new Date(bar1m.timestamp))),
-    isStraightRun: true,
-    straightRunScore: screenerData.straightRunDetail?.score ?? 0,
-    previousClose: screenerData.lastClose ?? null,
+    rangeBar: openingRangeBar.get(symbol) ?? null,
+    previousClose: screenerData?.previousClose ?? screenerData?.lastClose ?? null,
     sessionOpen: sessionOpenPrice.get(symbol) ?? null,
     sessionVwap: resolveVwapForSymbol(symbol),
     impulseBar: bar1m,
@@ -1036,6 +1123,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     minImbalance: config.openingDrive.minImbalance,
     maxExtensionPct: config.openingDrive.maxExtensionPct,
     rvolBaselineBars: config.openingDrive.rvolBaselineBars,
+    minOrbVolumeMultiple: config.openingDrive.minOrbVolumeMultiple,
     hardStopFloorPct: config.risk.hardStopFloorPct,
   });
 
@@ -1057,7 +1145,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
         symbol,
         signalAt: bar1m.timestamp,
         decision,
-        straightRunScore: ctx.straightRunScore,
+        straightRunScore: 0,
         rejectedBy: 'max_extension',
         horizonMinutes: config.openingDrive.shadowHorizonMinutes,
       });
@@ -1071,7 +1159,6 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   odLog.info(
     `${symbol}: Opening Drive ${banner} — ` +
     describeOpeningDriveDecision(decision) +
-    ` | run score ${ctx.straightRunScore.toFixed(2)}` +
     ` | score ${Math.round(decision.score).toLocaleString()}`,
   );
 
@@ -1081,7 +1168,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     symbol,
     signalAt: bar1m.timestamp,
     decision,
-    straightRunScore: ctx.straightRunScore,
+    straightRunScore: 0,
     rejectedBy: null,
     horizonMinutes: config.openingDrive.shadowHorizonMinutes,
   });
@@ -1108,6 +1195,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
 }
 
 function evaluateSignal(symbol: string, latestBar: BarData): void {
+  if (!config.entry.vwapPullbackEnabled) return;
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
 
@@ -1322,6 +1410,7 @@ function confirmCoreV7Entry(
  * Core never uses this path (V7 confirms on 5m via evaluateCoreV7Pullback).
  */
 function evaluatePullbackState(symbol: string, bar1m: BarData): void {
+  if (!config.entry.vwapPullbackEnabled) return;
   if (tradingHalted || hasEntered(symbol)) {
     pullbackTrackers.delete(symbol);
     return;
@@ -1437,7 +1526,7 @@ async function executeSignals(
     );
 
     try {
-      const settledCash = await trader.getSettledCash();
+      const availableBuyingPower = await trader.getAvailableBuyingPower();
       const allocation = await riskManager.getPortfolioAllocation();
       if (!allocation.canOpen) {
         log.warn(
@@ -1467,7 +1556,7 @@ async function executeSignals(
       const { qty, stopLossPrice, takeProfitPrice, atr } = await riskManager.computePositionSize(
         symbol,
         referencePrice,
-        settledCash,
+        availableBuyingPower,
         signal.stopPriceOverride ?? null,
       );
 
@@ -1504,7 +1593,7 @@ async function executeSignals(
       }
 
       const vwapDist = ((referencePrice - vwap) / vwap) * 100;
-      if (vwapDist > filters.maxVwapEntryDistancePct) {
+      if (setup !== 'OPENING_DRIVE' && vwapDist > filters.maxVwapEntryDistancePct) {
         log.warn(
           `${symbol}: entry blocked by FeedbackEngine — VWAP dist ` +
           `${vwapDist.toFixed(2)}% > cap ${filters.maxVwapEntryDistancePct.toFixed(2)}%`,
@@ -1513,7 +1602,7 @@ async function executeSignals(
       }
 
       const entryRsi = computeEntryRsi(symbol);
-      if (entryRsi !== null && entryRsi > config.entry.maxEntryRsi) {
+      if (setup !== 'OPENING_DRIVE' && entryRsi !== null && entryRsi > config.entry.maxEntryRsi) {
         log.warn(
           `${symbol}: entry blocked — 1-min RSI ${entryRsi.toFixed(1)} ` +
           `> cap ${config.entry.maxEntryRsi} (momentum exhaustion)`,
@@ -1526,6 +1615,7 @@ async function executeSignals(
         ? (gapRaw <= 1 ? gapRaw * 100 : gapRaw)
         : null;
       if (
+        setup !== 'OPENING_DRIVE' &&
         filters.maxGapPctForEntry !== null &&
         gapPct !== null &&
         gapPct > filters.maxGapPctForEntry
@@ -1770,6 +1860,7 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   pushEma9Close(symbol, barData.close);
   pushOneMinBar(symbol, barData);
   captureSessionOpen(symbol, barData);
+  captureOpeningRange(symbol, barData);
   evaluatePullbackState(symbol, barData);
 
   // Observation before evaluation, so this bar is folded into records opened on
@@ -1983,6 +2074,25 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 
     if (isWsErrorMessage(msg)) {
       log.warn(`WebSocket error: code ${msg.code} — ${msg.msg}`);
+      if (
+        activeStreamFeed !== 'iex' &&
+        !sipStreamFallbackUsed &&
+        isSipStreamDenied(msg.code, msg.msg)
+      ) {
+        sipStreamFallbackUsed = true;
+        activeStreamFeed = 'iex';
+        log.warn(
+          'SIP live stream refused — falling back to IEX real-time (production tape)',
+        );
+        const stale = ws;
+        ws = null;
+        if (stale) {
+          stale.removeAllListeners();
+          stale.close();
+        }
+        connectWebSocket(symbols);
+        return;
+      }
       if (config.level2.enabled && /quote/i.test(msg.msg)) {
         l2Log.warn(`Quote feed error — degrading to bars-only path: ${msg.msg}`);
       }
@@ -2004,28 +2114,34 @@ function connectWebSocket(symbols: string[]): void {
   });
 
   wsState = 'connecting';
-  ws = new WebSocket(WS_URL);
+  const socket = new WebSocket(streamUrl());
+  ws = socket;
+  log.info(`WebSocket connecting ${streamUrl()}`);
 
-  ws.on('open', () => {
+  socket.on('open', () => {
+    if (ws !== socket) return;
     reconnectAttempt = 0;
-    log.info('WebSocket connected — authenticating...');
-    ws?.send(authMessage);
+    log.info(`WebSocket connected (${activeStreamFeed}) — authenticating...`);
+    socket.send(authMessage);
   });
 
-  ws.on('message', (raw: WebSocket.RawData) => {
+  socket.on('message', (raw: WebSocket.RawData) => {
+    if (ws !== socket) return;
     handleWsMessage(raw, symbols).catch((err: unknown) => {
       log.error(`WebSocket message handler error: ${toErrorMessage(err)}`);
     });
   });
 
-  ws.on('close', (code: number) => {
+  socket.on('close', (code: number) => {
+    if (ws !== socket) return;
     wsState = 'disconnected';
     log.warn(`WebSocket closed (code ${code}) — reconnection scheduled...`);
     void sendTelegramAlert(formatErrorAlert(`WebSocket déconnecté (code ${code}) — reconnexion...`));
     scheduleReconnect(symbols);
   });
 
-  ws.on('error', (err: Error) => {
+  socket.on('error', (err: Error) => {
+    if (ws !== socket) return;
     log.error(`WebSocket error: ${err.message}`);
   });
 }
@@ -2176,6 +2292,7 @@ function scheduleDailyReset(): void {
     monitoredSymbols = [];
     oneMinBarHistory.clear();
     sessionOpenPrice.clear();
+    openingRangeBar.clear();
     openingDriveTriggered.clear();
     openingDriveAuditLogged.clear();
     shadowJournal.closeAllShadowRecords(new Date().toISOString());
@@ -2207,6 +2324,12 @@ function scheduleDailyReset(): void {
 
       if (!tradingToday) {
         log.info('Market closed today — Core screener skipped');
+        haltMarketDataIngest();
+        return;
+      }
+
+      if (!config.screener.eveningScreenerEnabled) {
+        log.info('Evening Core screener disabled — Hyper-Growth universe comes from 09:15 pre-market');
         haltMarketDataIngest();
         return;
       }
@@ -2274,6 +2397,7 @@ function schedulePreMarketReconciliation(): void {
       }
       log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
       try {
+        await armLivePipeline();
         await reconcileStateFromBroker();
         await runMorningRegimeAssessment();
         const watchlist = await runPremarketScreener();
@@ -2283,9 +2407,7 @@ function schedulePreMarketReconciliation(): void {
           `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
           `${newSymbols.length} new WebSocket subscription(s)`,
         );
-        if (wsEnabled && ws && newSymbols.length > 0) {
-          ws.send(buildSubscribeMessage(newSymbols));
-        }
+        connectWatchlistStream(newSymbols);
       } catch (err: unknown) {
         log.error(`Pre-market routine error: ${toErrorMessage(err)}`);
       }
@@ -2300,6 +2422,15 @@ function schedulePreMarketReconciliation(): void {
 
 async function main(): Promise<void> {
   log.info('Initializing trading bot...');
+  log.info(
+    `Market data: REST historical=${config.alpaca.dataFeed} | ` +
+    `live stream=${config.alpaca.streamFeed}`,
+  );
+  if (config.openingDrive.shadow) {
+    log.warn('OD_SHADOW=true — signals are journalled, no orders will be sent');
+  } else {
+    log.info(`PAPER live — orders will be sent to ${config.alpaca.baseUrl}`);
+  }
 
   const tradingToday = await isTradingDay();
   tradingDayFlag = tradingToday;
@@ -2331,39 +2462,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  wsEnabled = true;
   startPositionRefreshLoop();
+  await armLivePipeline();
 
   if (symbols.length === 0) {
-    log.warn('Empty watchlist — no trades today. Waiting for 20:00 screener...');
+    log.warn(
+      'Empty watchlist at boot — pipeline armed, universe comes from 09:15 pre-market',
+    );
     return;
   }
 
-  // Capture starting equity for the daily circuit breaker
-  sessionStartEquity = await trader.getAccountEquity();
-  riskManager.initDailyBaseline(sessionStartEquity);
-
-  // Reconcile state from broker (protects against mid-session crashes)
   await reconcileStateFromBroker();
-
   await hydrateIntradayBars(symbols);
-
-  marketDataBus.start(async (event) => {
-    if (event.kind === 'bar_1m') {
-      await handleOneMinuteBarEvent(event.bar);
-      return;
-    }
-    if (event.kind === 'quote') {
-      handleQuoteEvent(event.quote, event.receivedAt);
-    }
-  });
-
-  connectWebSocket(symbols);
+  connectWatchlistStream();
 
   if (config.level2.enabled) {
     l2Log.info(
-      `LEVEL2 enabled — IEX quotes subscribed | threshold=${config.level2.imbalanceThreshold} ` +
-      `fastTrigger=${config.level2.fastTrigger} topN=${config.level2.topN} (IEX effective depth=1)`,
+      `LEVEL2 enabled — ${activeStreamFeed} quotes subscribed | ` +
+      `threshold=${config.level2.imbalanceThreshold} ` +
+      `fastTrigger=${config.level2.fastTrigger} topN=${config.level2.topN}` +
+      (activeStreamFeed === 'iex' ? ' (IEX effective depth=1)' : ''),
     );
   }
 

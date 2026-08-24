@@ -1,5 +1,12 @@
 // Importing './env' loads the environment file — see the note in that module.
 import { parseFloatEnv, parseIntEnv, parseStringEnv, requireEnv } from './env';
+import { computeTrailLockedPct } from './exitPredicates';
+
+function parseFeed(envKey: string, raw: string | undefined, fallback: 'iex' | 'sip'): 'iex' | 'sip' {
+  const value = (raw ?? fallback).trim().toLowerCase();
+  if (value === 'iex' || value === 'sip') return value;
+  throw new Error(`[SYSTEM] ${envKey} must be iex|sip: "${raw ?? ''}"`);
+}
 
 function parseBusDropPolicy(raw: string | undefined): 'drop_oldest' | 'drop_newest' {
   const value = (raw ?? 'drop_oldest').trim().toLowerCase();
@@ -15,33 +22,63 @@ const config = {
     secretKey: requireEnv('ALPACA_SECRET_KEY'),
     baseUrl: process.env.ALPACA_BASE_URL ?? 'https://paper-api.alpaca.markets',
     dataUrl: process.env.ALPACA_DATA_URL ?? 'https://data.alpaca.markets',
+    /**
+     * Historical REST (screener, regime, overnight studies). SIP sees the full
+     * tape; on Basic it is delayed 15 minutes — fine for completed sessions,
+     * not for live bars. IEX historical under-counts pre-market micro-caps.
+     */
+    dataFeed: parseFeed('ALPACA_DATA_FEED', process.env.ALPACA_DATA_FEED, 'sip'),
+    /**
+     * Live tape: WebSocket plus REST that must be current (hydration, ATR,
+     * SPY trend). IEX is real-time on Basic and is what the bot used in
+     * production. `v2/sip` needs Algo Trader Plus; without it the stream
+     * falls back to IEX rather than dying.
+     */
+    streamFeed: parseFeed('ALPACA_STREAM_FEED', process.env.ALPACA_STREAM_FEED, 'iex'),
+    /**
+     * A non-realtime plan refuses any SIP window ending inside the last 15
+     * minutes, and refuses the whole request rather than truncating it. One
+     * extra minute of margin absorbs clock skew.
+     */
+    sipDelayMs: parseIntEnv('SIP_DELAY_MS', 16 * 60_000),
     paper: true as const,
   },
 
   risk: {
-    maxPositions: parseIntEnv('MAX_POSITIONS', 3),
+    // T+1 cash: leftover settled cash after ticket #1 is the only fuel for #2.
+    maxPositions: parseIntEnv('MAX_POSITIONS', 2),
+    // Capital allocated to this strategy. Sizing and the notional cap use
+    // min(account equity, this) so an over-funded paper account reproduces the
+    // fills and share rounding of the live account. 0 = use the whole account.
+    strategyCapitalUsd: parseFloatEnv('STRATEGY_CAPITAL_USD', 0),
     // Cash-account notional ceiling: qty * entry <= equity * maxPositionPct (no leverage).
-    maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.40),
-    riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.05),
+    maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.55),
+    riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.20),
     minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
-    atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.015),
-    atrTrailMultiplier: parseFloatEnv('ATR_TRAIL_MULTIPLIER', 2),
-    timeStopMinutes: parseIntEnv('TIME_STOP_MINUTES', 45),
+    // Loose trail: do not choke a runner until it has actually extended. Must
+    // stay above TRAILING_STOP_PCT / (1 − TRAILING_STOP_PCT) or arming the trail
+    // widens risk instead of banking the move — enforced in validateConfig.
+    atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.20),
+    atrTrailMultiplier: parseFloatEnv('ATR_TRAIL_MULTIPLIER', 4),
+    timeStopMinutes: parseIntEnv('TIME_STOP_MINUTES', 20),
     atrStopMultiplier: parseFloatEnv('ATR_STOP_MULTIPLIER', 1.5),
-    hardStopFloorPct: parseFloatEnv('HARD_STOP_FLOOR_PCT', 0.015),
-    // Single scale-out target for the unified 3-slot pool (#30).
-    // SCALE_OUT_TARGET_PCT_CORE is accepted as a fallback so an old .env still boots.
+    hardStopFloorPct: parseFloatEnv('HARD_STOP_FLOOR_PCT', 0.025),
+    // Kept for legacy callers / old .env. Scale-out and bracket TP are off.
     scaleOutTargetPct: parseFloatEnv(
       'SCALE_OUT_TARGET_PCT',
-      parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.05),
+      parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.30),
     ),
-    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.025),
+    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.12),
+    takeProfitEnabled: process.env.TAKE_PROFIT_ENABLED === 'true',
+    scaleOutEnabled: process.env.SCALE_OUT_ENABLED === 'true',
+    smartExitsEnabled: process.env.SMART_EXITS_ENABLED === 'true',
+    usePercentTrail: process.env.USE_PERCENT_TRAIL !== 'false',
     scaleOutSettlementDelayMs: parseIntEnv('SCALE_OUT_SETTLEMENT_DELAY_MS', 3000),
     eodTightTrailPct: parseFloatEnv('EOD_TIGHT_TRAIL_PCT', 0.005),
     // 0 disables the daily profit circuit breaker (drawdown kill-switch stays).
     dailyProfitTargetPct: parseFloatEnv('DAILY_PROFIT_TARGET_PCT', 0),
-    dailyDrawdownLimitDollars: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_DOLLARS', -1500),
-    dailyDrawdownLimitPct: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_PCT', -0.015),
+    dailyDrawdownLimitDollars: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_DOLLARS', -40),
+    dailyDrawdownLimitPct: parseFloatEnv('DAILY_DRAWDOWN_LIMIT_PCT', -0.20),
     atrTakeProfitMultiplier: parseFloatEnv('ATR_TP_MULTIPLIER', 1.5),
     atrStopMultiplier5m: parseFloatEnv('ATR_STOP_MULTIPLIER_5M', 1.0),
     smartExitMinPnlPct: parseFloatEnv('SMART_EXIT_MIN_PNL_PCT', 0.01),
@@ -60,15 +97,18 @@ const config = {
   },
 
   screener: {
-    // Annotate + rank only — not hard gates. Universe = liquidity + ADR + Weinstein.
+    // Evening Core is off. Universe = pre-market gap + PM volume, liquid names.
+    eveningScreenerEnabled: process.env.EVENING_SCREENER_ENABLED === 'true',
+    adrGateEnabled: process.env.ADR_GATE_ENABLED === 'true',
+    weinsteinGateEnabled: process.env.WEINSTEIN_GATE_ENABLED === 'true',
     minRelativeVolume: parseFloatEnv('MIN_RELATIVE_VOLUME', 2.0),
     minGapUpPct: parseFloatEnv('MIN_GAP_UP_PCT', 0.02),
     gapHoldTolerance: parseFloatEnv('GAP_HOLD_TOLERANCE', 0.01),
     watchlistMaxSize: parseIntEnv('WATCHLIST_MAX_SIZE', 50),
     relativeStrengthLookbackDays: parseIntEnv('RELATIVE_STRENGTH_LOOKBACK_DAYS', 20),
     volumeAverageDays: parseIntEnv('VOLUME_AVERAGE_DAYS', 14),
-    // V7 liquidity defaults (spec §1) — previously 10 / 50M
     minClosePrice: parseFloatEnv('MIN_CLOSE_PRICE', 5),
+    maxClosePrice: parseFloatEnv('MAX_CLOSE_PRICE', 50),
     minDollarVolume: parseFloatEnv('MIN_DOLLAR_VOLUME', 20_000_000),
     minAdrPct: parseFloatEnv('MIN_ADR_PCT', 4.0),
     adrLookbackDays: parseIntEnv('ADR_LOOKBACK_DAYS', 14),
@@ -82,8 +122,8 @@ const config = {
     sma150Period: parseIntEnv('SMA_150_PERIOD', 150),
     sma200Period: parseIntEnv('SMA_200_PERIOD', 200),
     sma150SlopeWeeks: parseIntEnv('SMA_150_SLOPE_WEEKS', 8),
-    // Reversal patterns (§3.A) — soft annotate post-Weinstein (no hard reject)
-    patternFilterEnabled: process.env.PATTERN_FILTER_ENABLED !== 'false',
+    // Reversal patterns (§3.A) — off by default on Hyper-Growth (no Weinstein path).
+    patternFilterEnabled: process.env.PATTERN_FILTER_ENABLED === 'true',
     // Bumped to 120 to cover cup/flat lookbacks (was 90 for reversal-only).
     patternLookbackBars: parseIntEnv('PATTERN_LOOKBACK_BARS', 120),
     patternPivotLeft: parseIntEnv('PATTERN_PIVOT_LEFT', 3),
@@ -120,27 +160,26 @@ const config = {
     rvolBaselineDays: parseIntEnv('STRAIGHT_RUN_RVOL_BASELINE_DAYS', 14),
   },
 
-  // Opening Drive Satellite path (#29). Window starts at 09:45 so it never
-  // competes with the ORB (09:30–09:45) for the single Satellite slot.
-  // Ships in shadow mode: signals are recorded, no order is ever sent.
+  // Opening Drive — sole live entry path. ORB 1-min high break, 09:30–09:45 EST.
   openingDrive: {
-    shadow: process.env.OD_SHADOW !== 'false',
+    shadow: process.env.OD_SHADOW === 'true',
     windowStartHour: parseIntEnv('OD_WINDOW_START_HOUR', 9),
-    windowStartMinute: parseIntEnv('OD_WINDOW_START_MINUTE', 45),
-    windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 10),
-    windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 15),
+    windowStartMinute: parseIntEnv('OD_WINDOW_START_MINUTE', 30),
+    windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 9),
+    windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 45),
     minRvol1m: parseFloatEnv('OD_RVOL_1M', 2.0),
     minImbalance: parseFloatEnv('OD_MIN_IMBALANCE', 0.65),
-    maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.015),
+    maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.08),
     rvolBaselineBars: parseIntEnv('OD_RVOL_BASELINE_BARS', 20),
+    minOrbVolumeMultiple: parseFloatEnv('OD_MIN_ORB_VOLUME_MULTIPLE', 1.5),
     shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
   },
 
   premarket: {
-    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.02),
-    // Share volume summed on 1Min bars in EST [04:00, 09:30) — previously 100k
-    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
-    watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 10),
+    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.10),
+    // Share volume summed on 1Min bars in EST [04:00, 09:30)
+    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 1_000_000),
+    watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 8),
   },
 
   entry: {
@@ -148,6 +187,8 @@ const config = {
     minBarsForVolumeAvg: 5,
     signalBatchWindowMs: parseIntEnv('SIGNAL_BATCH_WINDOW_MS', 10000),
     tradeDuringLunch: process.env.TRADE_DURING_LUNCH === 'true',
+    vwapPullbackEnabled: process.env.VWAP_PULLBACK_ENABLED === 'true',
+    orbFiveMinEnabled: process.env.ORB_FIVE_MIN_ENABLED === 'true',
     orbWindowBars: parseIntEnv('ORB_WINDOW_BARS', 1),
     // V7 Core VWAP pullback: green 5m confirmation RVOL (was 1.2 legacy).
     minRvolForPullback: parseFloatEnv('MIN_RVOL_FOR_PULLBACK', 1.5),
@@ -173,7 +214,7 @@ const config = {
     // Anti-chase guard: max % the live ask may sit above the signal bar close
     // before the entry is abandoned. Prevents buying the top of a vertical spike
     // when the price ran away during the signal-batch debounce window.
-    maxEntryChasePct: parseFloatEnv('MAX_ENTRY_CHASE_PCT', 1.0),
+    maxEntryChasePct: parseFloatEnv('MAX_ENTRY_CHASE_PCT', 3.0),
     // Entry-timing filter: skip entries when the 1-min RSI is already overbought
     // (chasing exhaustion). Distinct from the smart-exit RSI threshold.
     maxEntryRsi: parseFloatEnv('MAX_ENTRY_RSI', 75),
@@ -303,17 +344,38 @@ const config = {
   if (r.maxPositionPct <= 0 || r.maxPositionPct > 1.0)
     throw new Error(`[SYSTEM] MAX_POSITION_PCT out of bounds (0–1.0): ${r.maxPositionPct}`);
 
-  if (r.riskPerTradePct <= 0 || r.riskPerTradePct > 0.05)
-    throw new Error(`[SYSTEM] RISK_PER_TRADE_PCT must be between 0 and 5%: ${r.riskPerTradePct}`);
+  if (r.strategyCapitalUsd < 0)
+    throw new Error(`[SYSTEM] STRATEGY_CAPITAL_USD must be >= 0: ${r.strategyCapitalUsd}`);
+
+  if (r.riskPerTradePct <= 0 || r.riskPerTradePct > 0.25)
+    throw new Error(`[SYSTEM] RISK_PER_TRADE_PCT must be between 0 and 25%: ${r.riskPerTradePct}`);
 
   if (r.minRiskRewardRatio < 1 || r.minRiskRewardRatio > 10)
     throw new Error(`[SYSTEM] MIN_RISK_REWARD_RATIO out of bounds (1–10): ${r.minRiskRewardRatio}`);
 
-  if (r.atrTrailTriggerPct <= 0 || r.atrTrailTriggerPct > 0.1)
-    throw new Error(`[SYSTEM] ATR_TRAIL_TRIGGER_PCT out of bounds (0–10%): ${r.atrTrailTriggerPct}`);
+  if (r.atrTrailTriggerPct <= 0 || r.atrTrailTriggerPct > 0.35)
+    throw new Error(`[SYSTEM] ATR_TRAIL_TRIGGER_PCT out of bounds (0–35%): ${r.atrTrailTriggerPct}`);
 
   if (r.atrTrailMultiplier < 1 || r.atrTrailMultiplier > 5)
     throw new Error(`[SYSTEM] ATR_TRAIL_MULTIPLIER out of bounds (1–5): ${r.atrTrailMultiplier}`);
+
+  if (r.trailingStopPct <= 0 || r.trailingStopPct >= 1)
+    throw new Error(`[SYSTEM] TRAILING_STOP_PCT out of bounds (0–1): ${r.trailingStopPct}`);
+
+  // A percent trail armed too early is a risk widener, not a protection: the
+  // stop lands below entry and the initial hard stop has already been cancelled.
+  if (r.usePercentTrail) {
+    const lockedPct = computeTrailLockedPct(r.atrTrailTriggerPct, r.trailingStopPct);
+    if (lockedPct <= 0) {
+      const minTrigger = r.trailingStopPct / (1 - r.trailingStopPct);
+      throw new Error(
+        `[SYSTEM] ATR_TRAIL_TRIGGER_PCT (${(r.atrTrailTriggerPct * 100).toFixed(1)}%) is too low ` +
+        `for TRAILING_STOP_PCT (${(r.trailingStopPct * 100).toFixed(1)}%): arming the trail would ` +
+        `set the stop at ${(lockedPct * 100).toFixed(2)}% of entry. ` +
+        `Raise the trigger above ${(minTrigger * 100).toFixed(2)}% or tighten the trail.`,
+      );
+    }
+  }
 
   if (r.timeStopMinutes < 5 || r.timeStopMinutes > 240)
     throw new Error(`[SYSTEM] TIME_STOP_MINUTES out of bounds (5–240): ${r.timeStopMinutes}`);
@@ -324,7 +386,7 @@ const config = {
   if (r.hardStopFloorPct < 0.005 || r.hardStopFloorPct > 0.1)
     throw new Error(`[SYSTEM] HARD_STOP_FLOOR_PCT out of bounds (0.5%–10%): ${r.hardStopFloorPct}`);
 
-  if (r.scaleOutTargetPct <= r.hardStopFloorPct)
+  if (r.scaleOutEnabled && r.scaleOutTargetPct <= r.hardStopFloorPct)
     throw new Error('[SYSTEM] SCALE_OUT_TARGET_PCT must be > HARD_STOP_FLOOR_PCT');
 
   // 0 disables the daily profit circuit breaker; the drawdown kill-switch is independent.
@@ -397,6 +459,12 @@ const config = {
   const s = config.screener;
   if (s.minClosePrice <= 0) {
     throw new Error(`[SYSTEM] MIN_CLOSE_PRICE must be > 0: ${s.minClosePrice}`);
+  }
+  if (s.maxClosePrice <= s.minClosePrice) {
+    throw new Error(
+      `[SYSTEM] MAX_CLOSE_PRICE must be > MIN_CLOSE_PRICE: ` +
+      `${s.maxClosePrice} <= ${s.minClosePrice}`,
+    );
   }
   if (s.minDollarVolume <= 0) {
     throw new Error(`[SYSTEM] MIN_DOLLAR_VOLUME must be > 0: ${s.minDollarVolume}`);
@@ -487,16 +555,13 @@ const config = {
   if (odStart >= odEnd) {
     throw new Error(`[SYSTEM] OD window start must precede end: ${odStart} >= ${odEnd}`);
   }
-  // The ORB owns 09:30 to blackoutEndMinute and draws from the same Satellite
-  // slot; overlapping windows would make the winner depend on bar arrival order.
-  const orbEnd = config.session.marketOpenHour * 60 + config.session.blackoutEndMinute;
-  if (odStart < orbEnd) {
-    throw new Error(
-      `[SYSTEM] OD window must start at or after the ORB window end (${orbEnd} min EST): ${odStart}`,
-    );
-  }
   if (od.minRvol1m <= 0) {
     throw new Error(`[SYSTEM] OD_RVOL_1M must be > 0: ${od.minRvol1m}`);
+  }
+  if (od.minOrbVolumeMultiple <= 0) {
+    throw new Error(
+      `[SYSTEM] OD_MIN_ORB_VOLUME_MULTIPLE must be > 0: ${od.minOrbVolumeMultiple}`,
+    );
   }
   if (od.minImbalance <= 0.5 || od.minImbalance > 1) {
     throw new Error(

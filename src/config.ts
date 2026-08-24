@@ -1,6 +1,6 @@
 // Importing './env' loads the environment file — see the note in that module.
 import { parseFloatEnv, parseIntEnv, parseStringEnv, requireEnv } from './env';
-import { computeTrailLockedPct } from './exitPredicates';
+import { computeTrailLockedPct, isProfitLockingTrail, minProfitLockingTriggerPct } from './exitPredicates';
 
 function parseFeed(envKey: string, raw: string | undefined, fallback: 'iex' | 'sip'): 'iex' | 'sip' {
   const value = (raw ?? fallback).trim().toLowerCase();
@@ -55,10 +55,10 @@ const config = {
     maxPositionPct: parseFloatEnv('MAX_POSITION_PCT', 0.55),
     riskPerTradePct: parseFloatEnv('RISK_PER_TRADE_PCT', 0.20),
     minRiskRewardRatio: parseFloatEnv('MIN_RISK_REWARD_RATIO', 2),
-    // Loose trail: do not choke a runner until it has actually extended. Must
-    // stay above TRAILING_STOP_PCT / (1 − TRAILING_STOP_PCT) or arming the trail
-    // widens risk instead of banking the move — enforced in validateConfig.
-    atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.20),
+    // Percent trail: arm inside the Opening Drive MFE body (~4–10%, median ~8%),
+    // not in the +20% tail. 8% / 4% locks +3.68% on the ticket; a 12% trail
+    // cannot lock a profit unless the trigger exceeds 13.6% — above typical MFE.
+    atrTrailTriggerPct: parseFloatEnv('ATR_TRAIL_TRIGGER_PCT', 0.08),
     atrTrailMultiplier: parseFloatEnv('ATR_TRAIL_MULTIPLIER', 4),
     timeStopMinutes: parseIntEnv('TIME_STOP_MINUTES', 20),
     atrStopMultiplier: parseFloatEnv('ATR_STOP_MULTIPLIER', 1.5),
@@ -68,7 +68,7 @@ const config = {
       'SCALE_OUT_TARGET_PCT',
       parseFloatEnv('SCALE_OUT_TARGET_PCT_CORE', 0.30),
     ),
-    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.12),
+    trailingStopPct: parseFloatEnv('TRAILING_STOP_PCT', 0.04),
     takeProfitEnabled: process.env.TAKE_PROFIT_ENABLED === 'true',
     scaleOutEnabled: process.env.SCALE_OUT_ENABLED === 'true',
     smartExitsEnabled: process.env.SMART_EXITS_ENABLED === 'true',
@@ -369,9 +369,9 @@ const config = {
   // A percent trail armed too early is a risk widener, not a protection: the
   // stop lands below entry and the initial hard stop has already been cancelled.
   if (r.usePercentTrail) {
-    const lockedPct = computeTrailLockedPct(r.atrTrailTriggerPct, r.trailingStopPct);
-    if (lockedPct <= 0) {
-      const minTrigger = r.trailingStopPct / (1 - r.trailingStopPct);
+    if (!isProfitLockingTrail(r.atrTrailTriggerPct, r.trailingStopPct)) {
+      const lockedPct = computeTrailLockedPct(r.atrTrailTriggerPct, r.trailingStopPct);
+      const minTrigger = minProfitLockingTriggerPct(r.trailingStopPct);
       throw new Error(
         `[SYSTEM] ATR_TRAIL_TRIGGER_PCT (${(r.atrTrailTriggerPct * 100).toFixed(1)}%) is too low ` +
         `for TRAILING_STOP_PCT (${(r.trailingStopPct * 100).toFixed(1)}%): arming the trail would ` +

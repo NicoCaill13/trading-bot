@@ -11,8 +11,8 @@ const OPTIONS: SimOptions = {
   spreadPctOneWay: 0,
   maxEntryChasePct: 3.0,
   hardStopFloorPct: 0.025,
-  trailTriggerPct: 0.20,
-  trailPct: 0.12,
+  trailTriggerPct: 0.08,
+  trailPct: 0.04,
   timeStopMinutes: 20,
   hardCloseMinutes: 15 * 60 + 55,
 };
@@ -140,15 +140,15 @@ describe('simulateTrade — exits', () => {
       bar(2, 12.4, 12.4, 10.5, 10.6),
     ]);
     assert.equal(trade.exitReason, 'trailing-stop');
-    assert.equal(trade.exitPrice, 12.5 * 0.88);
+    assert.equal(trade.exitPrice, 12.5 * (1 - OPTIONS.trailPct));
     assert.equal(trade.mfePct, 0.25);
   });
 
   it('leaves the trail unarmed below the trigger, so the original stop holds', () => {
     const trade = run([
       bar(0, 10, 10, 10, 10),
-      bar(1, 10, 11.5, 10, 11.4),
-      bar(2, 11.4, 11.4, 8.9, 9),
+      bar(1, 10, 10.7, 10, 10.6),
+      bar(2, 10.6, 10.6, 8.9, 9),
     ]);
     assert.equal(trade.exitReason, 'stop-loss');
     assert.equal(trade.exitPrice, 9);
@@ -162,7 +162,7 @@ describe('simulateTrade — exits', () => {
       bar(3, 14.9, 14.9, 13, 13.1),
     ]);
     assert.equal(trade.exitReason, 'trailing-stop');
-    assert.equal(trade.exitPrice, 15 * 0.88);
+    assert.equal(trade.exitPrice, 15 * (1 - OPTIONS.trailPct));
   });
 
   it('fires the time stop only when the position never went positive', () => {

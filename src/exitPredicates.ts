@@ -1,5 +1,8 @@
 /**
  * Pure exit predicates for V7 risk management — unit-testable, no I/O.
+ *
+ * Trail arithmetic lives here so config validation, live exits, and the
+ * Opening Drive harness cannot drift apart.
  */
 
 /** True when position has stagnated without positive MFE for timeStopMinutes. */
@@ -28,6 +31,15 @@ export function shouldActivateAtrTrail(
 }
 
 /**
+ * Lowest trigger at which a percent trail still locks a non-negative gain.
+ * Arming at this level is break-even vs entry; anything lower is a risk widener.
+ */
+export function minProfitLockingTriggerPct(trailPct: number): number {
+  if (!(trailPct > 0) || trailPct >= 1) return Number.POSITIVE_INFINITY;
+  return trailPct / (1 - trailPct);
+}
+
+/**
  * Gain locked in, as a fraction of entry, the moment a percent trail is armed.
  *
  * The broker anchors `trail_percent` on the high-water mark, so arming at +T
@@ -41,4 +53,9 @@ export function computeTrailLockedPct(
   trailPct: number,
 ): number {
   return (1 + triggerPct) * (1 - trailPct) - 1;
+}
+
+/** Strict: the stop placed at arm sits above entry. */
+export function isProfitLockingTrail(triggerPct: number, trailPct: number): boolean {
+  return computeTrailLockedPct(triggerPct, trailPct) > 0;
 }

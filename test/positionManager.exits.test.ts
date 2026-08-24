@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeTrailLockedPct,
+  isProfitLockingTrail,
+  minProfitLockingTriggerPct,
   shouldActivateAtrTrail,
   shouldTriggerTimeStop,
 } from '../src/exitPredicates';
@@ -38,22 +40,39 @@ describe('shouldActivateAtrTrail', () => {
   });
 });
 
+describe('minProfitLockingTriggerPct', () => {
+  it('is trail / (1 - trail)', () => {
+    assert.ok(Math.abs(minProfitLockingTriggerPct(0.12) - 0.12 / 0.88) < 1e-12);
+    assert.ok(Math.abs(minProfitLockingTriggerPct(0.04) - 0.04 / 0.96) < 1e-12);
+  });
+
+  it('is infinite on a degenerate trail', () => {
+    assert.equal(minProfitLockingTriggerPct(1), Number.POSITIVE_INFINITY);
+    assert.equal(minProfitLockingTriggerPct(0), Number.POSITIVE_INFINITY);
+  });
+});
+
 describe('computeTrailLockedPct', () => {
   it('reports a loss when the trail is armed below its own width', () => {
-    // The rejected Hyper-Growth pairing: +10% trigger with a 12% trail lands the
-    // stop under entry, looser than the 2.5% hard floor it replaces.
     const locked = computeTrailLockedPct(0.10, 0.12);
     assert.ok(locked < 0, `expected a negative lock, got ${locked}`);
     assert.ok(Math.abs(locked - -0.032) < 1e-9);
+    assert.equal(isProfitLockingTrail(0.10, 0.12), false);
   });
 
-  it('is flat exactly at trail / (1 - trail)', () => {
+  it('is flat exactly at minProfitLockingTriggerPct', () => {
     const trail = 0.12;
-    const breakEvenTrigger = trail / (1 - trail);
+    const breakEvenTrigger = minProfitLockingTriggerPct(trail);
     assert.ok(Math.abs(computeTrailLockedPct(breakEvenTrigger, trail)) < 1e-12);
   });
 
-  it('locks a gain at the shipped 20% / 12% pairing', () => {
+  it('locks a gain at the shipped 8% / 4% pairing', () => {
+    const locked = computeTrailLockedPct(0.08, 0.04);
+    assert.ok(Math.abs(locked - 0.0368) < 1e-9, `got ${locked}`);
+    assert.equal(isProfitLockingTrail(0.08, 0.04), true);
+  });
+
+  it('still locks at the legacy 20% / 12% pairing, above typical MFE', () => {
     const locked = computeTrailLockedPct(0.20, 0.12);
     assert.ok(Math.abs(locked - 0.056) < 1e-9, `got ${locked}`);
   });

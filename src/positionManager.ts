@@ -267,7 +267,8 @@ export async function handlePositionUpdate(
     return;
   }
 
-  // 2 — Loose trailing stop once MFE / unrealized >= trigger (default +10%)
+  // 2 — Percent trail once unrealized >= trigger. Pairing is validated at boot
+  // so arming always locks a gain; trigger sits in the Opening Drive MFE body.
   if (
     shouldActivateAtrTrail(unrealizedPct, config.risk.atrTrailTriggerPct) &&
     !atrTrailApplied.has(symbol)
@@ -277,7 +278,7 @@ export async function handlePositionUpdate(
         symbol,
         position,
         config.risk.trailingStopPct,
-        `loose trail ${(config.risk.trailingStopPct * 100).toFixed(0)}%`,
+        `trail ${(config.risk.trailingStopPct * 100).toFixed(0)}%`,
         atrTrailApplied,
       );
     } else {

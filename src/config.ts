@@ -161,6 +161,7 @@ const config = {
   },
 
   // Opening Drive — sole live entry path. ORB 1-min high break, 09:30–09:45 EST.
+  // Volume + close location first. Spread and signed tape veto when present.
   openingDrive: {
     shadow: process.env.OD_SHADOW === 'true',
     windowStartHour: parseIntEnv('OD_WINDOW_START_HOUR', 9),
@@ -168,10 +169,13 @@ const config = {
     windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 9),
     windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 45),
     minRvol1m: parseFloatEnv('OD_RVOL_1M', 2.0),
-    minImbalance: parseFloatEnv('OD_MIN_IMBALANCE', 0.65),
     maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.08),
     rvolBaselineBars: parseIntEnv('OD_RVOL_BASELINE_BARS', 20),
     minOrbVolumeMultiple: parseFloatEnv('OD_MIN_ORB_VOLUME_MULTIPLE', 1.5),
+    minCloseLocation: parseFloatEnv('OD_MIN_CLOSE_LOCATION', 2 / 3),
+    maxSpreadPct: parseFloatEnv('OD_MAX_SPREAD_PCT', 0.004),
+    minTapeDelta: parseFloatEnv('OD_MIN_TAPE_DELTA', 0),
+    tapeEnabled: process.env.OD_TAPE_ENABLED !== 'false',
     shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
   },
 
@@ -563,9 +567,19 @@ const config = {
       `[SYSTEM] OD_MIN_ORB_VOLUME_MULTIPLE must be > 0: ${od.minOrbVolumeMultiple}`,
     );
   }
-  if (od.minImbalance <= 0.5 || od.minImbalance > 1) {
+  if (od.minCloseLocation <= 0.5 || od.minCloseLocation > 1) {
     throw new Error(
-      `[SYSTEM] OD_MIN_IMBALANCE must be in (0.5, 1]: ${od.minImbalance}`,
+      `[SYSTEM] OD_MIN_CLOSE_LOCATION must be in (0.5, 1]: ${od.minCloseLocation}`,
+    );
+  }
+  if (od.maxSpreadPct <= 0 || od.maxSpreadPct > 0.05) {
+    throw new Error(
+      `[SYSTEM] OD_MAX_SPREAD_PCT must be in (0, 0.05]: ${od.maxSpreadPct}`,
+    );
+  }
+  if (od.minTapeDelta < -1 || od.minTapeDelta >= 1) {
+    throw new Error(
+      `[SYSTEM] OD_MIN_TAPE_DELTA must be in [-1, 1): ${od.minTapeDelta}`,
     );
   }
   if (od.maxExtensionPct <= 0 || od.maxExtensionPct >= 1) {

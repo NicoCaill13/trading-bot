@@ -13,8 +13,8 @@
  * Known optimism, stated so results are not overread:
  *  - Fills assume the full size trades at one price. Real micro-cap books are
  *    thin; a 100-share market order can walk several levels.
- *  - Order book imbalance is absent from history, so that gate is skipped. Live,
- *    it can only reject trades this harness takes.
+ *  - Quotes and signed tape are absent from history, so spread and tape vetoes
+ *    fail open. Live they can only reject trades this harness takes.
  *  - Session VWAP is built from RTH bars only. The live bot seeds it with
  *    pre-market bars, so its VWAP gate behaves slightly differently.
  *
@@ -63,10 +63,12 @@ const OD_OPTIONS: OpeningDriveOptions = {
   windowEndMinutes:
     config.openingDrive.windowEndHour * 60 + config.openingDrive.windowEndMinute,
   minRvol1m: config.openingDrive.minRvol1m,
-  minImbalance: config.openingDrive.minImbalance,
   maxExtensionPct: config.openingDrive.maxExtensionPct,
   rvolBaselineBars: config.openingDrive.rvolBaselineBars,
   minOrbVolumeMultiple: config.openingDrive.minOrbVolumeMultiple,
+  minCloseLocation: config.openingDrive.minCloseLocation,
+  maxSpreadPct: config.openingDrive.maxSpreadPct,
+  minTapeDelta: config.openingDrive.minTapeDelta,
   hardStopFloorPct: config.risk.hardStopFloorPct,
 };
 

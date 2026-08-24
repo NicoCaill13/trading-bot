@@ -1,8 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  computeCloseLocation,
   computeOneMinuteRvol,
   computeOrbVolumeMultiple,
+  computeSpreadPct,
   evaluateOpeningDrive,
   type OpeningDriveContext,
   type OpeningDriveOptions,
@@ -14,10 +16,12 @@ const OPTS: OpeningDriveOptions = {
   windowStartMinutes: 9 * 60 + 30,
   windowEndMinutes: 9 * 60 + 45,
   minRvol1m: 2.0,
-  minImbalance: 0.65,
   maxExtensionPct: 0.08,
   rvolBaselineBars: 20,
   minOrbVolumeMultiple: 1.5,
+  minCloseLocation: 2 / 3,
+  maxSpreadPct: 0.004,
+  minTapeDelta: 0,
   hardStopFloorPct: 0.025,
 };
 
@@ -62,6 +66,9 @@ function context(overrides: Partial<OpeningDriveContext> = {}): OpeningDriveCont
     sessionVwap: 5.05,
     impulseBar,
     oneMinBars: overrides.oneMinBars ?? history(impulseBar),
+    bid: null,
+    ask: null,
+    tapeDelta: null,
     imbalance: null,
     ...overrides,
   };
@@ -184,7 +191,7 @@ describe('evaluateOpeningDrive — ORB 1-min gating', () => {
 });
 
 describe('evaluateOpeningDrive — momentum', () => {
-  it('rejects when RVOL, ORB volume multiple and book are all short', () => {
+  it('rejects when RVOL and ORB volume multiple are both short', () => {
     const impulse = bar(5.20, 90_000, 5.12, 5.22);
     const decision = evaluateOpeningDrive(
       context({ impulseBar: impulse, oneMinBars: history(impulse, 80_000) }),
@@ -194,19 +201,28 @@ describe('evaluateOpeningDrive — momentum', () => {
     assert.equal(decision.rejection, 'no_momentum');
   });
 
-  it('arms on book pressure alone when volume is short', () => {
+  it('does not arm on tape or a tight spread when volume is short', () => {
     const impulse = bar(5.20, 90_000, 5.12, 5.22);
     const decision = evaluateOpeningDrive(
       context({
         impulseBar: impulse,
         oneMinBars: history(impulse, 80_000),
-        imbalance: 0.8,
+        bid: 5.19,
+        ask: 5.20,
+        tapeDelta: 0.8,
       }),
       OPTS,
     );
 
+    assert.equal(decision.armed, false);
+    assert.equal(decision.rejection, 'no_momentum');
+  });
+
+  it('arms on volume when quotes and tape are missing', () => {
+    const decision = evaluateOpeningDrive(context(), OPTS);
     assert.equal(decision.armed, true);
-    assert.equal(decision.imbalance, 0.8);
+    assert.equal(decision.spreadPct, null);
+    assert.equal(decision.tapeDelta, null);
   });
 
   it('arms on first-minute volume multiple without RVOL', () => {
@@ -219,6 +235,71 @@ describe('evaluateOpeningDrive — momentum', () => {
 
     assert.equal(decision.armed, true);
     assert.equal(computeOrbVolumeMultiple(160_000, RANGE.volume), 2);
+  });
+});
+
+describe('evaluateOpeningDrive — close location', () => {
+  it('places the close in the bar range', () => {
+    assertRatio(computeCloseLocation(bar(5.20, 1, 5.12, 5.22)) ?? 0, 0.8);
+  });
+
+  it('rejects a close in the lower half of the impulse bar', () => {
+    const impulse = bar(5.14, 200_000, 5.12, 5.22);
+    const decision = evaluateOpeningDrive(
+      context({ impulseBar: impulse, oneMinBars: history(impulse) }),
+      OPTS,
+    );
+    assert.equal(decision.rejection, 'no_impulse_body');
+  });
+});
+
+describe('evaluateOpeningDrive — spread veto', () => {
+  it('returns null without a two-sided quote', () => {
+    assert.equal(computeSpreadPct(null, 5.2), null);
+    assert.equal(computeSpreadPct(5.2, null), null);
+  });
+
+  it('fails open when no quote is present', () => {
+    const decision = evaluateOpeningDrive(context({ bid: null, ask: null }), OPTS);
+    assert.equal(decision.armed, true);
+  });
+
+  it('rejects a quote too wide to trade', () => {
+    const decision = evaluateOpeningDrive(context({ bid: 5.00, ask: 5.05 }), OPTS);
+    assert.equal(decision.rejection, 'wide_spread');
+    assert.ok(decision.spreadPct !== null && decision.spreadPct > OPTS.maxSpreadPct);
+  });
+
+  it('rejects a crossed market', () => {
+    const decision = evaluateOpeningDrive(context({ bid: 5.22, ask: 5.18 }), OPTS);
+    assert.equal(decision.rejection, 'wide_spread');
+  });
+
+  it('arms when the spread is inside the cap', () => {
+    const decision = evaluateOpeningDrive(context({ bid: 5.19, ask: 5.20 }), OPTS);
+    assert.equal(decision.armed, true);
+  });
+});
+
+describe('evaluateOpeningDrive — tape veto', () => {
+  it('fails open when no prints were classified', () => {
+    const decision = evaluateOpeningDrive(context({ tapeDelta: null }), OPTS);
+    assert.equal(decision.armed, true);
+  });
+
+  it('rejects selling pressure on the impulse minute', () => {
+    const decision = evaluateOpeningDrive(context({ tapeDelta: -0.2 }), OPTS);
+    assert.equal(decision.rejection, 'adverse_tape');
+  });
+
+  it('rejects a flat tape when the floor is zero', () => {
+    const decision = evaluateOpeningDrive(context({ tapeDelta: 0 }), OPTS);
+    assert.equal(decision.rejection, 'adverse_tape');
+  });
+
+  it('arms when the tape is buying', () => {
+    const decision = evaluateOpeningDrive(context({ tapeDelta: 0.3 }), OPTS);
+    assert.equal(decision.armed, true);
   });
 });
 
@@ -277,7 +358,7 @@ describe('evaluateOpeningDrive — stop reference', () => {
 
   it('widens a tight first-minute low down to the hard floor', () => {
     const tightRange = bar(5.00, 80_000, 5.08, 5.10, '2026-08-18T13:30:00Z');
-    const impulse = bar(5.20, 200_000, 5.18, 5.22);
+    const impulse = bar(5.20, 200_000, 5.10, 5.22);
     const decision = evaluateOpeningDrive(
       context({
         rangeBar: tightRange,

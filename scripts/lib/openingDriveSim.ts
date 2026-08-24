@@ -13,10 +13,12 @@
  *  - Both legs pay the spread.
  */
 
-import { evaluateOpeningDrive, type OpeningDriveContext } from '../../src/openingDrive';
+import { evaluateOpeningDrive, type OpeningDriveContext, type OpeningDriveOptions } from '../../src/openingDrive';
 import { minutesSinceMidnight } from '../../src/vwapSetup';
 import { toESTDate } from '../../src/utils';
 import type { BarData } from '../../src/types';
+
+export type { OpeningDriveOptions };
 
 export type SimExitReason = 'stop-loss' | 'trailing-stop' | 'time-stop' | 'hard-close';
 
@@ -32,17 +34,6 @@ export interface SimOptions {
   timeStopMinutes: number;
   /** Minutes since EST midnight at which any open position is flattened. */
   hardCloseMinutes: number;
-}
-
-export interface OpeningDriveOptions {
-  windowStartMinutes: number;
-  windowEndMinutes: number;
-  minRvol1m: number;
-  minImbalance: number;
-  maxExtensionPct: number;
-  rvolBaselineBars: number;
-  minOrbVolumeMultiple: number;
-  hardStopFloorPct: number;
 }
 
 export interface SimTrade {
@@ -127,6 +118,9 @@ export function findSignal(
       sessionVwap: cumulativeVwap(history),
       impulseBar: bar,
       oneMinBars: history,
+      bid: null,
+      ask: null,
+      tapeDelta: null,
       imbalance: null,
     };
 

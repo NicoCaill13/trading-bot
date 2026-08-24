@@ -227,6 +227,8 @@ export type OpeningDriveRejection =
   | 'open_broken'
   | 'no_momentum'
   | 'no_impulse_body'
+  | 'adverse_tape'
+  | 'wide_spread'
   | 'max_extension';
 
 export interface OpeningDriveDecision {
@@ -235,8 +237,14 @@ export interface OpeningDriveDecision {
   /** Impulse close vs session VWAP. Null when the session state is incomplete. */
   extensionPct: number | null;
   rvol1m: number | null;
-  /** Top-of-book bid share; null when L2 is disabled or no quote was seen. */
+  /** Top-of-book bid share; diagnostic only, never a gate. */
   imbalance: number | null;
+  /** (ask−bid)/mid. Null when no two-sided quote was seen. */
+  spreadPct: number | null;
+  /** (close−low)/(high−low) of the impulse bar. Null on a doji. */
+  closeLocation: number | null;
+  /** Signed volume share on the impulse minute. Null when no classified prints. */
+  tapeDelta: number | null;
   /** Impulse bar close — the theoretical fill this decision is about. */
   entryPrice: number | null;
   /** Effective stop: impulse bar low widened to the hard stop floor. */
@@ -542,6 +550,17 @@ export interface WsQuoteMessage {
   t: string;
 }
 
+/** Alpaca trade print (IEX or SIP depending on the stream feed). */
+export interface WsTradeMessage {
+  T: 't';
+  S: string;
+  /** Trade price */
+  p: number;
+  /** Trade size in shares */
+  s: number;
+  t: string;
+}
+
 export interface WsSuccessMessage {
   T: 'success';
   msg: string;
@@ -556,6 +575,7 @@ export interface WsErrorMessage {
 export type WsMessage =
   | WsBarMessage
   | WsQuoteMessage
+  | WsTradeMessage
   | WsSuccessMessage
   | WsErrorMessage
   | { T: string };
@@ -576,6 +596,11 @@ export type MarketDataEvent =
       kind: 'quote';
       receivedAt: number;
       quote: WsQuoteMessage;
+    }
+  | {
+      kind: 'trade';
+      receivedAt: number;
+      trade: WsTradeMessage;
     };
 
 export interface OrderBookLevel {

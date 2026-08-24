@@ -25,10 +25,12 @@ const opts = {
   windowStartMinutes: config.openingDrive.windowStartHour * 60 + config.openingDrive.windowStartMinute,
   windowEndMinutes: config.openingDrive.windowEndHour * 60 + config.openingDrive.windowEndMinute,
   minRvol1m: config.openingDrive.minRvol1m,
-  minImbalance: config.openingDrive.minImbalance,
   maxExtensionPct: config.openingDrive.maxExtensionPct,
   rvolBaselineBars: config.openingDrive.rvolBaselineBars,
   minOrbVolumeMultiple: config.openingDrive.minOrbVolumeMultiple,
+  minCloseLocation: config.openingDrive.minCloseLocation,
+  maxSpreadPct: config.openingDrive.maxSpreadPct,
+  minTapeDelta: config.openingDrive.minTapeDelta,
   hardStopFloorPct: config.risk.hardStopFloorPct,
 };
 
@@ -113,6 +115,9 @@ async function main(): Promise<void> {
       sessionVwap: vwap,
       impulseBar: bar,
       oneMinBars: history,
+      bid: null,
+      ask: null,
+      tapeDelta: null,
       imbalance: null,
     };
 
@@ -127,7 +132,7 @@ async function main(): Promise<void> {
     }
     if (d.rvol1m !== null && d.rvol1m > opts.minRvol1m) surgeBars++;
 
-    if (d.rejection === 'no_momentum') continue;
+    if (d.rejection === 'no_momentum' || d.rejection === 'adverse_tape' || d.rejection === 'wide_spread') continue;
 
     if (d.armed || d.rejection === 'max_extension') {
       const rejectedBy = d.armed ? null : 'max_extension';

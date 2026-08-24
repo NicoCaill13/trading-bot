@@ -28,6 +28,7 @@ import {
   describeOpeningDriveDecision,
   evaluateOpeningDrive,
   type OpeningDriveContext,
+  type OpeningDriveOptions,
 } from './openingDrive';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
 import {
@@ -61,6 +62,12 @@ import { createMarketDataBus } from './marketDataBus';
 import { createHeartbeatWriter } from './heartbeat';
 import { assessQuoteForWall } from './orderBook';
 import {
+  computeTapeDelta,
+  minuteEpoch,
+  signPrint,
+  type TapeBucket,
+} from './tapeDelta';
+import {
   getEffectiveRiskPerTradePct,
   runMorningRegimeAssessment,
 } from './regimeModel';
@@ -79,6 +86,7 @@ import type {
   WsMessage,
   WsBarMessage,
   WsQuoteMessage,
+  WsTradeMessage,
   WsSuccessMessage,
   WsErrorMessage,
   DiscordField,
@@ -138,6 +146,9 @@ const EMA9_HISTORY_MAX = 50;
 // Level 2 / quote wall arming (Core VWAP complementary trigger)
 const l2WallSignals = new Map<string, ImbalanceSignal>();
 const l2QuotesSeen = new Set<string>();
+const lastNbbo = new Map<string, { bid: number; ask: number; mid: number }>();
+const tapeMinutes = new Map<string, Map<number, TapeBucket>>();
+const lastTradePrice = new Map<string, number>();
 
 // Regular-session open per symbol — the Opening Drive extension reference.
 // Captured from the first 1-min bar timestamped at or after 09:30 EST, never
@@ -147,6 +158,7 @@ const sessionOpenPrice = new Map<string, number>();
 const openingRangeBar = new Map<string, BarData>();
 // Symbols already evaluated-and-armed by the Opening Drive path this session.
 const openingDriveTriggered = new Set<string>();
+const openingDriveBookRejectLogged = new Set<string>();
 // Symbols whose audited rejection was already recorded. Tracked apart from the
 // armed set: a name can be capped at 09:51 and legitimately arm at 09:54 once
 // VWAP catches up, and both observations matter — but only the first cap does.
@@ -602,6 +614,10 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
   sessionOpenPrice.clear();
   openingDriveTriggered.clear();
   openingDriveAuditLogged.clear();
+  openingDriveBookRejectLogged.clear();
+  lastNbbo.clear();
+  tapeMinutes.clear();
+  lastTradePrice.clear();
 
   const keep = new Set(watchlist.symbols.map(s => s.symbol));
   for (const symbol of [...oneMinBarHistory.keys()]) {
@@ -675,6 +691,10 @@ async function consumeMarketData(event: MarketDataEvent): Promise<void> {
   }
   if (event.kind === 'quote') {
     handleQuoteEvent(event.quote, event.receivedAt);
+    return;
+  }
+  if (event.kind === 'trade') {
+    handleTradeEvent(event.trade);
   }
 }
 
@@ -1151,6 +1171,67 @@ function openingDriveWindowMinutes(): { start: number; end: number } {
   };
 }
 
+function openingDriveLiveOptions(): OpeningDriveOptions {
+  const od = config.openingDrive;
+  const window = openingDriveWindowMinutes();
+  return {
+    windowStartMinutes: window.start,
+    windowEndMinutes: window.end,
+    minRvol1m: od.minRvol1m,
+    maxExtensionPct: od.maxExtensionPct,
+    rvolBaselineBars: od.rvolBaselineBars,
+    minOrbVolumeMultiple: od.minOrbVolumeMultiple,
+    minCloseLocation: od.minCloseLocation,
+    maxSpreadPct: od.maxSpreadPct,
+    minTapeDelta: od.minTapeDelta,
+    hardStopFloorPct: config.risk.hardStopFloorPct,
+  };
+}
+
+function tapeDeltaForBar(symbol: string, barTimestamp: string): number | null {
+  if (!config.openingDrive.tapeEnabled) return null;
+  const minute = minuteEpoch(barTimestamp);
+  if (minute === null) return null;
+  const bucket = tapeMinutes.get(symbol)?.get(minute);
+  if (!bucket) return null;
+  return computeTapeDelta(bucket.buyVolume, bucket.sellVolume);
+}
+
+function rememberNbbo(quote: WsQuoteMessage): void {
+  if (!(quote.bp > 0) || !(quote.ap > 0)) return;
+  lastNbbo.set(quote.S, {
+    bid: quote.bp,
+    ask: quote.ap,
+    mid: (quote.bp + quote.ap) / 2,
+  });
+}
+
+function ingestSignedPrint(symbol: string, price: number, size: number, timestamp: string): void {
+  const minute = minuteEpoch(timestamp);
+  if (minute === null || !(price > 0) || !(size > 0)) return;
+
+  const mid = lastNbbo.get(symbol)?.mid ?? l2WallSignals.get(symbol)?.mid ?? null;
+  const prev = lastTradePrice.get(symbol) ?? null;
+  const side = signPrint(price, mid, prev);
+  lastTradePrice.set(symbol, price);
+  if (side === 0) return;
+
+  let buckets = tapeMinutes.get(symbol);
+  if (!buckets) {
+    buckets = new Map();
+    tapeMinutes.set(symbol, buckets);
+  }
+  const current = buckets.get(minute) ?? { buyVolume: 0, sellVolume: 0 };
+  if (side === 1) current.buyVolume += size;
+  else current.sellVolume += size;
+  buckets.set(minute, current);
+
+  if (buckets.size > 4) {
+    const keys = [...buckets.keys()].sort((a, b) => a - b);
+    for (const key of keys.slice(0, keys.length - 4)) buckets.delete(key);
+  }
+}
+
 /**
  * Opening Drive path — ORB 1-min high break on Hyper-Growth runners.
  * No straight-run tag, no VWAP pullback, no Fibonacci gate.
@@ -1161,7 +1242,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   if (openingDriveTriggered.has(symbol)) return;
 
   const screenerData = screenerDataMap.get(symbol);
-  const window = openingDriveWindowMinutes();
+  const nbbo = lastNbbo.get(symbol);
   const ctx: OpeningDriveContext = {
     symbol,
     barMinutesSinceMidnight: minutesSinceMidnight(toESTDate(new Date(bar1m.timestamp))),
@@ -1171,24 +1252,28 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     sessionVwap: resolveVwapForSymbol(symbol),
     impulseBar: bar1m,
     oneMinBars: oneMinBarHistory.get(symbol) ?? [bar1m],
+    bid: nbbo?.bid ?? l2WallSignals.get(symbol)?.topBid?.price ?? null,
+    ask: nbbo?.ask ?? l2WallSignals.get(symbol)?.topAsk?.price ?? null,
+    tapeDelta: tapeDeltaForBar(symbol, bar1m.timestamp),
     imbalance: l2WallSignals.get(symbol)?.imbalance ?? null,
   };
 
-  const decision = evaluateOpeningDrive(ctx, {
-    windowStartMinutes: window.start,
-    windowEndMinutes: window.end,
-    minRvol1m: config.openingDrive.minRvol1m,
-    minImbalance: config.openingDrive.minImbalance,
-    maxExtensionPct: config.openingDrive.maxExtensionPct,
-    rvolBaselineBars: config.openingDrive.rvolBaselineBars,
-    minOrbVolumeMultiple: config.openingDrive.minOrbVolumeMultiple,
-    hardStopFloorPct: config.risk.hardStopFloorPct,
-  });
+  const decision = evaluateOpeningDrive(ctx, openingDriveLiveOptions());
 
   // Codes that fire on every bar outside the setup would flood the log; the ones
   // kept below all mean "the setup was live and something specific stopped it".
   if (!decision.armed) {
     if (decision.rejection === 'max_extension' || decision.rejection === 'no_impulse_body') {
+      odLog.info(
+        `${symbol}: setup rejected by ${decision.rejection} — ` +
+        describeOpeningDriveDecision(decision),
+      );
+    }
+    if (
+      (decision.rejection === 'wide_spread' || decision.rejection === 'adverse_tape') &&
+      !openingDriveBookRejectLogged.has(symbol)
+    ) {
+      openingDriveBookRejectLogged.add(symbol);
       odLog.info(
         `${symbol}: setup rejected by ${decision.rejection} — ` +
         describeOpeningDriveDecision(decision),
@@ -2029,12 +2114,13 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function buildSubscribeMessage(symbols: string[]): string {
-  const payload: { action: string; bars: string[]; quotes?: string[] } = {
+  const payload: { action: string; bars: string[]; quotes?: string[]; trades?: string[] } = {
     action: 'subscribe',
     bars: symbols,
+    quotes: symbols,
   };
-  if (config.level2.enabled) {
-    payload.quotes = symbols;
+  if (config.openingDrive.tapeEnabled) {
+    payload.trades = symbols;
   }
   return JSON.stringify(payload);
 }
@@ -2045,6 +2131,10 @@ function isWsBarMessage(msg: WsMessage): msg is WsBarMessage {
 
 function isWsQuoteMessage(msg: WsMessage): msg is WsQuoteMessage {
   return msg.T === 'q';
+}
+
+function isWsTradeMessage(msg: WsMessage): msg is WsTradeMessage {
+  return msg.T === 't';
 }
 
 function isWsSuccessMessage(msg: WsMessage): msg is WsSuccessMessage {
@@ -2064,6 +2154,7 @@ function resolveVwapForSymbol(symbol: string): number | null {
 }
 
 function handleQuoteEvent(quote: WsQuoteMessage, receivedAt: number): void {
+  rememberNbbo(quote);
   if (!config.level2.enabled) return;
 
   try {
@@ -2094,6 +2185,14 @@ function handleQuoteEvent(quote: WsQuoteMessage, receivedAt: number): void {
   }
 }
 
+function handleTradeEvent(trade: WsTradeMessage): void {
+  try {
+    ingestSignedPrint(trade.S, trade.p, trade.s, trade.t);
+  } catch (err: unknown) {
+    odLog.warn(`${trade.S}: trade handling failed — ${toErrorMessage(err)}`);
+  }
+}
+
 async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promise<void> {
   let messages: WsMessage[];
   try {
@@ -2109,7 +2208,7 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
       wsState = 'authenticated';
       log.info(
         `WebSocket authenticated — subscribing to ${symbols.length} symbols` +
-        (config.level2.enabled ? ' (bars+quotes)' : ' (bars)'),
+        (config.openingDrive.tapeEnabled ? ' (bars+quotes+trades)' : ' (bars+quotes)'),
       );
       ws?.send(buildSubscribeMessage(symbols));
     }
@@ -2122,11 +2221,19 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
       });
     }
 
-    if (config.level2.enabled && isWsQuoteMessage(msg)) {
+    if (isWsQuoteMessage(msg)) {
       marketDataBus.publish({
         kind: 'quote',
         receivedAt: Date.now(),
         quote: msg,
+      });
+    }
+
+    if (config.openingDrive.tapeEnabled && isWsTradeMessage(msg)) {
+      marketDataBus.publish({
+        kind: 'trade',
+        receivedAt: Date.now(),
+        trade: msg,
       });
     }
 
@@ -2353,6 +2460,10 @@ function scheduleDailyReset(): void {
     openingRangeBar.clear();
     openingDriveTriggered.clear();
     openingDriveAuditLogged.clear();
+    openingDriveBookRejectLogged.clear();
+    lastNbbo.clear();
+    tapeMinutes.clear();
+    lastTradePrice.clear();
     shadowJournal.closeAllShadowRecords(new Date().toISOString());
     void shadowJournal.flushShadowRecords().then(() => shadowJournal.reset());
     atrAtEntry.clear();
@@ -2541,6 +2652,13 @@ async function main(): Promise<void> {
   await reconcileStateFromBroker();
   await hydrateIntradayBars(symbols);
   connectWatchlistStream();
+
+  if (config.openingDrive.tapeEnabled) {
+    odLog.info(
+      `TAPE enabled — ${activeStreamFeed} prints signed Lee-Ready | ` +
+      `minDelta>${config.openingDrive.minTapeDelta} (fail-open when no prints)`,
+    );
+  }
 
   if (config.level2.enabled) {
     l2Log.info(

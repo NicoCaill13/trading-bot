@@ -74,6 +74,7 @@ import type {
   SetupKind,
   OrbState,
   WatchlistSymbol,
+  Watchlist,
   EnteredSymbolEntry,
   WsMessage,
   WsBarMessage,
@@ -504,6 +505,8 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
           `need ${requiredWatchlistTradingDay ?? 'unknown'}) — ` +
           `evening screener disabled; waiting for 09:15 pre-market scan`,
         );
+        watchlistGeneratedAt = null;
+        watchlistTradingDay = null;
         return [];
       }
     } else {
@@ -537,6 +540,18 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
 
   if (data === null || data.symbols.length === 0) {
     log.warn('Watchlist empty after load');
+    return [];
+  }
+
+  if (
+    !config.screener.eveningScreenerEnabled &&
+    data.symbols.some(s => !isV2Symbol(s))
+  ) {
+    log.warn(
+      'On-disk watchlist still contains Core names — ignored (Hyper-Growth is V2-only)',
+    );
+    watchlistGeneratedAt = null;
+    watchlistTradingDay = null;
     return [];
   }
 
@@ -575,6 +590,33 @@ function applyV2WatchlistSymbols(v2Symbols: WatchlistSymbol[]): string[] {
 
   monitoredSymbols = [...new Set([...monitoredSymbols, ...v2PersistentSymbols])];
   return newSymbols;
+}
+
+/** Drop leftover Core names and rebuild the live universe from a V2-only list. */
+function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
+  orbUniverse.clear();
+  preMarketGaps.clear();
+  screenerDataMap.clear();
+  v2PersistentSymbols.clear();
+  openingRangeBar.clear();
+  sessionOpenPrice.clear();
+  openingDriveTriggered.clear();
+  openingDriveAuditLogged.clear();
+
+  const keep = new Set(watchlist.symbols.map(s => s.symbol));
+  for (const symbol of [...oneMinBarHistory.keys()]) {
+    if (!keep.has(symbol)) oneMinBarHistory.delete(symbol);
+  }
+
+  for (const s of watchlist.symbols) {
+    registerWatchlistSymbol(s);
+    v2PersistentSymbols.add(s.symbol);
+  }
+
+  monitoredSymbols = watchlist.symbols.map(s => s.symbol);
+  watchlistGeneratedAt = watchlist.generatedAt;
+  watchlistTradingDay = watchlist.tradingDay ?? null;
+  return monitoredSymbols;
 }
 
 function ensureV2SymbolsMonitored(): void {
@@ -659,6 +701,22 @@ function connectWatchlistStream(extraSymbols: string[] = []): void {
   if (extraSymbols.length > 0) {
     ws.send(buildSubscribeMessage(extraSymbols));
   }
+}
+
+/** Tear down the current socket and subscribe only the live universe. */
+function reconnectWatchlistStream(): void {
+  if (!wsEnabled) return;
+  const stale = ws;
+  ws = null;
+  if (stale) {
+    stale.removeAllListeners();
+    stale.close();
+  }
+  if (monitoredSymbols.length === 0) {
+    log.info('Watchlist empty — WebSocket left idle until 09:15 scan');
+    return;
+  }
+  connectWebSocket(monitoredSymbols);
 }
 
 function pushEma9Close(symbol: string, close: number): void {
@@ -1508,7 +1566,7 @@ async function executeSignals(
   for (const signal of toExecute) {
     const { symbol, barData, score, vwap, setup } = signal;
 
-    if (setup === 'ORB' || setup === 'OPENING_DRIVE') {
+    if (setup === 'ORB') {
       const oneMinBars = oneMinBarHistory.get(symbol) ?? [];
       if (!trader.passesSatelliteVolumeConfirmation(barData, oneMinBars)) {
         log.info(
@@ -2401,13 +2459,21 @@ function schedulePreMarketReconciliation(): void {
         await reconcileStateFromBroker();
         await runMorningRegimeAssessment();
         const watchlist = await runPremarketScreener();
-        const v2Symbols = extractV2Symbols(watchlist);
-        const newSymbols = applyV2WatchlistSymbols(v2Symbols);
-        log.info(
-          `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
-          `${newSymbols.length} new WebSocket subscription(s)`,
-        );
-        connectWatchlistStream(newSymbols);
+        if (!config.screener.eveningScreenerEnabled) {
+          const symbols = replaceMonitoredUniverse(watchlist);
+          log.info(
+            `Hyper-Growth universe replaced — ${symbols.length} V2_PLAYMAKER symbol(s)`,
+          );
+          reconnectWatchlistStream();
+        } else {
+          const v2Symbols = extractV2Symbols(watchlist);
+          const newSymbols = applyV2WatchlistSymbols(v2Symbols);
+          log.info(
+            `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
+            `${newSymbols.length} new WebSocket subscription(s)`,
+          );
+          connectWatchlistStream(newSymbols);
+        }
       } catch (err: unknown) {
         log.error(`Pre-market routine error: ${toErrorMessage(err)}`);
       }

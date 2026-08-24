@@ -174,6 +174,19 @@ describe('evaluateHeartbeat — watchlist freshness', () => {
     assert.deepEqual(codes(evaluateHeartbeat(snapshot, now, THRESHOLDS)), ['WATCHLIST_STALE']);
   });
 
+  it('accepts a leftover previous-session day when no universe is due yet', () => {
+    const now = estInstant(5, 21);
+    const snapshot = buildSnapshot(now, {
+      sessionPhase: 'pre_open',
+      monitoredSymbols: 0,
+      wsState: 'disabled',
+      lastBarAt: null,
+      watchlistTradingDay: '2026-08-21',
+      requiredWatchlistTradingDay: null,
+    });
+    assert.deepEqual(evaluateHeartbeat(snapshot, now, THRESHOLDS), []);
+  });
+
   it('accepts a 47h-old generatedAt when the calendar day matches (prod silent-fail)', () => {
     const now = estInstant(10, 0);
     const snapshot = buildSnapshot(now, {

@@ -176,9 +176,9 @@ const config = {
   },
 
   premarket: {
-    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.10),
+    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.03),
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
-    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 1_000_000),
+    minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 8),
   },
 

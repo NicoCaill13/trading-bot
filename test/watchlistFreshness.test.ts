@@ -59,6 +59,51 @@ describe('resolveRequiredWatchlistTradingDay', () => {
       null,
     );
   });
+
+  it('ignores the previous Core list before 09:15 when evening screener is off', () => {
+    assert.equal(
+      resolveRequiredWatchlistTradingDay({
+        todayNy: '2026-08-24',
+        todayIsTrading: true,
+        minutesSinceMidnight: 5 * 60 + 21,
+        screenerMinutes: SCREENER_MINUTES,
+        previousTradingDay: '2026-08-21',
+        eveningScreenerEnabled: false,
+        preMarketMinutes: 9 * 60 + 15,
+      }),
+      null,
+    );
+  });
+
+  it('requires today after 09:15 when evening screener is off', () => {
+    assert.equal(
+      resolveRequiredWatchlistTradingDay({
+        todayNy: '2026-08-24',
+        todayIsTrading: true,
+        minutesSinceMidnight: 9 * 60 + 15,
+        screenerMinutes: SCREENER_MINUTES,
+        previousTradingDay: '2026-08-21',
+        eveningScreenerEnabled: false,
+        preMarketMinutes: 9 * 60 + 15,
+      }),
+      '2026-08-24',
+    );
+  });
+
+  it('has no live universe on a weekend when evening screener is off', () => {
+    assert.equal(
+      resolveRequiredWatchlistTradingDay({
+        todayNy: '2026-08-22',
+        todayIsTrading: false,
+        minutesSinceMidnight: 12 * 60,
+        screenerMinutes: SCREENER_MINUTES,
+        previousTradingDay: '2026-08-21',
+        eveningScreenerEnabled: false,
+        preMarketMinutes: 9 * 60 + 15,
+      }),
+      null,
+    );
+  });
 });
 
 describe('isWatchlistCurrent', () => {

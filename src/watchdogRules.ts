@@ -74,14 +74,17 @@ function evaluateWatchlistFreshness(
 
   const have = snapshot.watchlistTradingDay;
   const need = snapshot.requiredWatchlistTradingDay;
-  const calendarArmed = typeof have === 'string' || typeof need === 'string';
 
-  if (calendarArmed) {
-    if (typeof have !== 'string' || typeof need !== 'string' || have !== need) {
+  if (typeof need !== 'string') {
+    // No universe is due (Hyper-Growth before 09:15). A leftover on-disk day
+    // is not a missed screener.
+    if (typeof have === 'string') return null;
+  } else {
+    if (have !== need) {
       return {
         code: 'WATCHLIST_STALE',
         message:
-          `Watchlist trading day ${have ?? 'none'} != required ${need ?? 'unknown'} ` +
+          `Watchlist trading day ${have ?? 'none'} != required ${need} ` +
           `— screener missed or crashed before write`,
       };
     }

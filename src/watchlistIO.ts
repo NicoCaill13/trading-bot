@@ -63,9 +63,8 @@ export function extractV2Symbols(watchlist: Watchlist): WatchlistSymbol[] {
 }
 
 /**
- * Hyper-Growth universe write: V2-only list stamped with the required EOD
- * trading day so `isWatchlistCurrent` accepts it for the next cash session.
- * Replaces any leftover Core names — they are not traded on this path.
+ * Hyper-Growth universe write: V2-only list stamped with the session being
+ * traded (today after 09:15), not the previous EOD close.
  */
 export async function writePremarketWatchlist(
   v2Symbols: WatchlistSymbol[],

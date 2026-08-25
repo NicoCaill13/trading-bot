@@ -98,7 +98,7 @@ export async function buildSessionFunnel(
     stages.passedPriceBand++;
 
     const gapPct = (premarketPrice - previousClose) / previousClose;
-    if (gapPct < minGap) continue;
+    if (minGap > 0 && gapPct < minGap) continue;
     stages.passedGap++;
 
     const premarketVolume = inWindow.reduce((sum, b) => sum + b.v, 0);

@@ -3,9 +3,10 @@
  *
  * Hyper-Growth cash path: buy the break of the first regular-session 1-min
  * high between 09:30 and 09:45 EST when volume confirms the extension and the
- * impulse bar closes in its upper tertile. Quotes veto a wide spread (fail
- * open when missing). Signed tape vetoes selling pressure (fail open when
- * missing). Snapshot IEX imbalance is diagnostic only.
+ * impulse bar closes in its upper tertile. A gap is not required — yesterday's
+ * close is diagnostic. Quotes veto a wide spread (fail open when missing).
+ * Signed tape vetoes selling pressure (fail open when missing). Snapshot IEX
+ * imbalance is diagnostic only.
  * The caller owns session state; this module only judges a snapshot.
  */
 
@@ -159,10 +160,6 @@ export function evaluateOpeningDrive(
 
   const price = impulseBar.close;
   if (price <= 0) return reject('insufficient_data');
-
-  if (ctx.previousClose !== null && sessionOpen < ctx.previousClose) {
-    return reject('gap_down');
-  }
 
   if (rangeBar === null || rangeBar.high <= 0) return reject('orb_not_ready');
   if (impulseBar.timestamp === rangeBar.timestamp) return reject('orb_not_ready');

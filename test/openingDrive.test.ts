@@ -142,12 +142,13 @@ describe('evaluateOpeningDrive — ORB 1-min gating', () => {
     assert.equal(decision.rejection, 'insufficient_data');
   });
 
-  it('treats a gap down as a stale runner', () => {
+  it('does not reject a gap down — the break of the opening range is the setup', () => {
     const decision = evaluateOpeningDrive(
       context({ sessionOpen: 4.40, previousClose: 4.50 }),
       OPTS,
     );
-    assert.equal(decision.rejection, 'gap_down');
+    assert.equal(decision.armed, true);
+    assert.equal(decision.rejection, null);
   });
 
   it('refuses to arm on the range bar itself', () => {

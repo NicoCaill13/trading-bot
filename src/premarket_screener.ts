@@ -32,6 +32,7 @@ interface SnapshotGapHit {
   preMarketGapPct: number;
   preMarketPrice: number;
   previousClose: number;
+  snapshotShareVolume: number;
 }
 
 function resolveSnapshotTicker(snap: AlpacaSnapshot): string | null {
@@ -58,6 +59,18 @@ function extractPreviousClose(snap: AlpacaSnapshot): number | null {
   const prev = snap.PrevDailyBar?.ClosePrice;
   if (prev !== undefined && prev > 0) return prev;
   return null;
+}
+
+function extractSnapshotShareVolume(snap: AlpacaSnapshot): number {
+  const daily = snap.DailyBar?.Volume;
+  if (daily !== undefined && daily > 0) return daily;
+  const minute = snap.MinuteBar?.Volume;
+  if (minute !== undefined && minute > 0) return minute;
+  return 0;
+}
+
+function snapshotDollarVolume(hit: SnapshotGapHit): number {
+  return hit.preMarketPrice * hit.snapshotShareVolume;
 }
 
 /** EST pre-market share volume window: [04:00, 09:30). */
@@ -126,24 +139,29 @@ async function throttledMap<T, R>(
 }
 
 /**
- * Phase 1: snapshot scan for price + gap only (cheap).
- * Phase 2: 1Min bar volume sum in EST [04:00, 09:30) for gap hits only.
+ * Phase 1: snapshot scan — price band, optional gap, cheap volume proxy.
+ * Phase 2: 1Min bar volume only for the most liquid snapshot names (not the
+ * whole in-band tape — that 429s the data API).
  */
 async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
-  const gapHits: SnapshotGapHit[] = [];
+  const hits: SnapshotGapHit[] = [];
   const minGap = config.premarket.minGapUpPct;
   const minClose = config.screener.minClosePrice;
   const maxClose = config.screener.maxClosePrice;
   const minShares = config.premarket.minPreMarketShareVolume;
+  const volumeFetchPool = Math.max(config.premarket.watchlistMaxSize * 3, 60);
 
   let rejectedMissingPrice = 0;
   let rejectedPrice = 0;
   let rejectedGap = 0;
 
+  const gapLabel = minGap > 0
+    ? `gap ≥ ${(minGap * 100).toFixed(1)}%`
+    : 'no gap gate';
   log.info(
     `Snapshot scan on ${universe.length} tradable symbols ` +
-    `(price $${minClose}–$${maxClose}, gap ≥ ${(minGap * 100).toFixed(1)}%, ` +
-    `then pre-market vol ≥ ${(minShares / 1_000_000).toFixed(1)}M shares before 09:30 EST)...`,
+    `(price $${minClose}–$${maxClose}, ${gapLabel}, ` +
+    `then top ${volumeFetchPool} by snapshot $ vol, PM shares ≥ ${minShares})...`,
   );
 
   for (let i = 0; i < universe.length; i += SNAPSHOT_BATCH_SIZE) {
@@ -169,16 +187,17 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
         }
 
         const gap = (preMarketPrice - previousClose) / previousClose;
-        if (gap < minGap) {
+        if (minGap > 0 && gap < minGap) {
           rejectedGap++;
           continue;
         }
 
-        gapHits.push({
+        hits.push({
           symbol: ticker,
           preMarketGapPct: gap,
           preMarketPrice,
           previousClose,
+          snapshotShareVolume: extractSnapshotShareVolume(snap),
         });
       }
     } catch (err) {
@@ -193,13 +212,20 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
     }
   }
 
+  hits.sort((a, b) => {
+    const bySnap = snapshotDollarVolume(b) - snapshotDollarVolume(a);
+    if (Math.abs(bySnap) > 1e-9) return bySnap;
+    return Math.abs(b.preMarketGapPct) - Math.abs(a.preMarketGapPct);
+  });
+  const toFetch = hits.slice(0, volumeFetchPool);
+
   log.info(
-    `Snapshot phase: ${gapHits.length} gap hits | ` +
-    `rejects price=${rejectedPrice} gap=${rejectedGap} missing_price=${rejectedMissingPrice}`,
+    `Snapshot phase: ${hits.length} in-band | fetch PM bars for ${toFetch.length} ` +
+    `| rejects price=${rejectedPrice} gap=${rejectedGap} missing_price=${rejectedMissingPrice}`,
   );
 
   const volumeResults = await throttledMap(
-    gapHits,
+    toFetch,
     async (hit): Promise<GapCandidate | null> => {
       try {
         const preMarketShareVolume = await fetchPremarketShareVolume(hit.symbol);
@@ -277,7 +303,9 @@ export async function runPremarketScreener(): Promise<Watchlist> {
   log.info(
     `${dedupedCandidates.length} V2 candidate(s) from ${universe.length} symbols ` +
     `(${gapCandidates.length - dedupedCandidates.length} deduped vs Core) ` +
-    `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%, ranked by PM dollar volume)`,
+    `${config.premarket.minGapUpPct > 0
+      ? `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%, ranked by PM dollar volume)`
+      : '(no gap gate, ranked by PM dollar volume)'}`,
   );
 
   const ranked = toWatchlistEntries(dedupedCandidates);

@@ -180,10 +180,10 @@ const config = {
   },
 
   premarket: {
-    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.02),
+    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0),
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
-    watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 8),
+    watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 30),
   },
 
   entry: {
@@ -657,8 +657,13 @@ const config = {
       `[SYSTEM] PREMARKET_MIN_SHARE_VOLUME must be > 0: ${pm.minPreMarketShareVolume}`,
     );
   }
-  if (pm.minGapUpPct <= 0) {
-    throw new Error(`[SYSTEM] PREMARKET_MIN_GAP_UP_PCT must be > 0: ${pm.minGapUpPct}`);
+  if (pm.minGapUpPct < 0) {
+    throw new Error(`[SYSTEM] PREMARKET_MIN_GAP_UP_PCT must be >= 0: ${pm.minGapUpPct}`);
+  }
+  if (pm.watchlistMaxSize < 1) {
+    throw new Error(
+      `[SYSTEM] PREMARKET_WATCHLIST_MAX_SIZE must be >= 1: ${pm.watchlistMaxSize}`,
+    );
   }
 
   const sess = config.session;

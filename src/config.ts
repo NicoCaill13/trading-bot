@@ -108,7 +108,7 @@ const config = {
     relativeStrengthLookbackDays: parseIntEnv('RELATIVE_STRENGTH_LOOKBACK_DAYS', 20),
     volumeAverageDays: parseIntEnv('VOLUME_AVERAGE_DAYS', 14),
     minClosePrice: parseFloatEnv('MIN_CLOSE_PRICE', 5),
-    maxClosePrice: parseFloatEnv('MAX_CLOSE_PRICE', 50),
+    maxClosePrice: parseFloatEnv('MAX_CLOSE_PRICE', 100),
     minDollarVolume: parseFloatEnv('MIN_DOLLAR_VOLUME', 20_000_000),
     minAdrPct: parseFloatEnv('MIN_ADR_PCT', 4.0),
     adrLookbackDays: parseIntEnv('ADR_LOOKBACK_DAYS', 14),
@@ -180,7 +180,7 @@ const config = {
   },
 
   premarket: {
-    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.03),
+    minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0.02),
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 8),

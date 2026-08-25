@@ -9,6 +9,7 @@
 
 import config from '../../src/config';
 import { nyWallTimeToUtc } from '../../src/utils';
+import { comparePremarketRank, passesPremarketPricePair } from '../../src/screenerMath';
 import { fetchBars, type Feed, type RawBar } from './barFetch';
 
 /** 30-min bars align on :00/:30, so [04:00, 09:30) never spills into RTH. */
@@ -33,7 +34,7 @@ export interface FunnelStages {
 export interface SessionFunnel {
   session: string;
   stages: FunnelStages;
-  /** Passing candidates, ranked by pre-market volume and capped like the live screener. */
+  /** Passing candidates, ranked by pre-market dollar volume and capped like the live screener. */
   watchlist: Candidate[];
 }
 
@@ -90,11 +91,11 @@ export async function buildSessionFunnel(
     stages.hadPremarketData++;
 
     const premarketPrice = inWindow[inWindow.length - 1].c;
-    if (!(premarketPrice >= minPrice && premarketPrice <= maxPrice)) continue;
-    stages.passedPriceBand++;
-
     const previousClose = lastCloseBefore(dailyBars.get(symbol) ?? [], start.getTime());
     if (previousClose === null || previousClose <= 0) continue;
+
+    if (!passesPremarketPricePair(premarketPrice, previousClose, minPrice, maxPrice)) continue;
+    stages.passedPriceBand++;
 
     const gapPct = (premarketPrice - previousClose) / previousClose;
     if (gapPct < minGap) continue;
@@ -107,7 +108,12 @@ export async function buildSessionFunnel(
     passing.push({ symbol, gapPct, premarketVolume, premarketPrice, previousClose });
   }
 
-  passing.sort((a, b) => b.premarketVolume - a.premarketVolume);
+  passing.sort((a, b) =>
+    comparePremarketRank(
+      { dollarVolume: a.premarketPrice * a.premarketVolume, gapPct: a.gapPct },
+      { dollarVolume: b.premarketPrice * b.premarketVolume, gapPct: b.gapPct },
+    ),
+  );
 
   return {
     session,

@@ -6,7 +6,7 @@ import { clampQueryEnd, getESTDate, isRateLimitError, nyWallTimeToUtc, toErrorMe
 import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin, writePremarketWatchlist } from './watchlistIO';
 import { queryRequiredWatchlistTradingDay } from './marketCalendar';
 import { notifyWatchlistSaved } from './notificationManager';
-import { passesPriceBand, sumShareVolume } from './screenerMath';
+import { comparePremarketRank, passesPremarketPricePair, sumShareVolume } from './screenerMath';
 import { createNewsProvider } from './newsProvider';
 import { filterWatchlistByBullishCatalyst } from './sentiment';
 import type { Watchlist, WatchlistSymbol } from './types';
@@ -163,7 +163,7 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
           continue;
         }
 
-        if (!passesPriceBand(preMarketPrice, minClose, maxClose)) {
+        if (!passesPremarketPricePair(preMarketPrice, previousClose, minClose, maxClose)) {
           rejectedPrice++;
           continue;
         }
@@ -226,7 +226,6 @@ async function scanGapCandidates(universe: string[]): Promise<GapCandidate[]> {
 
 function toWatchlistEntries(candidates: GapCandidate[]): WatchlistSymbol[] {
   return candidates
-    .sort((a, b) => b.preMarketGapPct - a.preMarketGapPct)
     .map(c => ({
       symbol: c.symbol,
       origin: 'V2_PLAYMAKER' as const,
@@ -236,7 +235,13 @@ function toWatchlistEntries(candidates: GapCandidate[]): WatchlistSymbol[] {
       lastClose: c.preMarketPrice,
       previousClose: c.previousClose,
       dollarVolume: c.preMarketPrice * c.preMarketShareVolume,
-    }));
+    }))
+    .sort((a, b) =>
+      comparePremarketRank(
+        { dollarVolume: a.dollarVolume ?? 0, gapPct: a.preMarketGapPct ?? 0 },
+        { dollarVolume: b.dollarVolume ?? 0, gapPct: b.preMarketGapPct ?? 0 },
+      ),
+    );
 }
 
 /**
@@ -272,7 +277,7 @@ export async function runPremarketScreener(): Promise<Watchlist> {
   log.info(
     `${dedupedCandidates.length} V2 candidate(s) from ${universe.length} symbols ` +
     `(${gapCandidates.length - dedupedCandidates.length} deduped vs Core) ` +
-    `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%)`,
+    `(gap ≥ ${(config.premarket.minGapUpPct * 100).toFixed(1)}%, ranked by PM dollar volume)`,
   );
 
   const ranked = toWatchlistEntries(dedupedCandidates);
@@ -280,6 +285,7 @@ export async function runPremarketScreener(): Promise<Watchlist> {
     ? Math.min(ranked.length, Math.max(config.premarket.watchlistMaxSize * 3, 30))
     : config.premarket.watchlistMaxSize;
   const v2SymbolsRaw = ranked.slice(0, poolSize);
+  const overflow = ranked.slice(config.premarket.watchlistMaxSize, config.premarket.watchlistMaxSize + 8);
   const withCatalyst = await filterWatchlistByBullishCatalyst(v2SymbolsRaw, newsProvider);
   const v2Symbols = withCatalyst.slice(0, config.premarket.watchlistMaxSize);
 
@@ -287,9 +293,20 @@ export async function runPremarketScreener(): Promise<Watchlist> {
     log.info(
       `  ${s.symbol.padEnd(6)} | gap ${((s.preMarketGapPct ?? 0) * 100).toFixed(2)}% ` +
       `| close $${(s.lastClose ?? 0).toFixed(2)}` +
+      `| $vol ${Math.round(s.dollarVolume ?? 0).toLocaleString()}` +
       (s.sentiment ? ` | sent: ${s.sentiment}` : ''),
     );
   });
+
+  if (overflow.length > 0) {
+    log.info(
+      `Watchlist cap ${config.premarket.watchlistMaxSize} — next: ` +
+      overflow.map(s =>
+        `${s.symbol} gap ${((s.preMarketGapPct ?? 0) * 100).toFixed(1)}% ` +
+        `$vol ${Math.round(s.dollarVolume ?? 0).toLocaleString()}`,
+      ).join(', '),
+    );
+  }
 
   const tradingDay = await queryRequiredWatchlistTradingDay();
   if (!config.screener.eveningScreenerEnabled && tradingDay === null) {

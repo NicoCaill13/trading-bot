@@ -1,12 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  comparePremarketRank,
   compareWatchlistRank,
   computeAdrPct,
   isAllowedExchange,
   passesAdrGate,
   passesClosePrice,
   passesDollarVolume,
+  passesPremarketPricePair,
   passesPriceBand,
   passesFloatGate,
   sumShareVolume,
@@ -66,6 +68,38 @@ describe('passesClosePrice + passesDollarVolume', () => {
   it('enforces dollar volume via close * volume', () => {
     assert.equal(passesDollarVolume(10, 2_000_000, 20_000_000), true);
     assert.equal(passesDollarVolume(10, 1_999_999, 20_000_000), false);
+  });
+});
+
+describe('passesPremarketPricePair', () => {
+  it('accepts a name whose print and previous close are both in band', () => {
+    assert.equal(passesPremarketPricePair(9.38, 9.17, 5, 100), true);
+  });
+
+  it('rejects a print in-band sitting on a penny previous close (GRML)', () => {
+    assert.equal(passesPremarketPricePair(8.52, 0.203, 5, 100), false);
+  });
+
+  it('rejects a previous close above the cap (MRNA)', () => {
+    assert.equal(passesPremarketPricePair(144.03, 138.82, 5, 100), false);
+  });
+});
+
+describe('comparePremarketRank', () => {
+  it('ranks higher dollar volume ahead of a larger gap', () => {
+    const ranked = [
+      { dollarVolume: 1_000_000, gapPct: 40 },
+      { dollarVolume: 20_000_000, gapPct: 0.04 },
+    ].sort(comparePremarketRank);
+    assert.equal(ranked[0]?.dollarVolume, 20_000_000);
+  });
+
+  it('breaks a dollar-volume tie on gap', () => {
+    const ranked = [
+      { dollarVolume: 10_000_000, gapPct: 0.03 },
+      { dollarVolume: 10_000_000, gapPct: 0.08 },
+    ].sort(comparePremarketRank);
+    assert.equal(ranked[0]?.gapPct, 0.08);
   });
 });
 

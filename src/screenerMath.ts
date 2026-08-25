@@ -50,6 +50,33 @@ export function passesPriceBand(
   return price >= minPrice && price <= maxPrice;
 }
 
+/**
+ * Premarket pair: both the last print and yesterday's close must sit in the
+ * band. A $8 print on a $0.20 close is a corporate-action / bad tick, not a
+ * Hyper-Growth name (GRML 25/08).
+ */
+export function passesPremarketPricePair(
+  preMarketPrice: number,
+  previousClose: number,
+  minPrice: number,
+  maxPrice: number,
+): boolean {
+  return (
+    passesPriceBand(preMarketPrice, minPrice, maxPrice) &&
+    passesPriceBand(previousClose, minPrice, maxPrice)
+  );
+}
+
+/** Higher pre-market dollar volume first; gap is the tie-break. */
+export function comparePremarketRank(
+  a: { dollarVolume: number; gapPct: number },
+  b: { dollarVolume: number; gapPct: number },
+): number {
+  const byDollarVolume = b.dollarVolume - a.dollarVolume;
+  if (Math.abs(byDollarVolume) > 1e-9) return byDollarVolume;
+  return b.gapPct - a.gapPct;
+}
+
 export function passesDollarVolume(
   close: number,
   volume: number,

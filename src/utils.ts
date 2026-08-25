@@ -107,6 +107,16 @@ export function isSipStreamDenied(code: number, message: string): boolean {
   );
 }
 
+/** Alpaca HTTP 429 — REST bars, snapshots, and order submit share this shape. */
+export function isRateLimitError(err: unknown): boolean {
+  if (typeof err === 'object' && err !== null) {
+    const status = (err as { response?: { status?: number } }).response?.status;
+    if (status === 429) return true;
+  }
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return message.includes('429') || /too many requests/i.test(message);
+}
+
 /** Order failures that must not be retried on the next flush (blackout defer loop). */
 export function isNonRetryableOrderError(message: string): boolean {
   return (

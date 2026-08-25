@@ -2,7 +2,7 @@ import alpaca from './alpacaClient';
 import config from './config';
 import { getDynamicUniverse } from './screener';
 import { createLogger } from './logger';
-import { clampQueryEnd, getESTDate, nyWallTimeToUtc, toErrorMessage } from './utils';
+import { clampQueryEnd, getESTDate, isRateLimitError, nyWallTimeToUtc, toErrorMessage } from './utils';
 import { mergeV2IntoWatchlist, readWatchlist, getSymbolOrigin, writePremarketWatchlist } from './watchlistIO';
 import { queryRequiredWatchlistTradingDay } from './marketCalendar';
 import { notifyWatchlistSaved } from './notificationManager';
@@ -16,7 +16,8 @@ const log = createLogger('PREMARKET_SCREENER');
 const newsProvider = createNewsProvider();
 
 const SNAPSHOT_BATCH_SIZE = 100;
-const VOLUME_FETCH_CONCURRENCY = 5;
+const VOLUME_FETCH_CONCURRENCY = 2;
+const VOLUME_FETCH_MAX_ATTEMPTS = 4;
 
 interface GapCandidate {
   symbol: string;
@@ -60,7 +61,7 @@ function extractPreviousClose(snap: AlpacaSnapshot): number | null {
 }
 
 /** EST pre-market share volume window: [04:00, 09:30). */
-async function fetchPremarketShareVolume(symbol: string): Promise<number> {
+async function fetchPremarketShareVolumeOnce(symbol: string): Promise<number> {
   const estDay = getESTDate();
   const start = nyWallTimeToUtc(estDay, 4, 0);
   // Runs at ~09:15, so a delayed SIP plan would 403 on a 09:30 end boundary.
@@ -89,6 +90,24 @@ async function fetchPremarketShareVolume(symbol: string): Promise<number> {
   return sumShareVolume(bars.map(b => ({ volume: b.Volume })));
 }
 
+async function fetchPremarketShareVolume(symbol: string): Promise<number> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= VOLUME_FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fetchPremarketShareVolumeOnce(symbol);
+    } catch (err) {
+      lastErr = err;
+      if (!isRateLimitError(err) || attempt === VOLUME_FETCH_MAX_ATTEMPTS) throw err;
+      const delay = Math.min(500 * 2 ** (attempt - 1), 8_000);
+      log.warn(
+        `${symbol}: premarket volume 429 — retry ${attempt}/${VOLUME_FETCH_MAX_ATTEMPTS} in ${delay}ms`,
+      );
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
 async function throttledMap<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
@@ -100,7 +119,7 @@ async function throttledMap<T, R>(
     const batchResults = await Promise.all(batch.map(fn));
     results.push(...batchResults);
     if (i + concurrency < items.length) {
-      await new Promise(r => setTimeout(r, 350));
+      await new Promise(r => setTimeout(r, 600));
     }
   }
   return results;

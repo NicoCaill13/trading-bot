@@ -235,6 +235,16 @@ export function evaluateOpeningDrive(
   };
 }
 
+/**
+ * `outside_window` fires on every bar of the session. Everything else is a
+ * real funnel step and is logged once per symbol per code.
+ */
+export function isOpeningDriveFunnelRejection(
+  rejection: OpeningDriveRejection | null,
+): rejection is OpeningDriveRejection {
+  return rejection !== null && rejection !== 'outside_window';
+}
+
 export function describeOpeningDriveDecision(decision: OpeningDriveDecision): string {
   const pct = (value: number | null, digits: number): string =>
     value === null ? 'N/A' : `${(value * 100).toFixed(digits)}%`;

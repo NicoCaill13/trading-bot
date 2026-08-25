@@ -6,6 +6,7 @@ import {
   computeOrbVolumeMultiple,
   computeSpreadPct,
   evaluateOpeningDrive,
+  isOpeningDriveFunnelRejection,
   type OpeningDriveContext,
   type OpeningDriveOptions,
 } from '../src/openingDrive';
@@ -392,5 +393,30 @@ describe('evaluateOpeningDrive — score', () => {
     );
 
     assert.ok(strong.score > weak.score);
+  });
+});
+
+describe('isOpeningDriveFunnelRejection', () => {
+  it('hides outside_window — it is not a setup evaluation', () => {
+    assert.equal(isOpeningDriveFunnelRejection('outside_window'), false);
+    assert.equal(isOpeningDriveFunnelRejection(null), false);
+  });
+
+  it('keeps every in-window rejection as a funnel step', () => {
+    const codes = [
+      'insufficient_data',
+      'gap_down',
+      'orb_not_ready',
+      'no_breakout',
+      'open_broken',
+      'no_momentum',
+      'no_impulse_body',
+      'adverse_tape',
+      'wide_spread',
+      'max_extension',
+    ] as const;
+    for (const code of codes) {
+      assert.equal(isOpeningDriveFunnelRejection(code), true);
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { clampQueryEnd, isSipStreamDenied } from '../src/utils';
+import { clampQueryEnd, isRateLimitError, isSipStreamDenied } from '../src/utils';
 
 const DELAY_MS = 16 * 60_000;
 const now = new Date('2026-08-21T13:20:00.000Z');
@@ -44,5 +44,20 @@ describe('isSipStreamDenied', () => {
   it('does not treat credential failures as a feed fallback', () => {
     assert.equal(isSipStreamDenied(401, 'auth failed'), false);
     assert.equal(isSipStreamDenied(402, 'authentication failed'), false);
+  });
+});
+
+describe('isRateLimitError', () => {
+  it('detects Axios-style 429 responses', () => {
+    assert.equal(isRateLimitError({ response: { status: 429 } }), true);
+  });
+
+  it('detects the Alpaca SDK message shape', () => {
+    assert.equal(isRateLimitError(new Error('code: 429, message: too many requests.')), true);
+  });
+
+  it('ignores unrelated failures', () => {
+    assert.equal(isRateLimitError(new Error('HTTP 400: bad request')), false);
+    assert.equal(isRateLimitError({ response: { status: 500 } }), false);
   });
 });

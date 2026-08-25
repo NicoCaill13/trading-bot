@@ -1,6 +1,6 @@
 import alpaca from './alpacaClient';
 import config from './config';
-import { getESTDate, toErrorMessage } from './utils';
+import { getESTDate, isRateLimitError, toErrorMessage } from './utils';
 import { createLogger } from './logger';
 import { sanitizeLiveAskPrice } from './entryPrice';
 import { isVwapPullbackEntryWindow } from './vwapSetup';
@@ -105,9 +105,7 @@ async function submitOrderWithRetry(
     const status  = httpErr.response?.status;
     const body    = httpErr.response?.data;
 
-    const is429 = status === 429 || (err instanceof Error && err.message.includes('429'));
-
-    if (is429 && attempt < maxAttempts) {
+    if (isRateLimitError(err) && attempt < maxAttempts) {
       const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), 30000);
       log.warn(
         `Rate limit on ${orderParams.symbol} — attempt ${attempt}/${maxAttempts} ` +

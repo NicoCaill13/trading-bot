@@ -27,6 +27,7 @@ import {
 import {
   describeOpeningDriveDecision,
   evaluateOpeningDrive,
+  isOpeningDriveFunnelRejection,
   type OpeningDriveContext,
   type OpeningDriveOptions,
 } from './openingDrive';
@@ -147,6 +148,9 @@ const EMA9_HISTORY_MAX = 50;
 const l2WallSignals = new Map<string, ImbalanceSignal>();
 const l2QuotesSeen = new Set<string>();
 const lastNbbo = new Map<string, { bid: number; ask: number; mid: number }>();
+const L2_LOG_MIN_INTERVAL_MS = 15_000;
+const lastL2LogAt = new Map<string, number>();
+const lastLoggedL2Wall = new Map<string, boolean>();
 const tapeMinutes = new Map<string, Map<number, TapeBucket>>();
 const lastTradePrice = new Map<string, number>();
 
@@ -158,7 +162,7 @@ const sessionOpenPrice = new Map<string, number>();
 const openingRangeBar = new Map<string, BarData>();
 // Symbols already evaluated-and-armed by the Opening Drive path this session.
 const openingDriveTriggered = new Set<string>();
-const openingDriveBookRejectLogged = new Set<string>();
+const openingDriveRejectLogged = new Set<string>();
 // Symbols whose audited rejection was already recorded. Tracked apart from the
 // armed set: a name can be capped at 09:51 and legitimately arm at 09:54 once
 // VWAP catches up, and both observations matter — but only the first cap does.
@@ -266,6 +270,10 @@ function buildHeartbeatSnapshot(): HeartbeatSnapshot {
     watchlistTradingDay,
     requiredWatchlistTradingDay,
   };
+}
+
+async function refreshRequiredWatchlistTradingDay(): Promise<void> {
+  requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
 }
 
 const heartbeatWriter = createHeartbeatWriter(
@@ -478,7 +486,7 @@ async function loadWatchlist(skipScreener = false): Promise<string[]> {
   orbUniverse.clear();
   preMarketGaps.clear();
 
-  requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
+  await refreshRequiredWatchlistTradingDay();
 
   let data = await readWatchlist();
   watchlistGeneratedAt = data?.generatedAt ?? null;
@@ -614,8 +622,10 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
   sessionOpenPrice.clear();
   openingDriveTriggered.clear();
   openingDriveAuditLogged.clear();
-  openingDriveBookRejectLogged.clear();
+  openingDriveRejectLogged.clear();
   lastNbbo.clear();
+  lastL2LogAt.clear();
+  lastLoggedL2Wall.clear();
   tapeMinutes.clear();
   lastTradePrice.clear();
 
@@ -1260,24 +1270,16 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
 
   const decision = evaluateOpeningDrive(ctx, openingDriveLiveOptions());
 
-  // Codes that fire on every bar outside the setup would flood the log; the ones
-  // kept below all mean "the setup was live and something specific stopped it".
   if (!decision.armed) {
-    if (decision.rejection === 'max_extension' || decision.rejection === 'no_impulse_body') {
-      odLog.info(
-        `${symbol}: setup rejected by ${decision.rejection} — ` +
-        describeOpeningDriveDecision(decision),
-      );
-    }
-    if (
-      (decision.rejection === 'wide_spread' || decision.rejection === 'adverse_tape') &&
-      !openingDriveBookRejectLogged.has(symbol)
-    ) {
-      openingDriveBookRejectLogged.add(symbol);
-      odLog.info(
-        `${symbol}: setup rejected by ${decision.rejection} — ` +
-        describeOpeningDriveDecision(decision),
-      );
+    if (isOpeningDriveFunnelRejection(decision.rejection)) {
+      const key = `${symbol}:${decision.rejection}`;
+      if (!openingDriveRejectLogged.has(key)) {
+        openingDriveRejectLogged.add(key);
+        odLog.info(
+          `${symbol}: setup rejected by ${decision.rejection} — ` +
+          describeOpeningDriveDecision(decision),
+        );
+      }
     }
 
     // A cap rejection is only actionable with an outcome attached: a bare counter
@@ -2169,16 +2171,24 @@ function handleQuoteEvent(quote: WsQuoteMessage, receivedAt: number): void {
     l2QuotesSeen.add(quote.S);
     l2WallSignals.set(quote.S, signal);
 
-    const bid = signal.topBid;
-    const ask = signal.topAsk;
-    l2Log.info(
-      `${quote.S}: imbalance=${signal.imbalance === null ? 'N/A' : signal.imbalance.toFixed(3)} ` +
-      `mid=${signal.mid === null ? 'N/A' : `$${signal.mid.toFixed(2)}`} ` +
-      `vwap=${vwap === null ? 'N/A' : `$${vwap.toFixed(2)}`} ` +
-      `bid=${bid ? `${bid.size}@${bid.price.toFixed(2)}` : 'N/A'} ` +
-      `ask=${ask ? `${ask.size}@${ask.price.toFixed(2)}` : 'N/A'} ` +
-      `wall=${signal.wall ? 'YES' : 'no'}`,
-    );
+    const wallFlipped = lastLoggedL2Wall.get(quote.S) !== signal.wall;
+    const lastAt = lastL2LogAt.get(quote.S);
+    const due = lastAt === undefined || receivedAt - lastAt >= L2_LOG_MIN_INTERVAL_MS;
+    if (wallFlipped || due) {
+      lastL2LogAt.set(quote.S, receivedAt);
+      lastLoggedL2Wall.set(quote.S, signal.wall);
+
+      const bid = signal.topBid;
+      const ask = signal.topAsk;
+      l2Log.info(
+        `${quote.S}: imbalance=${signal.imbalance === null ? 'N/A' : signal.imbalance.toFixed(3)} ` +
+        `mid=${signal.mid === null ? 'N/A' : `$${signal.mid.toFixed(2)}`} ` +
+        `vwap=${vwap === null ? 'N/A' : `$${vwap.toFixed(2)}`} ` +
+        `bid=${bid ? `${bid.size}@${bid.price.toFixed(2)}` : 'N/A'} ` +
+        `ask=${ask ? `${ask.size}@${ask.price.toFixed(2)}` : 'N/A'} ` +
+        `wall=${signal.wall ? 'YES' : 'no'}`,
+      );
+    }
   } catch (err: unknown) {
     // Graceful degrade — never crash the bus consumer on bad quotes.
     l2Log.warn(`${quote.S}: quote handling failed — ${toErrorMessage(err)}`);
@@ -2460,8 +2470,10 @@ function scheduleDailyReset(): void {
     openingRangeBar.clear();
     openingDriveTriggered.clear();
     openingDriveAuditLogged.clear();
-    openingDriveBookRejectLogged.clear();
+    openingDriveRejectLogged.clear();
     lastNbbo.clear();
+    lastL2LogAt.clear();
+    lastLoggedL2Wall.clear();
     tapeMinutes.clear();
     lastTradePrice.clear();
     shadowJournal.closeAllShadowRecords(new Date().toISOString());
@@ -2499,12 +2511,13 @@ function scheduleDailyReset(): void {
 
       if (!config.screener.eveningScreenerEnabled) {
         log.info('Evening Core screener disabled — Hyper-Growth universe comes from 09:15 pre-market');
+        await refreshRequiredWatchlistTradingDay();
         haltMarketDataIngest();
         return;
       }
 
       try {
-        requiredWatchlistTradingDay = await queryRequiredWatchlistTradingDay();
+        await refreshRequiredWatchlistTradingDay();
         const watchlist = await runScreener(requiredWatchlistTradingDay ?? undefined);
         orbUniverse.clear();
         preMarketGaps.clear();
@@ -2566,12 +2579,14 @@ function schedulePreMarketReconciliation(): void {
       }
       log.info('Pre-market 09:15 — reconciliation + Satellite screener...');
       try {
+        await refreshRequiredWatchlistTradingDay();
         await armLivePipeline();
         await reconcileStateFromBroker();
         await runMorningRegimeAssessment();
         const watchlist = await runPremarketScreener();
         if (!config.screener.eveningScreenerEnabled) {
           const symbols = replaceMonitoredUniverse(watchlist);
+          await refreshRequiredWatchlistTradingDay();
           log.info(
             `Hyper-Growth universe replaced — ${symbols.length} V2_PLAYMAKER symbol(s)`,
           );
@@ -2579,6 +2594,7 @@ function schedulePreMarketReconciliation(): void {
         } else {
           const v2Symbols = extractV2Symbols(watchlist);
           const newSymbols = applyV2WatchlistSymbols(v2Symbols);
+          await refreshRequiredWatchlistTradingDay();
           log.info(
             `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
             `${newSymbols.length} new WebSocket subscription(s)`,

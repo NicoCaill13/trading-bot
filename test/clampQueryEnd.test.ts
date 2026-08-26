@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { clampQueryEnd, isRateLimitError, isSipStreamDenied } from '../src/utils';
+import { clampQueryEnd, isRateLimitError, isSipStreamDenied, isSymbolLimitExceeded } from '../src/utils';
 
 const DELAY_MS = 16 * 60_000;
 const now = new Date('2026-08-21T13:20:00.000Z');
@@ -44,6 +44,20 @@ describe('isSipStreamDenied', () => {
   it('does not treat credential failures as a feed fallback', () => {
     assert.equal(isSipStreamDenied(401, 'auth failed'), false);
     assert.equal(isSipStreamDenied(402, 'authentication failed'), false);
+  });
+});
+
+describe('isSymbolLimitExceeded', () => {
+  it('treats Alpaca 405 as the IEX stream cap', () => {
+    assert.equal(isSymbolLimitExceeded(405, 'symbol limit exceeded'), true);
+  });
+
+  it('matches the message even if the code is missing', () => {
+    assert.equal(isSymbolLimitExceeded(0, 'Symbol limit exceeded'), true);
+  });
+
+  it('ignores unrelated websocket errors', () => {
+    assert.equal(isSymbolLimitExceeded(409, 'insufficient subscription'), false);
   });
 });
 

@@ -41,6 +41,12 @@ const config = {
      * extra minute of margin absorbs clock skew.
      */
     sipDelayMs: parseIntEnv('SIP_DELAY_MS', 16 * 60_000),
+    /**
+     * IEX websocket cap is 30 *streams* (a bar, quote, or trade each count).
+     * 8 names × 3 channels = 24 (ok). 17 × 3 = 51 (405, nothing subscribed).
+     */
+    iexMaxStreams: parseIntEnv('ALPACA_IEX_MAX_STREAMS', 30),
+    sipMaxStreams: parseIntEnv('ALPACA_SIP_MAX_STREAMS', 1000),
     paper: true as const,
   },
 
@@ -343,6 +349,18 @@ const config = {
 
 // Fail-fast validation of risk parameters at startup
 (function validateConfig(): void {
+  const a = config.alpaca;
+  if (a.iexMaxStreams < 1 || a.iexMaxStreams > 200) {
+    throw new Error(
+      `[SYSTEM] ALPACA_IEX_MAX_STREAMS out of bounds (1–200): ${a.iexMaxStreams}`,
+    );
+  }
+  if (a.sipMaxStreams < 1 || a.sipMaxStreams > 10_000) {
+    throw new Error(
+      `[SYSTEM] ALPACA_SIP_MAX_STREAMS out of bounds (1–10000): ${a.sipMaxStreams}`,
+    );
+  }
+
   const r = config.risk;
 
   if (r.maxPositionPct <= 0 || r.maxPositionPct > 1.0)

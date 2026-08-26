@@ -107,6 +107,12 @@ export function isSipStreamDenied(code: number, message: string): boolean {
   );
 }
 
+/** IEX live stream refused the subscribe payload as over the 30-stream cap. */
+export function isSymbolLimitExceeded(code: number, message: string): boolean {
+  if (code === 405) return true;
+  return message.toLowerCase().includes('symbol limit exceeded');
+}
+
 /** Alpaca HTTP 429 — REST bars, snapshots, and order submit share this shape. */
 export function isRateLimitError(err: unknown): boolean {
   if (typeof err === 'object' && err !== null) {

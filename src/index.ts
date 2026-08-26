@@ -21,6 +21,7 @@ import {
   getESTDate,
   isNonRetryableOrderError,
   isSipStreamDenied,
+  isSymbolLimitExceeded,
   toESTDate,
   toErrorMessage,
 } from './utils';
@@ -31,6 +32,12 @@ import {
   type OpeningDriveContext,
   type OpeningDriveOptions,
 } from './openingDrive';
+import {
+  allocateStreamChannels,
+  describeStreamPlan,
+  uniqueSymbols,
+  type StreamChannelPlan,
+} from './streamSubscriptions';
 import { alertCritical, alertInfo, sendDailyReport } from './notifier';
 import {
   sendTelegramAlert,
@@ -208,6 +215,8 @@ let sessionStartEquity = 0;
 
 let activeStreamFeed: 'iex' | 'sip' = config.alpaca.streamFeed;
 let sipStreamFallbackUsed = false;
+/** After a 405, the current socket retries bars-only instead of looping 3×N. */
+let streamBarsOnly = false;
 
 function streamUrl(): string {
   return `wss://stream.data.alpaca.markets/v2/${activeStreamFeed}`;
@@ -729,12 +738,14 @@ function connectWatchlistStream(extraSymbols: string[] = []): void {
     return;
   }
   if (extraSymbols.length > 0) {
-    ws.send(buildSubscribeMessage(extraSymbols));
+    // Incremental add on an already-budgeted socket: bars only, never 3×N.
+    ws.send(buildSubscribeMessage(extraSymbols, true));
   }
 }
 
 /** Tear down the current socket and subscribe only the live universe. */
 function reconnectWatchlistStream(): void {
+  streamBarsOnly = false;
   if (!wsEnabled) return;
   const stale = ws;
   ws = null;
@@ -2115,15 +2126,28 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
 // WebSocket
 // ---------------------------------------------------------------------------
 
-function buildSubscribeMessage(symbols: string[]): string {
+function maxStreamsForActiveFeed(): number {
+  return activeStreamFeed === 'sip'
+    ? config.alpaca.sipMaxStreams
+    : config.alpaca.iexMaxStreams;
+}
+
+function planForSymbols(symbols: string[], barsOnly = streamBarsOnly): StreamChannelPlan {
+  return allocateStreamChannels(symbols, {
+    maxStreams: maxStreamsForActiveFeed(),
+    quotesEnabled: config.level2.enabled && !barsOnly,
+    tradesEnabled: config.openingDrive.tapeEnabled && !barsOnly,
+  });
+}
+
+function buildSubscribeMessage(symbols: string[], barsOnly = streamBarsOnly): string {
+  const plan = planForSymbols(symbols, barsOnly);
   const payload: { action: string; bars: string[]; quotes?: string[]; trades?: string[] } = {
     action: 'subscribe',
-    bars: symbols,
-    quotes: symbols,
+    bars: plan.bars,
   };
-  if (config.openingDrive.tapeEnabled) {
-    payload.trades = symbols;
-  }
+  if (plan.quotes.length > 0) payload.quotes = plan.quotes;
+  if (plan.trades.length > 0) payload.trades = plan.trades;
   return JSON.stringify(payload);
 }
 
@@ -2216,9 +2240,14 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
   for (const msg of messages) {
     if (isWsSuccessMessage(msg) && msg.msg === 'authenticated') {
       wsState = 'authenticated';
+      const unique = uniqueSymbols(symbols);
+      const plan = planForSymbols(symbols);
+      const dropped = unique.length - plan.bars.length;
       log.info(
-        `WebSocket authenticated — subscribing to ${symbols.length} symbols` +
-        (config.openingDrive.tapeEnabled ? ' (bars+quotes+trades)' : ' (bars+quotes)'),
+        `WebSocket authenticated — ${describeStreamPlan(plan)}` +
+        (dropped > 0
+          ? ` — dropped ${dropped} symbol(s) over ${maxStreamsForActiveFeed()}-stream cap`
+          : ''),
       );
       ws?.send(buildSubscribeMessage(symbols));
     }
@@ -2249,6 +2278,19 @@ async function handleWsMessage(raw: WebSocket.RawData, symbols: string[]): Promi
 
     if (isWsErrorMessage(msg)) {
       log.warn(`WebSocket error: code ${msg.code} — ${msg.msg}`);
+      if (isSymbolLimitExceeded(msg.code, msg.msg)) {
+        if (!streamBarsOnly) {
+          streamBarsOnly = true;
+          log.warn(
+            'IEX symbol limit — retrying bars-only on this socket ' +
+            `(${uniqueSymbols(symbols).length} names, cap ${maxStreamsForActiveFeed()} streams)`,
+          );
+          ws?.send(buildSubscribeMessage(symbols, true));
+        } else {
+          log.error('IEX symbol limit persists on bars-only — live tape stays empty');
+        }
+        return;
+      }
       if (
         activeStreamFeed !== 'iex' &&
         !sipStreamFallbackUsed &&

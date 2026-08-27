@@ -3,11 +3,15 @@ import assert from 'node:assert/strict';
 import {
   comparePremarketRank,
   compareWatchlistRank,
+  compareOpeningExtensionRank,
   computeAdrPct,
+  computeOpeningExtensionPct,
   isAllowedExchange,
+  isEtfLikeProduct,
   passesAdrGate,
   passesClosePrice,
   passesDollarVolume,
+  passesOpeningExtensionGates,
   passesPremarketPricePair,
   passesPriceBand,
   passesFloatGate,
@@ -130,6 +134,35 @@ describe('isAllowedExchange', () => {
   });
 });
 
+describe('isEtfLikeProduct', () => {
+  it('rejects the NASDAQ ETFs that filled the 27/08 watchlist', () => {
+    assert.equal(isEtfLikeProduct({ name: 'ProShares UltraPro Short QQQ' }), true);
+    assert.equal(isEtfLikeProduct({ name: 'ProShares UltraPro QQQ' }), true);
+    assert.equal(
+      isEtfLikeProduct({
+        name: 'Direxion Shares ETF Trust Direxion Daily TSLA Bull 2X ETF',
+      }),
+      true,
+    );
+    assert.equal(isEtfLikeProduct({ name: 'iShares Bitcoin Trust ETF Shares' }), true);
+    assert.equal(isEtfLikeProduct({ name: 'iShares Ethereum Trust ETF Shares' }), true);
+    assert.equal(isEtfLikeProduct({ name: 'Invesco QQQ Trust, Series 1' }), true);
+  });
+
+  it('keeps common stock / corporate names from the same tape', () => {
+    assert.equal(isEtfLikeProduct({ name: 'Intel Corporation Common Stock' }), false);
+    assert.equal(isEtfLikeProduct({ name: 'American Airlines Group Inc. Common Stock' }), false);
+    assert.equal(isEtfLikeProduct({ name: 'BitMine Immersion Technologies, Inc.' }), false);
+    assert.equal(isEtfLikeProduct({ name: 'Circle Internet Group, Inc.' }), false);
+    assert.equal(isEtfLikeProduct({ name: 'Invesco Ltd. Common Stock' }), false);
+  });
+
+  it('fails closed on a missing name and on an explicit etf attribute', () => {
+    assert.equal(isEtfLikeProduct({ name: '' }), true);
+    assert.equal(isEtfLikeProduct({ name: 'Mystery Co', attributes: ['etf'] }), true);
+  });
+});
+
 describe('sumShareVolume', () => {
   it('sums positive volumes', () => {
     assert.equal(sumShareVolume([{ volume: 100 }, { volume: 200 }, { volume: -1 }]), 300);
@@ -151,6 +184,67 @@ describe('compareWatchlistRank', () => {
       { relativeReturn: 0.02, relativeVolume: 1.4, gapUp: 0.00 },
     ].sort(compareWatchlistRank);
     assert.equal(ranked[0]?.relativeVolume, 1.4);
+  });
+});
+
+const extensionGates = {
+  minPrice: 5,
+  maxPrice: 100,
+  minExtensionPct: 0.01,
+  minRthDollarVolume: 100_000,
+};
+
+describe('computeOpeningExtensionPct + passesOpeningExtensionGates', () => {
+  it('accepts PATH 27/08 (+6.9% from the open, in-band)', () => {
+    assert.equal(computeOpeningExtensionPct(18.23, 17.055)?.toFixed(4), '0.0689');
+    assert.equal(
+      passesOpeningExtensionGates(
+        { last: 18.23, sessionOpen: 17.055, previousClose: 16.75, rthDollarVolume: 2_800_000 },
+        extensionGates,
+      ),
+      true,
+    );
+  });
+
+  it('rejects a name still at or below the open (long-only)', () => {
+    assert.equal(
+      passesOpeningExtensionGates(
+        { last: 38.22, sessionOpen: 38.47, previousClose: 39.4, rthDollarVolume: 7_000_000 },
+        extensionGates,
+      ),
+      false,
+    );
+  });
+
+  it('rejects a sub-1% drift even with mega dollar volume (INTC-like)', () => {
+    assert.equal(
+      passesOpeningExtensionGates(
+        { last: 90.0, sessionOpen: 89.615, previousClose: 88.25, rthDollarVolume: 36_000_000 },
+        { ...extensionGates, minExtensionPct: 0.021 },
+      ),
+      false,
+    );
+  });
+});
+
+describe('compareOpeningExtensionRank', () => {
+  it('ranks PATH / ASAN / CLSK ahead of INTC / TQQQ / SQQQ / AAL', () => {
+    const ranked = [
+      { symbol: 'INTC', extensionPct: 0.0205, rthDollarVolume: 36_000_000 },
+      { symbol: 'TQQQ', extensionPct: 0.0068, rthDollarVolume: 8_000_000 },
+      { symbol: 'SQQQ', extensionPct: 0.0073, rthDollarVolume: 7_000_000 },
+      { symbol: 'AAL', extensionPct: 0.0065, rthDollarVolume: 750_000 },
+      { symbol: 'PATH', extensionPct: 0.0689, rthDollarVolume: 2_800_000 },
+      { symbol: 'ASAN', extensionPct: 0.0480, rthDollarVolume: 300_000 },
+      { symbol: 'CLSK', extensionPct: 0.0221, rthDollarVolume: 366_000 },
+      { symbol: 'WULF', extensionPct: 0.0203, rthDollarVolume: 1_900_000 },
+    ].sort(compareOpeningExtensionRank);
+    const order = ranked.map(r => r.symbol);
+    assert.deepEqual(order.slice(0, 3), ['PATH', 'ASAN', 'CLSK']);
+    // WULF +2.03% vs INTC +2.05%: extension-first ranking keeps INTC just ahead.
+    assert.ok(order.indexOf('INTC') < order.indexOf('TQQQ'));
+    assert.ok(order.indexOf('WULF') < order.indexOf('TQQQ'));
+    assert.deepEqual(order.slice(-3), ['SQQQ', 'TQQQ', 'AAL']);
   });
 });
 

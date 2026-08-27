@@ -13,6 +13,7 @@ import {
   compareWatchlistRank,
   computeAdrPct,
   isAllowedExchange,
+  isEtfLikeProduct,
   passesAdrGate,
   passesDollarVolume,
   passesFloatGate,
@@ -84,6 +85,7 @@ export async function getDynamicUniverseAssets(): Promise<UniverseAsset[]> {
   let rejectedExchange = 0;
   let rejectedDirty = 0;
   let rejectedNotTradable = 0;
+  let rejectedEtf = 0;
 
   const filtered: UniverseAsset[] = [];
 
@@ -100,13 +102,17 @@ export async function getDynamicUniverseAssets(): Promise<UniverseAsset[]> {
       rejectedExchange++;
       continue;
     }
+    if (isEtfLikeProduct({ name: a.name, attributes: a.attributes })) {
+      rejectedEtf++;
+      continue;
+    }
     filtered.push({ symbol: a.symbol, exchange: a.exchange });
   }
 
   log.info(
     `Raw universe: ${assets.length} assets | ` +
-    `${filtered.length} after filtering (tradable + marginable + clean + exchange) | ` +
-    `rejects exchange=${rejectedExchange} dirty=${rejectedDirty} not_tradable=${rejectedNotTradable}`,
+    `${filtered.length} after filtering (tradable + marginable + clean + exchange + common equity) | ` +
+    `rejects exchange=${rejectedExchange} dirty=${rejectedDirty} not_tradable=${rejectedNotTradable} etf=${rejectedEtf}`,
   );
 
   return filtered;

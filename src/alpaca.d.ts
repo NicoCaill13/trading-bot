@@ -14,6 +14,9 @@ declare module '@alpacahq/alpaca-trade-api' {
     class: string;
     /** Venue code from Alpaca (e.g. NYSE, NASDAQ, ARCA). */
     exchange: string;
+    /** Issuer / product name — ETFs are `us_equity` and this is how we exclude them. */
+    name: string;
+    attributes?: string[];
   }
 
   // Matches the real SDK AlpacaBar (PascalCase — entityv2.d.ts)
@@ -123,6 +126,7 @@ declare module '@alpacahq/alpaca-trade-api' {
   export default class Alpaca {
     constructor(config: AlpacaClientConfig);
     getAssets(params: { status?: string; asset_class?: string }): Promise<AlpacaAsset[]>;
+    getAsset(symbol: string): Promise<AlpacaAsset>;
     // No second argument — SDK uses this.configuration (credentials) by default
     getSnapshots(symbols: string[]): Promise<AlpacaSnapshot[]>;
     getBarsV2(symbol: string, params: BarQueryParams): AsyncIterable<AlpacaBar>;

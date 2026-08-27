@@ -166,14 +166,14 @@ const config = {
     rvolBaselineDays: parseIntEnv('STRAIGHT_RUN_RVOL_BASELINE_DAYS', 14),
   },
 
-  // Opening Drive — sole live entry path. ORB 1-min high break, 09:30–09:45 EST.
+  // Opening Drive — sole live entry path. ORB 1-min high break, 09:30–10:00 EST.
   // Volume + close location first. Spread and signed tape veto when present.
   openingDrive: {
     shadow: process.env.OD_SHADOW === 'true',
     windowStartHour: parseIntEnv('OD_WINDOW_START_HOUR', 9),
     windowStartMinute: parseIntEnv('OD_WINDOW_START_MINUTE', 30),
-    windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 9),
-    windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 45),
+    windowEndHour: parseIntEnv('OD_WINDOW_END_HOUR', 10),
+    windowEndMinute: parseIntEnv('OD_WINDOW_END_MINUTE', 0),
     minRvol1m: parseFloatEnv('OD_RVOL_1M', 2.0),
     maxExtensionPct: parseFloatEnv('OD_MAX_EXTENSION_PCT', 0.08),
     rvolBaselineBars: parseIntEnv('OD_RVOL_BASELINE_BARS', 20),
@@ -183,6 +183,14 @@ const config = {
     minTapeDelta: parseFloatEnv('OD_MIN_TAPE_DELTA', 0),
     tapeEnabled: process.env.OD_TAPE_ENABLED !== 'false',
     shadowHorizonMinutes: parseIntEnv('OD_SHADOW_HORIZON_MIN', 60),
+    // Rank live names by (last − open) / open after 09:30. false = 09:15 PM $ vol list.
+    scannerEnabled: process.env.OD_SCANNER_ENABLED !== 'false',
+    scannerStartHour: parseIntEnv('OD_SCANNER_START_HOUR', 9),
+    scannerStartMinute: parseIntEnv('OD_SCANNER_START_MINUTE', 31),
+    scannerIntervalSec: parseIntEnv('OD_SCANNER_INTERVAL_SEC', 60),
+    scannerMaxSymbols: parseIntEnv('OD_SCANNER_MAX_SYMBOLS', 25),
+    scannerMinExtensionPct: parseFloatEnv('OD_SCANNER_MIN_EXTENSION_PCT', 0.01),
+    scannerMinRthDollarVolume: parseFloatEnv('OD_SCANNER_MIN_RTH_DOLLAR_VOLUME', 100_000),
   },
 
   premarket: {
@@ -190,6 +198,10 @@ const config = {
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 30),
+    // Eligible-pool 09:15: structural liquidity on yesterday's close, IEX scale.
+    // SIP ~$20M ≈ IEX ~$1.5–2M. ASAN printed $2.08M IEX on 26/08; GRML/AMIX stay under $0.4M.
+    poolMinPrevDollarVolume: parseFloatEnv('POOL_MIN_PREV_DOLLAR_VOLUME', 1_500_000),
+    poolMaxSize: parseIntEnv('POOL_MAX_SIZE', 1500),
   },
 
   entry: {
@@ -332,6 +344,7 @@ const config = {
     // Opening Drive observations. Kept apart from journal.json so hypothetical
     // fills never reach the FeedbackEngine.
     shadowSignals: parseStringEnv('OD_SHADOW_PATH', './data/shadow_signals.json'),
+    eligiblePool: parseStringEnv('ELIGIBLE_POOL_PATH', './data/eligible_pool.json'),
   },
 
   // Liveness contract consumed by the standalone watchdog process.
@@ -613,6 +626,32 @@ const config = {
       `[SYSTEM] OD_SHADOW_HORIZON_MIN must be >= 1: ${od.shadowHorizonMinutes}`,
     );
   }
+  const scannerStart = od.scannerStartHour * 60 + od.scannerStartMinute;
+  if (od.scannerEnabled && (scannerStart < odStart || scannerStart >= odEnd)) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_START must sit inside the OD window: ${scannerStart} not in [${odStart}, ${odEnd})`,
+    );
+  }
+  if (od.scannerIntervalSec < 15 || od.scannerIntervalSec > 300) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_INTERVAL_SEC out of bounds (15–300): ${od.scannerIntervalSec}`,
+    );
+  }
+  if (od.scannerMaxSymbols < 1 || od.scannerMaxSymbols > 30) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_MAX_SYMBOLS out of bounds (1–30): ${od.scannerMaxSymbols}`,
+    );
+  }
+  if (od.scannerMinExtensionPct < 0 || od.scannerMinExtensionPct > 0.2) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_MIN_EXTENSION_PCT out of bounds [0, 0.2]: ${od.scannerMinExtensionPct}`,
+    );
+  }
+  if (od.scannerMinRthDollarVolume <= 0) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_MIN_RTH_DOLLAR_VOLUME must be > 0: ${od.scannerMinRthDollarVolume}`,
+    );
+  }
   if (s.springReclaimRvol <= 0) {
     throw new Error(`[SYSTEM] SPRING_RECLAIM_RVOL must be > 0: ${s.springReclaimRvol}`);
   }
@@ -682,6 +721,14 @@ const config = {
     throw new Error(
       `[SYSTEM] PREMARKET_WATCHLIST_MAX_SIZE must be >= 1: ${pm.watchlistMaxSize}`,
     );
+  }
+  if (pm.poolMinPrevDollarVolume <= 0) {
+    throw new Error(
+      `[SYSTEM] POOL_MIN_PREV_DOLLAR_VOLUME must be > 0: ${pm.poolMinPrevDollarVolume}`,
+    );
+  }
+  if (pm.poolMaxSize < 1) {
+    throw new Error(`[SYSTEM] POOL_MAX_SIZE must be >= 1: ${pm.poolMaxSize}`);
   }
 
   const sess = config.session;

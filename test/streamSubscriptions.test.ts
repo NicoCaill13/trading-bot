@@ -56,6 +56,20 @@ describe('allocateStreamChannels', () => {
     assert.equal(countStreams(plan), 17);
   });
 
+  it('fits 25 movers plus 2 open positions under the IEX cap (bars-only)', () => {
+    const movers = Array.from({ length: 25 }, (_, i) => `M${i}`);
+    const live = [...movers, 'POS1', 'POS2'];
+    const plan = allocateStreamChannels(live, {
+      maxStreams: 30,
+      quotesEnabled: false,
+      tradesEnabled: false,
+    });
+    assert.equal(plan.bars.length, 27);
+    assert.deepEqual(plan.quotes, []);
+    assert.deepEqual(plan.trades, []);
+    assert.ok(countStreams(plan) <= 30);
+  });
+
   it('never exceeds maxStreams', () => {
     const names = Array.from({ length: 50 }, (_, i) => `S${i}`);
     const plan = allocateStreamChannels(names, { maxStreams: 30, quotesEnabled: true, tradesEnabled: true });

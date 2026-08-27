@@ -16,16 +16,20 @@ import { runPostMortem } from './analyzer';
 import { isTradingDay, queryRequiredWatchlistTradingDay } from './marketCalendar';
 import alpaca from './alpacaClient';
 import { createLogger } from './logger';
+import { isEtfLikeProduct } from './screenerMath';
 import {
   clampQueryEnd,
   getESTDate,
   isNonRetryableOrderError,
+  isRateLimitError,
   isSipStreamDenied,
   isSymbolLimitExceeded,
+  nyWallTimeToUtc,
   toESTDate,
   toErrorMessage,
 } from './utils';
 import {
+  computeSpreadPct,
   describeOpeningDriveDecision,
   evaluateOpeningDrive,
   isOpeningDriveFunnelRejection,
@@ -44,8 +48,11 @@ import {
   formatStartupAlert,
   formatErrorAlert,
 } from './notificationManager';
-import { extractV2Symbols, isV2Symbol, readWatchlist } from './watchlistIO';
+import { extractV2Symbols, isV2Symbol, readWatchlist, writePremarketWatchlist } from './watchlistIO';
 import { isWatchlistCurrent } from './watchlistFreshness';
+import { selectOpeningRangeBar } from './openingRange';
+import { buildEligiblePool, readEligiblePool } from './eligiblePool';
+import { moversToWatchlist, scanSessionExtension } from './openingScanner';
 import {
   computeFibLevels,
   deriveFibLevelsFromBars,
@@ -217,6 +224,7 @@ let activeStreamFeed: 'iex' | 'sip' = config.alpaca.streamFeed;
 let sipStreamFallbackUsed = false;
 /** After a 405, the current socket retries bars-only instead of looping 3×N. */
 let streamBarsOnly = false;
+let openingScannerTimer: ReturnType<typeof setTimeout> | null = null;
 
 function streamUrl(): string {
   return `wss://stream.data.alpaca.markets/v2/${activeStreamFeed}`;
@@ -654,6 +662,93 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
   return monitoredSymbols;
 }
 
+function purgeMonitoredSymbol(symbol: string): void {
+  orbUniverse.delete(symbol);
+  preMarketGaps.delete(symbol);
+  screenerDataMap.delete(symbol);
+  v2PersistentSymbols.delete(symbol);
+  openingRangeBar.delete(symbol);
+  sessionOpenPrice.delete(symbol);
+  openingDriveTriggered.delete(symbol);
+  openingDriveAuditLogged.delete(symbol);
+  openingDriveRejectLogged.delete(symbol);
+  lastNbbo.delete(symbol);
+  lastL2LogAt.delete(symbol);
+  lastLoggedL2Wall.delete(symbol);
+  tapeMinutes.delete(symbol);
+  lastTradePrice.delete(symbol);
+  oneMinBarHistory.delete(symbol);
+  ema9ClosePrices.delete(symbol);
+  pullbackTrackers.delete(symbol);
+  l2WallSignals.delete(symbol);
+  l2QuotesSeen.delete(symbol);
+  signalBars5m.delete(symbol);
+  fiveMinAggregators.delete(symbol);
+  sessionData.delete(symbol);
+}
+
+/**
+ * Merge-swap the Opening Drive universe. Preserves session state for names that
+ * stay (open positions, already-armed setups). Purges only the dropouts.
+ */
+async function swapOpeningUniverse(
+  movers: WatchlistSymbol[],
+): Promise<{ added: string[]; removed: string[] }> {
+  const keep = new Set(movers.map(s => s.symbol));
+  for (const symbol of enteredBySetup.keys()) keep.add(symbol);
+  for (const symbol of openingDriveTriggered) keep.add(symbol);
+
+  const previous = new Set(monitoredSymbols);
+  const removed = monitoredSymbols.filter(s => !keep.has(s));
+  for (const symbol of removed) purgeMonitoredSymbol(symbol);
+
+  v2PersistentSymbols.clear();
+  orbUniverse.clear();
+  for (const entry of movers) {
+    registerWatchlistSymbol(entry);
+    v2PersistentSymbols.add(entry.symbol);
+  }
+  for (const symbol of keep) {
+    v2PersistentSymbols.add(symbol);
+    orbUniverse.add(symbol);
+  }
+
+  monitoredSymbols = [...keep];
+  const added = monitoredSymbols.filter(s => !previous.has(s));
+
+  const tradingDay =
+    watchlistTradingDay ??
+    (await queryRequiredWatchlistTradingDay()) ??
+    getSessionDateStr();
+  const written = await writePremarketWatchlist(
+    movers.filter(s => keep.has(s.symbol)),
+    tradingDay,
+  );
+  watchlistGeneratedAt = written.generatedAt;
+  watchlistTradingDay = written.tradingDay ?? tradingDay;
+
+  log.info(
+    `Opening universe swap — keep ${monitoredSymbols.length} ` +
+    `(+${added.length} / −${removed.length})`,
+  );
+  return { added, removed };
+}
+
+/**
+ * Seeds 1-min history and the true 09:30 opening range without replaying signals.
+ */
+function seedSessionBars(symbol: string, bars: BarData[]): void {
+  if (bars.length === 0) return;
+  for (const bar of bars) {
+    pushOneMinBar(symbol, bar);
+    pushEma9Close(symbol, bar.close);
+  }
+  const selected = selectOpeningRangeBar(bars, marketOpenMinutes());
+  if (selected === null) return;
+  if (!sessionOpenPrice.has(symbol)) sessionOpenPrice.set(symbol, selected.sessionOpen);
+  if (!openingRangeBar.has(symbol)) openingRangeBar.set(symbol, selected.rangeBar);
+}
+
 function ensureV2SymbolsMonitored(): void {
   if (v2PersistentSymbols.size === 0) return;
   monitoredSymbols = [...new Set([...monitoredSymbols, ...v2PersistentSymbols])];
@@ -745,7 +840,7 @@ function connectWatchlistStream(extraSymbols: string[] = []): void {
 
 /** Tear down the current socket and subscribe only the live universe. */
 function reconnectWatchlistStream(): void {
-  streamBarsOnly = false;
+  streamBarsOnly = config.openingDrive.scannerEnabled;
   if (!wsEnabled) return;
   const stale = ws;
   ws = null;
@@ -877,6 +972,10 @@ function getSessionDateStr(): string {
   return `${y}-${m}-${d}`;
 }
 
+function marketOpenMinutes(): number {
+  return config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
+}
+
 /**
  * Records the regular-session open from the bar's own timestamp.
  *
@@ -886,22 +985,25 @@ function getSessionDateStr(): string {
  */
 function captureSessionOpen(symbol: string, bar: BarData): void {
   if (sessionOpenPrice.has(symbol)) return;
-
-  const barEst = toESTDate(new Date(bar.timestamp));
-  const openMinutes = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
-  if (minutesSinceMidnight(barEst) < openMinutes) return;
-
-  sessionOpenPrice.set(symbol, bar.open);
+  const selected = selectOpeningRangeBar(
+    oneMinBarHistory.get(symbol) ?? [bar],
+    marketOpenMinutes(),
+  );
+  if (selected === null) return;
+  sessionOpenPrice.set(symbol, selected.sessionOpen);
 }
 
 function captureOpeningRange(symbol: string, bar: BarData): void {
   if (openingRangeBar.has(symbol)) return;
-
-  const barEst = toESTDate(new Date(bar.timestamp));
-  const openMinutes = config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
-  if (minutesSinceMidnight(barEst) < openMinutes) return;
-
-  openingRangeBar.set(symbol, bar);
+  const selected = selectOpeningRangeBar(
+    oneMinBarHistory.get(symbol) ?? [bar],
+    marketOpenMinutes(),
+  );
+  if (selected === null) return;
+  openingRangeBar.set(symbol, selected.rangeBar);
+  if (!sessionOpenPrice.has(symbol)) {
+    sessionOpenPrice.set(symbol, selected.sessionOpen);
+  }
 }
 
 function isRegularSessionStarted(): boolean {
@@ -1026,7 +1128,11 @@ function seedOrbState(symbol: string, bars: BarData[]): void {
   });
 }
 
-async function hydrateIntradayBars(symbols: string[]): Promise<void> {
+async function hydrateIntradayBars(
+  symbols: string[],
+  opts: { evaluate?: boolean } = {},
+): Promise<void> {
+  const evaluate = opts.evaluate !== false;
   if (!isRegularSessionStarted()) {
     log.info('Pre-open — intraday bar hydration skipped');
     return;
@@ -1083,6 +1189,8 @@ async function hydrateIntradayBars(symbols: string[]): Promise<void> {
     `Hydration done — ${symbolsWithBars}/${symbols.length} symbols, ` +
     `${totalBars} bar(s) loaded`,
   );
+
+  if (!evaluate) return;
 
   for (const symbol of symbols) {
     const bars = signalBars5m.get(symbol);
@@ -1682,6 +1790,12 @@ async function executeSignals(
     );
 
     try {
+      const asset = await alpaca.getAsset(symbol);
+      if (isEtfLikeProduct({ name: asset.name, attributes: asset.attributes })) {
+        log.warn(`${symbol}: entry blocked — ETF/ETP product (${asset.name})`);
+        continue;
+      }
+
       const availableBuyingPower = await trader.getAvailableBuyingPower();
       const allocation = await riskManager.getPortfolioAllocation();
       if (!allocation.canOpen) {
@@ -1697,7 +1811,8 @@ async function executeSignals(
       // stale signal bar close. The signal-batch debounce can let fast movers run
       // several % between signal and submission — that gap was the root cause of the
       // catastrophic fills (e.g. validated near VWAP at $28, filled at $32).
-      const referencePrice = await trader.getEntryReferencePrice(symbol, barData.close);
+      const reference = await trader.getEntryReference(symbol, barData.close);
+      const referencePrice = reference.price;
 
       const chasePct = ((referencePrice - barData.close) / barData.close) * 100;
       if (chasePct > config.entry.maxEntryChasePct) {
@@ -1705,6 +1820,15 @@ async function executeSignals(
           `${symbol}: entry blocked by anti-chase — live ask $${referencePrice.toFixed(2)} ` +
           `is ${chasePct.toFixed(2)}% above signal $${barData.close.toFixed(2)} ` +
           `(cap ${config.entry.maxEntryChasePct}%)`,
+        );
+        continue;
+      }
+
+      const spreadPct = computeSpreadPct(reference.bid, reference.ask);
+      if (spreadPct !== null && spreadPct > config.openingDrive.maxSpreadPct) {
+        log.warn(
+          `${symbol}: entry blocked — live spread ${(spreadPct * 100).toFixed(2)}% ` +
+          `> cap ${(config.openingDrive.maxSpreadPct * 100).toFixed(2)}%`,
         );
         continue;
       }
@@ -2151,6 +2275,33 @@ function buildSubscribeMessage(symbols: string[], barsOnly = streamBarsOnly): st
   return JSON.stringify(payload);
 }
 
+function buildUnsubscribeMessage(symbols: string[], barsOnly = streamBarsOnly): string {
+  const plan = planForSymbols(symbols, barsOnly);
+  const payload: { action: string; bars: string[]; quotes?: string[]; trades?: string[] } = {
+    action: 'unsubscribe',
+    bars: plan.bars,
+  };
+  if (plan.quotes.length > 0) payload.quotes = plan.quotes;
+  if (plan.trades.length > 0) payload.trades = plan.trades;
+  return JSON.stringify(payload);
+}
+
+/** In-place stream swap — keeps the socket, avoids a MARKET_DATA_STALE gap. */
+function swapLiveStream(added: string[], removed: string[]): void {
+  if (!wsEnabled) return;
+  if (config.openingDrive.scannerEnabled) streamBarsOnly = true;
+  if (!ws) {
+    if (monitoredSymbols.length > 0) connectWebSocket(monitoredSymbols);
+    return;
+  }
+  if (removed.length > 0) {
+    ws.send(buildUnsubscribeMessage(removed, streamBarsOnly));
+  }
+  if (added.length > 0) {
+    ws.send(buildSubscribeMessage(added, true));
+  }
+}
+
 function isWsBarMessage(msg: WsMessage): msg is WsBarMessage {
   return msg.T === 'b';
 }
@@ -2526,6 +2677,10 @@ function scheduleDailyReset(): void {
       clearTimeout(signalFlushTimer);
       signalFlushTimer = null;
     }
+    if (openingScannerTimer) {
+      clearTimeout(openingScannerTimer);
+      openingScannerTimer = null;
+    }
     signalBars5m.clear();
     fiveMinAggregators.clear();
     sessionData.clear();
@@ -2625,23 +2780,36 @@ function schedulePreMarketReconciliation(): void {
         await armLivePipeline();
         await reconcileStateFromBroker();
         await runMorningRegimeAssessment();
-        const watchlist = await runPremarketScreener();
-        if (!config.screener.eveningScreenerEnabled) {
-          const symbols = replaceMonitoredUniverse(watchlist);
+        if (config.openingDrive.scannerEnabled) {
+          const { warmup } = await buildEligiblePool();
+          const symbols = replaceMonitoredUniverse(warmup);
           await refreshRequiredWatchlistTradingDay();
+          streamBarsOnly = true;
           log.info(
-            `Hyper-Growth universe replaced — ${symbols.length} V2_PLAYMAKER symbol(s)`,
+            `Hyper-Growth eligible pool ready — warmup ${symbols.length} symbol(s), ` +
+            `scanner from ${config.openingDrive.scannerStartHour}:` +
+            `${String(config.openingDrive.scannerStartMinute).padStart(2, '0')}`,
           );
           reconnectWatchlistStream();
         } else {
-          const v2Symbols = extractV2Symbols(watchlist);
-          const newSymbols = applyV2WatchlistSymbols(v2Symbols);
-          await refreshRequiredWatchlistTradingDay();
-          log.info(
-            `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
-            `${newSymbols.length} new WebSocket subscription(s)`,
-          );
-          connectWatchlistStream(newSymbols);
+          const watchlist = await runPremarketScreener();
+          if (!config.screener.eveningScreenerEnabled) {
+            const symbols = replaceMonitoredUniverse(watchlist);
+            await refreshRequiredWatchlistTradingDay();
+            log.info(
+              `Hyper-Growth universe replaced — ${symbols.length} V2_PLAYMAKER symbol(s)`,
+            );
+            reconnectWatchlistStream();
+          } else {
+            const v2Symbols = extractV2Symbols(watchlist);
+            const newSymbols = applyV2WatchlistSymbols(v2Symbols);
+            await refreshRequiredWatchlistTradingDay();
+            log.info(
+              `Play-Maker V2 done — ${v2Symbols.length} symbol(s), ` +
+              `${newSymbols.length} new WebSocket subscription(s)`,
+            );
+            connectWatchlistStream(newSymbols);
+          }
         }
       } catch (err: unknown) {
         log.error(`Pre-market routine error: ${toErrorMessage(err)}`);
@@ -2649,6 +2817,147 @@ function schedulePreMarketReconciliation(): void {
       schedulePreMarketReconciliation();
     });
   }, ms);
+}
+
+async function fetchOneMinuteSessionBars(symbol: string): Promise<BarData[]> {
+  const estDay = getESTDate();
+  const start = nyWallTimeToUtc(estDay, 4, 0);
+  const end = clampQueryEnd(
+    new Date(),
+    config.alpaca.streamFeed,
+    config.alpaca.sipDelayMs,
+  );
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const bars: BarData[] = [];
+      const iter = alpaca.getBarsV2(symbol, {
+        start: start.toISOString(),
+        end: end.toISOString(),
+        timeframe: '1Min',
+        feed: config.alpaca.streamFeed,
+      });
+      for await (const bar of iter) {
+        bars.push(alpacaBarToBarData(bar));
+      }
+      return bars;
+    } catch (err) {
+      lastErr = err;
+      if (!isRateLimitError(err) || attempt === 4) break;
+      const delay = Math.min(500 * 2 ** (attempt - 1), 8_000);
+      log.warn(
+        `${symbol}: 1-min seed 429 — retry ${attempt}/4 in ${delay}ms`,
+      );
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+async function seedNewOpeningSymbols(symbols: string[]): Promise<void> {
+  if (symbols.length === 0) return;
+  log.info(`Seeding 1-min bars (${config.alpaca.streamFeed}) for ${symbols.length} new mover(s)...`);
+  const concurrency = 2;
+  for (let i = 0; i < symbols.length; i += concurrency) {
+    const batch = symbols.slice(i, i + concurrency);
+    await Promise.all(batch.map(async symbol => {
+      try {
+        const bars = await fetchOneMinuteSessionBars(symbol);
+        seedSessionBars(symbol, bars);
+      } catch (err) {
+        log.warn(`${symbol}: 1-min seed failed — ${toErrorMessage(err)}`);
+      }
+    }));
+    if (i + concurrency < symbols.length) {
+      await new Promise(r => setTimeout(r, 600));
+    }
+  }
+  await hydrateIntradayBars(symbols, { evaluate: false });
+}
+
+function isOpeningScannerWindow(): boolean {
+  const mins = minutesSinceMidnight(getESTDate());
+  const start =
+    config.openingDrive.scannerStartHour * 60 + config.openingDrive.scannerStartMinute;
+  const end =
+    config.openingDrive.windowEndHour * 60 + config.openingDrive.windowEndMinute;
+  return mins >= start && mins <= end;
+}
+
+async function runOpeningScannerTick(): Promise<void> {
+  let pool = await readEligiblePool();
+  if (pool === null || pool.symbols.length === 0) {
+    log.warn('Opening scanner — no pool on disk, rebuilding');
+    try {
+      const built = await buildEligiblePool();
+      pool = built.pool;
+    } catch (err) {
+      log.error(`Opening scanner skipped — pool rebuild failed: ${toErrorMessage(err)}`);
+      return;
+    }
+  }
+  const pinned = new Set<string>([...openingDriveTriggered, ...enteredBySetup.keys()]);
+  const movers = await scanSessionExtension(pool.symbols, alpaca, {
+    minPrice: config.screener.minClosePrice,
+    maxPrice: config.screener.maxClosePrice,
+    minExtensionPct: config.openingDrive.scannerMinExtensionPct,
+    minRthDollarVolume: config.openingDrive.scannerMinRthDollarVolume,
+    maxSymbols: config.openingDrive.scannerMaxSymbols,
+    pinned,
+  });
+  const { added, removed } = await swapOpeningUniverse(moversToWatchlist(movers));
+  swapLiveStream(added, removed);
+  if (added.length > 0) await seedNewOpeningSymbols(added);
+}
+
+function armOpeningScannerLoop(): void {
+  if (openingScannerTimer) clearTimeout(openingScannerTimer);
+  openingScannerTimer = setTimeout(() => {
+    void (async () => {
+      if (!isOpeningScannerWindow()) return;
+      try {
+        await runOpeningScannerTick();
+      } catch (err) {
+        log.error(`Opening scanner tick failed — ${toErrorMessage(err)}`);
+      }
+      if (isOpeningScannerWindow()) armOpeningScannerLoop();
+    })();
+  }, config.openingDrive.scannerIntervalSec * 1000);
+}
+
+function scheduleOpeningScanner(): void {
+  if (!config.openingDrive.scannerEnabled) return;
+
+  const startHour = config.openingDrive.scannerStartHour;
+  const startMinute = config.openingDrive.scannerStartMinute;
+  const delayMs = isOpeningScannerWindow()
+    ? 0
+    : msUntilESTTime(startHour, startMinute);
+
+  log.info(
+    delayMs === 0
+      ? 'Opening scanner — already in window, first tick now'
+      : `Opening scanner ${String(startHour).padStart(2, '0')}:` +
+        `${String(startMinute).padStart(2, '0')} scheduled in ` +
+        `${Math.round(delayMs / 1000 / 60)} minutes`,
+  );
+
+  setTimeout(() => {
+    void isTradingDay().then(async tradingToday => {
+      if (tradingToday && (isOpeningScannerWindow() || delayMs > 0)) {
+        if (isOpeningScannerWindow() || delayMs > 0) {
+          try {
+            await runOpeningScannerTick();
+          } catch (err) {
+            log.error(`Opening scanner start failed — ${toErrorMessage(err)}`);
+          }
+          armOpeningScannerLoop();
+        }
+      }
+      const nextMs = msUntilESTTime(startHour, startMinute);
+      setTimeout(() => scheduleOpeningScanner(), nextMs);
+    });
+  }, delayMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2686,6 +2995,7 @@ async function main(): Promise<void> {
   scheduleDailyReset();
   schedulePreMarketReconciliation();
   scheduleMarketOpenAlert();
+  scheduleOpeningScanner();
 
   if (!tradingToday) {
     wsEnabled = false;
@@ -2709,6 +3019,7 @@ async function main(): Promise<void> {
 
   await reconcileStateFromBroker();
   await hydrateIntradayBars(symbols);
+  streamBarsOnly = config.openingDrive.scannerEnabled;
   connectWatchlistStream();
 
   if (config.openingDrive.tapeEnabled) {

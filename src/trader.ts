@@ -359,11 +359,13 @@ function positiveOrNull(value: number | undefined): number | null {
 /** Pulls ask / last / minute close from an Alpaca snapshot without preferring a stale ask. */
 function extractSnapshotPrices(snap: AlpacaSnapshot): {
   ask: number | null;
+  bid: number | null;
   lastTrade: number | null;
   minuteClose: number | null;
 } {
   return {
     ask: positiveOrNull(snap.LatestQuote?.AskPrice),
+    bid: positiveOrNull(snap.LatestQuote?.BidPrice),
     lastTrade: positiveOrNull(snap.LatestTrade?.Price),
     minuteClose: positiveOrNull(snap.MinuteBar?.ClosePrice),
   };
@@ -371,27 +373,38 @@ function extractSnapshotPrices(snap: AlpacaSnapshot): {
 
 /**
  * Public live-ask resolver — used by the entry pipeline to validate guards
- * (anti-chase, VWAP distance, Fibonacci, stop sizing) against the price we will
- * actually pay, not the stale signal bar close.
+ * (anti-chase, VWAP distance, Fibonacci, stop sizing, spread) against the
+ * price we will actually pay, not the stale signal bar close.
  */
+export async function getEntryReference(
+  symbol: string,
+  fallbackPrice: number,
+): Promise<{ price: number; bid: number | null; ask: number | null }> {
+  return fetchLiveAskPrice(symbol, fallbackPrice);
+}
+
 export async function getEntryReferencePrice(
   symbol: string,
   fallbackPrice: number,
 ): Promise<number> {
-  return fetchLiveAskPrice(symbol, fallbackPrice);
+  const reference = await getEntryReference(symbol, fallbackPrice);
+  return reference.price;
 }
 
 /**
  * Fetches the live ask price for a symbol.
  * Falls back to signalPrice when the snapshot call fails.
  */
-async function fetchLiveAskPrice(symbol: string, signalPrice: number): Promise<number> {
+async function fetchLiveAskPrice(
+  symbol: string,
+  signalPrice: number,
+): Promise<{ price: number; bid: number | null; ask: number | null }> {
   try {
     const snapshots = await alpaca.getSnapshots([symbol]);
     const snap = snapshots.find(
       s => (s.Symbol ?? (s as { symbol?: string }).symbol) === symbol,
     );
-    if (!snap) return signalPrice;
+    if (!snap) return { price: signalPrice, bid: null, ask: null };
 
     const extracted = extractSnapshotPrices(snap);
     const staleAskExcess = config.entry.maxEntryChasePct / 100;
@@ -411,9 +424,13 @@ async function fetchLiveAskPrice(symbol: string, signalPrice: number): Promise<n
       );
     }
 
-    return resolved.price;
+    return {
+      price: resolved.price,
+      bid: extracted.bid,
+      ask: extracted.ask,
+    };
   } catch {
-    return signalPrice;
+    return { price: signalPrice, bid: null, ask: null };
   }
 }
 
@@ -459,7 +476,7 @@ export async function placeBracketOrder(
   const liveAskPrice =
     prefetchedAskPrice !== undefined && prefetchedAskPrice > 0
       ? prefetchedAskPrice
-      : await fetchLiveAskPrice(symbol, signalPrice);
+      : (await fetchLiveAskPrice(symbol, signalPrice)).price;
 
   const [availableBuyingPower, positions] = await Promise.all([
     getAvailableBuyingPower(),

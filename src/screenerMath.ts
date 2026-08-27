@@ -102,6 +102,38 @@ export function isAllowedExchange(
   return allowed.some(a => a.toUpperCase() === normalized);
 }
 
+/**
+ * Alpaca lists ETFs under `us_equity` with no `attributes: ["etf"]` flag.
+ * Opening Drive is stock-only — names are the only reliable discriminator.
+ * Empty name fails closed so an unnamed payload never reaches the watchlist.
+ */
+const ETF_VEHICLE_RE = /\b(?:ETF|ETN|ETP|ETMF)s?\b/i;
+const ETF_ISSUER_OR_SHARE_CLASS_RE =
+  /\b(?:ProShares|Direxion|iShares|SPDR|UltraPro|UltraShort)\b/i;
+const ETF_LEVERAGED_DAILY_RE =
+  /\bDaily\b.+\b(?:Bull|Bear)\b|\b(?:Bull|Bear)\b.+\b\d+X\b/i;
+const ETF_TRUST_SERIES_RE = /\bTrust,\s*Series\b/i;
+
+export function isEtfLikeProduct(params: {
+  name?: string | null;
+  attributes?: readonly string[] | null;
+}): boolean {
+  const attributes = params.attributes ?? [];
+  if (attributes.some(a => a.trim().toLowerCase() === 'etf')) {
+    return true;
+  }
+
+  const name = (params.name ?? '').trim();
+  if (name.length === 0) return true;
+
+  return (
+    ETF_VEHICLE_RE.test(name) ||
+    ETF_ISSUER_OR_SHARE_CLASS_RE.test(name) ||
+    ETF_LEVERAGED_DAILY_RE.test(name) ||
+    ETF_TRUST_SERIES_RE.test(name)
+  );
+}
+
 export function sumShareVolume(bars: readonly VolumeBar[]): number {
   return bars.reduce((sum, b) => sum + (b.volume > 0 ? b.volume : 0), 0);
 }
@@ -119,5 +151,61 @@ export function compareWatchlistRank(
   const rvol = (b.relativeVolume ?? 0) - (a.relativeVolume ?? 0);
   if (Math.abs(rvol) > 1e-12) return rvol;
   return (b.gapUp ?? 0) - (a.gapUp ?? 0);
+}
+
+/** (last − sessionOpen) / sessionOpen. Null when the open is not usable. */
+export function computeOpeningExtensionPct(
+  last: number,
+  sessionOpen: number,
+): number | null {
+  if (!(last > 0) || !(sessionOpen > 0)) return null;
+  return (last - sessionOpen) / sessionOpen;
+}
+
+export interface OpeningExtensionCandidate {
+  last: number;
+  sessionOpen: number;
+  previousClose: number;
+  rthDollarVolume: number;
+}
+
+export interface OpeningExtensionGateOpts {
+  minPrice: number;
+  maxPrice: number;
+  minExtensionPct: number;
+  minRthDollarVolume: number;
+}
+
+/**
+ * Long-only opening-extension gates: last above the session open, minimum
+ * extension, price band on last AND previous close, RTH dollar-volume floor.
+ */
+export function passesOpeningExtensionGates(
+  c: OpeningExtensionCandidate,
+  opts: OpeningExtensionGateOpts,
+): boolean {
+  const extension = computeOpeningExtensionPct(c.last, c.sessionOpen);
+  if (extension === null) return false;
+  if (!(c.last > c.sessionOpen)) return false;
+  if (extension < opts.minExtensionPct) return false;
+  if (!passesPremarketPricePair(c.last, c.previousClose, opts.minPrice, opts.maxPrice)) {
+    return false;
+  }
+  return c.rthDollarVolume >= opts.minRthDollarVolume;
+}
+
+export interface OpeningExtensionRank {
+  extensionPct: number;
+  rthDollarVolume: number;
+}
+
+/** Extension from the open first; RTH dollar volume is the tie-break. */
+export function compareOpeningExtensionRank(
+  a: OpeningExtensionRank,
+  b: OpeningExtensionRank,
+): number {
+  const byExtension = b.extensionPct - a.extensionPct;
+  if (Math.abs(byExtension) > 1e-12) return byExtension;
+  return b.rthDollarVolume - a.rthDollarVolume;
 }
 

@@ -83,6 +83,7 @@ import { resolveRiskDollarsAtEntry } from './expectancy';
 import { remainingPositionSlots } from './riskSizing';
 import { createMarketDataBus } from './marketDataBus';
 import { createHeartbeatWriter } from './heartbeat';
+import { startPolicyMonitor, stopPolicyMonitor } from './policyMonitor';
 import { assessQuoteForWall } from './orderBook';
 import {
   computeTapeDelta,
@@ -3028,6 +3029,8 @@ async function main(): Promise<void> {
   // Started before any await that can fail: an unreachable broker must still
   // produce a heartbeat, otherwise the watchdog cannot tell "degraded" from "dead".
   heartbeatWriter.start();
+  // No-op unless POLICY_MONITOR_ENABLED=true. Alert-only; never trades.
+  startPolicyMonitor();
 
   const symbols = await loadWatchlist(!tradingToday);
   monitoredSymbols = symbols;
@@ -3108,6 +3111,7 @@ async function main(): Promise<void> {
 async function gracefulShutdown(signal: string): Promise<void> {
   log.warn(`Signal ${signal} received — saving state and shutting down`);
   await saveSessionState().catch(() => { });
+  stopPolicyMonitor();
   // Final write then stop: the watchdog sees the last known state age out
   // naturally instead of finding a file frozen mid-session.
   heartbeatWriter.flush();

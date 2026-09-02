@@ -16,6 +16,12 @@ function parseBusDropPolicy(raw: string | undefined): 'drop_oldest' | 'drop_newe
   );
 }
 
+function parsePolicyMode(raw: string | undefined): 'market' | 'all' {
+  const value = (raw ?? 'market').trim().toLowerCase();
+  if (value === 'market' || value === 'all') return value;
+  throw new Error(`[SYSTEM] POLICY_MONITOR_MODE must be market|all: "${raw ?? ''}"`);
+}
+
 const config = {
   alpaca: {
     keyId: requireEnv('ALPACA_KEY_ID'),
@@ -335,6 +341,20 @@ const config = {
     lookbackHours: parseIntEnv('SENTIMENT_LOOKBACK_HOURS', 48),
     maxHeadlinesPerSymbol: parseIntEnv('SENTIMENT_MAX_HEADLINES', 25),
     fetchConcurrency: parseIntEnv('SENTIMENT_FETCH_CONCURRENCY', 5),
+  },
+
+  /**
+   * Presidential-action / Trump-headline alerter. Off by default.
+   * Alert-only: never sizes, never sends orders, never mutates the watchlist.
+   */
+  policyMonitor: {
+    enabled: process.env.POLICY_MONITOR_ENABLED === 'true',
+    mode: parsePolicyMode(process.env.POLICY_MONITOR_MODE),
+    pollIntervalMs: parseIntEnv('POLICY_MONITOR_POLL_MS', 300_000),
+    newsLookbackMs: parseIntEnv('POLICY_MONITOR_NEWS_LOOKBACK_MS', 6 * 60 * 60 * 1000),
+    federalRegisterLimit: parseIntEnv('POLICY_MONITOR_FR_LIMIT', 20),
+    newsLimit: parseIntEnv('POLICY_MONITOR_NEWS_LIMIT', 50),
+    cursorPath: parseStringEnv('POLICY_MONITOR_CURSOR_PATH', './data/policy_cursor.json'),
   },
 
   paths: {
@@ -827,6 +847,28 @@ const config = {
   if (sent.fetchConcurrency < 1 || sent.fetchConcurrency > 20) {
     throw new Error(
       `[SYSTEM] SENTIMENT_FETCH_CONCURRENCY out of bounds (1–20): ${sent.fetchConcurrency}`,
+    );
+  }
+
+  const policy = config.policyMonitor;
+  if (policy.pollIntervalMs < 60_000 || policy.pollIntervalMs > 3_600_000) {
+    throw new Error(
+      `[SYSTEM] POLICY_MONITOR_POLL_MS out of bounds (60000–3600000): ${policy.pollIntervalMs}`,
+    );
+  }
+  if (policy.newsLookbackMs < 60_000 || policy.newsLookbackMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error(
+      `[SYSTEM] POLICY_MONITOR_NEWS_LOOKBACK_MS out of bounds: ${policy.newsLookbackMs}`,
+    );
+  }
+  if (policy.federalRegisterLimit < 1 || policy.federalRegisterLimit > 100) {
+    throw new Error(
+      `[SYSTEM] POLICY_MONITOR_FR_LIMIT out of bounds (1–100): ${policy.federalRegisterLimit}`,
+    );
+  }
+  if (policy.newsLimit < 1 || policy.newsLimit > 50) {
+    throw new Error(
+      `[SYSTEM] POLICY_MONITOR_NEWS_LIMIT out of bounds (1–50): ${policy.newsLimit}`,
     );
   }
 }());

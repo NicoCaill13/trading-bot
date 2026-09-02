@@ -6,7 +6,9 @@ import {
   computeOrbVolumeMultiple,
   computeSpreadPct,
   evaluateOpeningDrive,
+  isChasingOpeningRangeHigh,
   isOpeningDriveFunnelRejection,
+  SCANNER_HOLD_GATES,
   type OpeningDriveContext,
   type OpeningDriveOptions,
 } from '../src/openingDrive';
@@ -406,10 +408,15 @@ describe('isOpeningDriveFunnelRejection', () => {
   it('keeps every in-window rejection as a funnel step', () => {
     const codes = [
       'insufficient_data',
+      'not_in_scanner',
       'gap_down',
       'orb_not_ready',
       'no_breakout',
       'open_broken',
+      'extension_too_low',
+      'extension_too_high',
+      'chasing_open_high',
+      'below_vwap',
       'no_momentum',
       'no_impulse_body',
       'adverse_tape',
@@ -419,5 +426,130 @@ describe('isOpeningDriveFunnelRejection', () => {
     for (const code of codes) {
       assert.equal(isOpeningDriveFunnelRejection(code), true);
     }
+  });
+});
+
+const HOLD_OPTS: OpeningDriveOptions = {
+  ...OPTS,
+  windowEndMinutes: 10 * 60,
+  ...SCANNER_HOLD_GATES,
+  minOpenExtensionPct: 0.025,
+  maxOpenExtensionPct: 0.055,
+};
+
+/** 09:30 impulse wick: +8% high, later hold sits inside it. */
+const HOLD_RANGE = bar(53.50, 200_000, 49.50, 54.00, '2026-08-18T13:30:00Z');
+
+function holdContext(overrides: Partial<OpeningDriveContext> = {}): OpeningDriveContext {
+  const impulseBar = overrides.impulseBar ?? bar(52.40, 40_000, 52.00, 52.60);
+  return context({
+    rangeBar: HOLD_RANGE,
+    sessionOpen: 50,
+    sessionVwap: 51,
+    impulseBar,
+    oneMinBars: [
+      ...Array.from({ length: 18 }, () => bar(48, 10_000, 47.5, 48.5, '2026-08-18T12:00:00Z')),
+      HOLD_RANGE,
+      impulseBar,
+    ],
+    inScanner: true,
+    ...overrides,
+  });
+}
+
+describe('evaluateOpeningDrive — scanner hold (anti-FOMO)', () => {
+  it('arms ASAN-like +4.8% after the 09:30 wick, still above the open, not on the high', () => {
+    const decision = evaluateOpeningDrive(holdContext(), HOLD_OPTS);
+    assert.equal(decision.armed, true);
+    assert.equal(decision.rejection, null);
+    assert.ok(decision.entryPrice !== null && decision.entryPrice < HOLD_RANGE.high);
+    assert.ok(decision.score > 0);
+  });
+
+  it('refuses a warmup name that is not in the scanner ranking', () => {
+    const decision = evaluateOpeningDrive(holdContext({ inScanner: false }), HOLD_OPTS);
+    assert.equal(decision.rejection, 'not_in_scanner');
+    assert.equal(decision.armed, false);
+  });
+
+  it('rejects AI +1.5% / SNAP loc=1 +1.4% — below the 2.5% open-extension floor', () => {
+    const ai = bar(20.30, 200_000, 20.20, 20.32);
+    const range = bar(20.00, 80_000, 19.80, 20.25, '2026-08-18T13:30:00Z');
+    const aiDecision = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 20,
+        sessionVwap: 20.10,
+        impulseBar: ai,
+        oneMinBars: history(ai),
+        inScanner: true,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(aiDecision.rejection, 'extension_too_low');
+
+    const snap = bar(10.14, 80_000, 10.00, 10.14);
+    const snapRange = bar(10.00, 50_000, 9.90, 10.10, '2026-08-18T13:30:00Z');
+    const snapDecision = evaluateOpeningDrive(
+      context({
+        rangeBar: snapRange,
+        sessionOpen: 10,
+        sessionVwap: 10.05,
+        impulseBar: snap,
+        oneMinBars: [snapRange, snap],
+        inScanner: true,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(snapDecision.rejection, 'extension_too_low');
+    assert.equal(computeCloseLocation(snap), 1);
+  });
+
+  it('rejects BRZE +8.4% / HNGE +7.2% / TNDM +5.8% — wait for a return into 5.5%', () => {
+    const cases: Array<{ last: number; open: number }> = [
+      { last: 43.36, open: 40 },
+      { last: 53.60, open: 50 },
+      { last: 52.90, open: 50 },
+    ];
+    for (const { last, open } of cases) {
+      const impulse = bar(last, 40_000, last * 0.995, last * 1.002);
+      const decision = evaluateOpeningDrive(
+        holdContext({ impulseBar: impulse, sessionOpen: open }),
+        HOLD_OPTS,
+      );
+      assert.equal(decision.rejection, 'extension_too_high', `${last} vs ${open}`);
+    }
+  });
+
+  it('rejects a close glued to the 09:30 high even when the open-extension is in band', () => {
+    const gluedHigh = 52.40;
+    const range = bar(52.00, 200_000, 49.50, gluedHigh, '2026-08-18T13:30:00Z');
+    const onHigh = bar(gluedHigh, 40_000, 52.00, gluedHigh);
+    const decision = evaluateOpeningDrive(
+      holdContext({
+        rangeBar: range,
+        impulseBar: onHigh,
+        sessionOpen: 50,
+        oneMinBars: [
+          ...Array.from({ length: 18 }, () => bar(48, 10_000, 47.5, 48.5, '2026-08-18T12:00:00Z')),
+          range,
+          onHigh,
+        ],
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(isChasingOpeningRangeHigh(gluedHigh, gluedHigh), true);
+    assert.equal(decision.rejection, 'chasing_open_high');
+  });
+
+  it('rejects a hold that has lost session VWAP', () => {
+    const decision = evaluateOpeningDrive(holdContext({ sessionVwap: 52.50 }), HOLD_OPTS);
+    assert.equal(decision.rejection, 'below_vwap');
+  });
+
+  it('does not require a break of the 09:30 high (that is the FOMO trigger)', () => {
+    const decision = evaluateOpeningDrive(holdContext(), HOLD_OPTS);
+    assert.ok(decision.entryPrice !== null && decision.entryPrice <= HOLD_RANGE.high);
+    assert.equal(decision.armed, true);
   });
 });

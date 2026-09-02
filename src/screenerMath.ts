@@ -162,6 +162,16 @@ export function computeOpeningExtensionPct(
   return (last - sessionOpen) / sessionOpen;
 }
 
+/** Inclusive band on (last − open) / open. Null extension never passes. */
+export function isOpeningExtensionInBand(
+  extensionPct: number | null,
+  minPct: number,
+  maxPct: number,
+): boolean {
+  if (extensionPct === null) return false;
+  return extensionPct >= minPct && extensionPct <= maxPct;
+}
+
 export interface OpeningExtensionCandidate {
   last: number;
   sessionOpen: number;

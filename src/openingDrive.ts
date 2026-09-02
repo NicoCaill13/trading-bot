@@ -1,15 +1,20 @@
 /**
- * Opening Drive — ORB 1-min, pure decision logic, no I/O, no state.
+ * Opening Drive — pure decision logic, no I/O, no state.
  *
- * Hyper-Growth cash path: buy the break of the first regular-session 1-min
- * high between 09:30 and 09:45 EST when volume confirms the extension and the
- * impulse bar closes in its upper tertile. A gap is not required — yesterday's
- * close is diagnostic. Quotes veto a wide spread (fail open when missing).
- * Signed tape vetoes selling pressure (fail open when missing). Snapshot IEX
- * imbalance is diagnostic only.
+ * Two entry styles share this function (Open/Closed via options, not a fork):
+ * - `orb_breakout` (scanner off): buy the first-minute high with volume + loc.
+ * - `scanner_hold`: the 09:30 bar is the impulse; enter after it, still above
+ *   the open, inside the open-extension band, not on the opening-range high.
+ *
+ * Quotes veto a wide spread (fail open when missing). Yesterday's close is
+ * diagnostic. Snapshot IEX imbalance is diagnostic only.
  * The caller owns session state; this module only judges a snapshot.
  */
 
+import {
+  computeOpeningExtensionPct,
+  isOpeningExtensionInBand,
+} from './screenerMath';
 import type { BarData, OpeningDriveDecision, OpeningDriveRejection } from './types';
 
 export interface OpeningDriveContext {
@@ -41,6 +46,8 @@ export interface OpeningDriveContext {
   tapeDelta: number | null;
   /** Top-of-book bid share; diagnostic, never a gate. */
   imbalance: number | null;
+  /** True when the symbol is in the live opening-extension ranking. */
+  inScanner?: boolean;
 }
 
 export interface OpeningDriveOptions {
@@ -71,6 +78,61 @@ export interface OpeningDriveOptions {
    * basis points away would otherwise inflate size.
    */
   hardStopFloorPct: number;
+  /**
+   * Scanner-hold path: refuse names that are not in the current ranking.
+   * Default false — premarket-watchlist rollback.
+   */
+  requireScannerMember?: boolean;
+  /**
+   * ORB path: last must clear the first-minute high. Default true.
+   * Scanner-hold sets this false — that break is the FOMO wick.
+   */
+  requireBreakout?: boolean;
+  /**
+   * Scanner-hold: refuse last >= opening-range high (glued to the 09:30 wick).
+   * Default false.
+   */
+  rejectAtOrHigh?: boolean;
+  /** Inclusive floor on (last − sessionOpen) / sessionOpen. Default 0 (off). */
+  minOpenExtensionPct?: number;
+  /** Inclusive cap on (last − sessionOpen) / sessionOpen. Default off. */
+  maxOpenExtensionPct?: number;
+  /** Scanner-hold: last must be strictly above session VWAP. Default false. */
+  requireAboveVwap?: boolean;
+  /** ORB path: RVOL or first-minute volume multiple. Default true. */
+  requireMomentum?: boolean;
+  /** ORB path: impulse close in the upper tertile. Default true. */
+  requireImpulseBody?: boolean;
+  /** ORB path: signed-tape veto when prints exist. Default true. */
+  requireTape?: boolean;
+}
+
+/**
+ * Gates that turn ORB breakout into the scanner-hold continuation.
+ * Band bounds stay in config — this overlay is the style switch only.
+ */
+export const SCANNER_HOLD_GATES: Pick<
+  OpeningDriveOptions,
+  | 'requireScannerMember'
+  | 'requireBreakout'
+  | 'rejectAtOrHigh'
+  | 'requireAboveVwap'
+  | 'requireMomentum'
+  | 'requireImpulseBody'
+  | 'requireTape'
+> = {
+  requireScannerMember: true,
+  requireBreakout: false,
+  rejectAtOrHigh: true,
+  requireAboveVwap: true,
+  requireMomentum: false,
+  requireImpulseBody: false,
+  requireTape: false,
+};
+
+/** last glued to or above the 09:30 high — the FOMO wick, not a hold. */
+export function isChasingOpeningRangeHigh(last: number, rangeHigh: number): boolean {
+  return last >= rangeHigh;
 }
 
 function reject(
@@ -154,6 +216,10 @@ export function evaluateOpeningDrive(
     return reject('outside_window');
   }
 
+  if (opts.requireScannerMember === true && ctx.inScanner !== true) {
+    return reject('not_in_scanner');
+  }
+
   const { sessionOpen, sessionVwap, impulseBar, rangeBar } = ctx;
   if (sessionOpen === null || sessionOpen <= 0) return reject('insufficient_data');
   if (sessionVwap === null || sessionVwap <= 0) return reject('insufficient_data');
@@ -166,11 +232,19 @@ export function evaluateOpeningDrive(
 
   if (price <= sessionOpen) return reject('open_broken');
 
+  const requireBreakout = opts.requireBreakout !== false;
+  const requireMomentum = opts.requireMomentum !== false;
+  const requireImpulseBody = opts.requireImpulseBody !== false;
+  const requireTape = opts.requireTape !== false;
+  const minOpenExt = opts.minOpenExtensionPct ?? 0;
+  const maxOpenExt = opts.maxOpenExtensionPct;
+
   const rvol1m = computeOneMinuteRvol(ctx.oneMinBars, opts.rvolBaselineBars);
   const closeLocation = computeCloseLocation(impulseBar);
   const spreadPct = computeSpreadPct(ctx.bid, ctx.ask);
   const { imbalance, tapeDelta } = ctx;
   const extensionPct = (price - sessionVwap) / sessionVwap;
+  const openExtensionPct = computeOpeningExtensionPct(price, sessionOpen);
   const observed = {
     extensionPct,
     rvol1m,
@@ -181,21 +255,42 @@ export function evaluateOpeningDrive(
     entryPrice: price,
   };
 
-  if (price <= rangeBar.high) return reject('no_breakout', observed);
+  const bandMax = maxOpenExt ?? Number.POSITIVE_INFINITY;
+  if (
+    (minOpenExt > 0 || maxOpenExt !== undefined) &&
+    !isOpeningExtensionInBand(openExtensionPct, minOpenExt, bandMax)
+  ) {
+    if (openExtensionPct !== null && maxOpenExt !== undefined && openExtensionPct > maxOpenExt) {
+      return reject('extension_too_high', observed);
+    }
+    return reject('extension_too_low', observed);
+  }
+
+  if (opts.rejectAtOrHigh === true && isChasingOpeningRangeHigh(price, rangeBar.high)) {
+    return reject('chasing_open_high', observed);
+  }
+
+  if (opts.requireAboveVwap === true && !(price > sessionVwap)) {
+    return reject('below_vwap', observed);
+  }
+
+  if (requireBreakout && price <= rangeBar.high) {
+    return reject('no_breakout', observed);
+  }
 
   const vsRange = computeOrbVolumeMultiple(impulseBar.volume, rangeBar.volume);
   const hasRvolSurge = rvol1m !== null && rvol1m > opts.minRvol1m;
   const hasOrbVolumeSurge =
     vsRange !== null && vsRange >= opts.minOrbVolumeMultiple;
-  if (!hasRvolSurge && !hasOrbVolumeSurge) {
+  if (requireMomentum && !hasRvolSurge && !hasOrbVolumeSurge) {
     return reject('no_momentum', observed);
   }
 
-  if (closeLocation === null || closeLocation < opts.minCloseLocation) {
+  if (requireImpulseBody && (closeLocation === null || closeLocation < opts.minCloseLocation)) {
     return reject('no_impulse_body', observed);
   }
 
-  if (tapeDelta !== null && !(tapeDelta > opts.minTapeDelta)) {
+  if (requireTape && tapeDelta !== null && !(tapeDelta > opts.minTapeDelta)) {
     return reject('adverse_tape', observed);
   }
 
@@ -215,7 +310,10 @@ export function evaluateOpeningDrive(
 
   const breakPct = (price - rangeBar.high) / rangeBar.high;
   const volumeConviction = Math.max(vsRange ?? 1, rvol1m ?? 1);
-  const score = impulseBar.volume * Math.max(breakPct, 0) * volumeConviction;
+  const edgePct = requireBreakout
+    ? Math.max(breakPct, 0)
+    : Math.max(openExtensionPct ?? 0, 0);
+  const score = impulseBar.volume * edgePct * volumeConviction;
 
   return {
     armed: true,

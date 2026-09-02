@@ -33,6 +33,7 @@ import {
   describeOpeningDriveDecision,
   evaluateOpeningDrive,
   isOpeningDriveFunnelRejection,
+  SCANNER_HOLD_GATES,
   type OpeningDriveContext,
   type OpeningDriveOptions,
 } from './openingDrive';
@@ -53,6 +54,13 @@ import { isWatchlistCurrent } from './watchlistFreshness';
 import { selectOpeningRangeBar } from './openingRange';
 import { buildEligiblePool, readEligiblePool } from './eligiblePool';
 import { moversToWatchlist, scanSessionExtension } from './openingScanner';
+import {
+  addBarToVwap,
+  computeVwap,
+  emptyVwapAccumulator,
+  removeBarFromVwap,
+  vwapFromAccumulator,
+} from './sessionVwap';
 import {
   computeFibLevels,
   deriveFibLevelsFromBars,
@@ -181,10 +189,14 @@ const openingDriveRejectLogged = new Set<string>();
 // armed set: a name can be capped at 09:51 and legitimately arm at 09:54 once
 // VWAP catches up, and both observations matter — but only the first cap does.
 const openingDriveAuditLogged = new Set<string>();
+// Live scanner ranking. Empty until the first 09:31 tick — no warmup substitute fills.
+const scannerMoverSymbols = new Set<string>();
 
 // Rolling 1-min bar history for RSI, VMA_10 and Satellite volume confirmation
 const oneMinBarHistory = new Map<string, BarData[]>();
 const ONE_MIN_HISTORY_MAX = 30;
+// Session VWAP from seeded 1-min bars (04:00→now). History is truncated; this is not.
+const sessionVwapAccum = new Map<string, { tpv: number; volume: number }>();
 const atrAtEntry = new Map<string, number>();
 let isFlushInProgress = false;
 
@@ -645,10 +657,14 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
   lastLoggedL2Wall.clear();
   tapeMinutes.clear();
   lastTradePrice.clear();
+  scannerMoverSymbols.clear();
 
   const keep = new Set(watchlist.symbols.map(s => s.symbol));
   for (const symbol of [...oneMinBarHistory.keys()]) {
-    if (!keep.has(symbol)) oneMinBarHistory.delete(symbol);
+    if (!keep.has(symbol)) {
+      oneMinBarHistory.delete(symbol);
+      sessionVwapAccum.delete(symbol);
+    }
   }
 
   for (const s of watchlist.symbols) {
@@ -678,6 +694,7 @@ function purgeMonitoredSymbol(symbol: string): void {
   tapeMinutes.delete(symbol);
   lastTradePrice.delete(symbol);
   oneMinBarHistory.delete(symbol);
+  sessionVwapAccum.delete(symbol);
   ema9ClosePrices.delete(symbol);
   pullbackTrackers.delete(symbol);
   l2WallSignals.delete(symbol);
@@ -758,14 +775,6 @@ function ensureV2SymbolsMonitored(): void {
 // Intraday cumulative VWAP
 // ---------------------------------------------------------------------------
 
-function computeVwap(bars: BarData[]): number | null {
-  if (bars.length === 0) return null;
-  const totalVolume = bars.reduce((a, b) => a + b.volume, 0);
-  if (totalVolume === 0) return null;
-  const tpv = bars.reduce((sum, b) => sum + ((b.high + b.low + b.close) / 3) * b.volume, 0);
-  return tpv / totalVolume;
-}
-
 function pushOneMinBar(symbol: string, bar: BarData): void {
   let bars = oneMinBarHistory.get(symbol);
   if (!bars) {
@@ -774,9 +783,12 @@ function pushOneMinBar(symbol: string, bar: BarData): void {
   }
 
   const last = bars[bars.length - 1];
+  const acc = sessionVwapAccum.get(symbol) ?? emptyVwapAccumulator();
   if (last?.timestamp === bar.timestamp) {
+    sessionVwapAccum.set(symbol, addBarToVwap(removeBarFromVwap(acc, last), bar));
     bars[bars.length - 1] = bar;
   } else {
+    sessionVwapAccum.set(symbol, addBarToVwap(acc, bar));
     bars.push(bar);
     if (bars.length > ONE_MIN_HISTORY_MAX) {
       bars.splice(0, bars.length - ONE_MIN_HISTORY_MAX);
@@ -1303,7 +1315,7 @@ function openingDriveWindowMinutes(): { start: number; end: number } {
 function openingDriveLiveOptions(): OpeningDriveOptions {
   const od = config.openingDrive;
   const window = openingDriveWindowMinutes();
-  return {
+  const base: OpeningDriveOptions = {
     windowStartMinutes: window.start,
     windowEndMinutes: window.end,
     minRvol1m: od.minRvol1m,
@@ -1314,6 +1326,13 @@ function openingDriveLiveOptions(): OpeningDriveOptions {
     maxSpreadPct: od.maxSpreadPct,
     minTapeDelta: od.minTapeDelta,
     hardStopFloorPct: config.risk.hardStopFloorPct,
+  };
+  if (!od.scannerEnabled) return base;
+  return {
+    ...base,
+    ...SCANNER_HOLD_GATES,
+    minOpenExtensionPct: od.minOpenExtensionPct,
+    maxOpenExtensionPct: od.maxOpenExtensionPct,
   };
 }
 
@@ -1362,13 +1381,14 @@ function ingestSignedPrint(symbol: string, price: number, size: number, timestam
 }
 
 /**
- * Opening Drive path — ORB 1-min high break on Hyper-Growth runners.
- * No straight-run tag, no VWAP pullback, no Fibonacci gate.
+ * Opening Drive path. Scanner on: hold after the 09:30 impulse, in the
+ * open-extension band, never on the wick. Scanner off: ORB 1-min high break.
  */
 function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   if (tradingHalted) return;
   if (hasEntered(symbol)) return;
   if (openingDriveTriggered.has(symbol)) return;
+  if (config.openingDrive.scannerEnabled && !scannerMoverSymbols.has(symbol)) return;
 
   const screenerData = screenerDataMap.get(symbol);
   const nbbo = lastNbbo.get(symbol);
@@ -1385,6 +1405,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     ask: nbbo?.ask ?? l2WallSignals.get(symbol)?.topAsk?.price ?? null,
     tapeDelta: tapeDeltaForBar(symbol, bar1m.timestamp),
     imbalance: l2WallSignals.get(symbol)?.imbalance ?? null,
+    inScanner: scannerMoverSymbols.has(symbol),
   };
 
   const decision = evaluateOpeningDrive(ctx, openingDriveLiveOptions());
@@ -2323,6 +2344,11 @@ function isWsErrorMessage(msg: WsMessage): msg is WsErrorMessage {
 }
 
 function resolveVwapForSymbol(symbol: string): number | null {
+  const seeded = sessionVwapAccum.get(symbol);
+  if (seeded) {
+    const fromSeed = vwapFromAccumulator(seeded);
+    if (fromSeed !== null) return fromSeed;
+  }
   const bars = signalBars5m.get(symbol);
   if (bars && bars.length > 0) {
     return computeVwap(bars);
@@ -2659,6 +2685,8 @@ function scheduleDailyReset(): void {
     isFlushInProgress = false;
     monitoredSymbols = [];
     oneMinBarHistory.clear();
+    sessionVwapAccum.clear();
+    scannerMoverSymbols.clear();
     sessionOpenPrice.clear();
     openingRangeBar.clear();
     openingDriveTriggered.clear();
@@ -2905,6 +2933,8 @@ async function runOpeningScannerTick(): Promise<void> {
     maxSymbols: config.openingDrive.scannerMaxSymbols,
     pinned,
   });
+  scannerMoverSymbols.clear();
+  for (const mover of movers) scannerMoverSymbols.add(mover.symbol);
   const { added, removed } = await swapOpeningUniverse(moversToWatchlist(movers));
   swapLiveStream(added, removed);
   if (added.length > 0) await seedNewOpeningSymbols(added);

@@ -191,6 +191,10 @@ const config = {
     scannerMaxSymbols: parseIntEnv('OD_SCANNER_MAX_SYMBOLS', 25),
     scannerMinExtensionPct: parseFloatEnv('OD_SCANNER_MIN_EXTENSION_PCT', 0.01),
     scannerMinRthDollarVolume: parseFloatEnv('OD_SCANNER_MIN_RTH_DOLLAR_VOLUME', 100_000),
+    // Entry band vs session open — not the scanner ranker floor (1%).
+    // Below: AI/SNAP/SLB drift. Above: vertical 09:30 wick; wait for a return.
+    minOpenExtensionPct: parseFloatEnv('OD_MIN_OPEN_EXTENSION_PCT', 0.025),
+    maxOpenExtensionPct: parseFloatEnv('OD_MAX_OPEN_EXTENSION_PCT', 0.055),
   },
 
   premarket: {
@@ -650,6 +654,20 @@ const config = {
   if (od.scannerMinRthDollarVolume <= 0) {
     throw new Error(
       `[SYSTEM] OD_SCANNER_MIN_RTH_DOLLAR_VOLUME must be > 0: ${od.scannerMinRthDollarVolume}`,
+    );
+  }
+  if (od.minOpenExtensionPct < 0 || od.minOpenExtensionPct > 0.2) {
+    throw new Error(
+      `[SYSTEM] OD_MIN_OPEN_EXTENSION_PCT out of bounds [0, 0.2]: ${od.minOpenExtensionPct}`,
+    );
+  }
+  if (
+    od.maxOpenExtensionPct <= od.minOpenExtensionPct ||
+    od.maxOpenExtensionPct > 0.2
+  ) {
+    throw new Error(
+      `[SYSTEM] OD_MAX_OPEN_EXTENSION_PCT must sit above OD_MIN_OPEN_EXTENSION_PCT ` +
+      `and <= 0.2: ${od.maxOpenExtensionPct}`,
     );
   }
   if (s.springReclaimRvol <= 0) {

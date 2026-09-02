@@ -8,6 +8,7 @@ import {
   computeOpeningExtensionPct,
   isAllowedExchange,
   isEtfLikeProduct,
+  isOpeningExtensionInBand,
   passesAdrGate,
   passesClosePrice,
   passesDollarVolume,
@@ -245,6 +246,33 @@ describe('compareOpeningExtensionRank', () => {
     assert.ok(order.indexOf('INTC') < order.indexOf('TQQQ'));
     assert.ok(order.indexOf('WULF') < order.indexOf('TQQQ'));
     assert.deepEqual(order.slice(-3), ['SQQQ', 'TQQQ', 'AAL']);
+  });
+});
+
+describe('isOpeningExtensionInBand — entry vs 09:30 open', () => {
+  const min = 0.025;
+  const max = 0.055;
+
+  it('keeps ASAN 26/08 (+4.8%) and DOCS 31/08 (+4.0%) inside the hold band', () => {
+    assert.equal(isOpeningExtensionInBand(0.0480, min, max), true);
+    assert.equal(isOpeningExtensionInBand(0.0400, min, max), true);
+  });
+
+  it('rejects AI / SNAP / SLB-class drift under 2.5%', () => {
+    assert.equal(isOpeningExtensionInBand(0.015, min, max), false);
+    assert.equal(isOpeningExtensionInBand(0.014, min, max), false);
+    assert.equal(isOpeningExtensionInBand(0.0085, min, max), false);
+  });
+
+  it('rejects the vertical 09:30 wick (BRZE / HNGE / PATH print) — wait for a return', () => {
+    assert.equal(isOpeningExtensionInBand(0.084, min, max), false);
+    assert.equal(isOpeningExtensionInBand(0.072, min, max), false);
+    assert.equal(isOpeningExtensionInBand(0.0689, min, max), false);
+    assert.equal(isOpeningExtensionInBand(0.058, min, max), false);
+  });
+
+  it('fails closed on a null extension', () => {
+    assert.equal(isOpeningExtensionInBand(null, min, max), false);
   });
 });
 

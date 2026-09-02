@@ -3,14 +3,15 @@
  *
  * Two entry styles share this function (Open/Closed via options, not a fork):
  * - `orb_breakout` (scanner off): buy the first-minute high with volume + loc.
- * - `scanner_hold`: the 09:30 bar is the impulse; enter after it, still above
- *   the open, inside the open-extension band, not on the opening-range high.
+ * - `scanner_hold`: enter after the RTH impulse, still above the open, inside
+ *   the open-extension band, not glued to the running session high.
  *
  * Quotes veto a wide spread (fail open when missing). Yesterday's close is
  * diagnostic. Snapshot IEX imbalance is diagnostic only.
  * The caller owns session state; this module only judges a snapshot.
  */
 
+import { computeSessionImpulseHigh } from './openingRange';
 import {
   computeOpeningExtensionPct,
   isOpeningExtensionInBand,
@@ -48,6 +49,12 @@ export interface OpeningDriveContext {
   imbalance: number | null;
   /** True when the symbol is in the live opening-extension ranking. */
   inScanner?: boolean;
+  /**
+   * Max 1-min high since 09:30. Live path supplies an accumulator because the
+   * rolling 1-min history is truncated. Tests may omit it — derived from
+   * `oneMinBars` + `rangeBar`.
+   */
+  sessionHigh?: number | null;
 }
 
 export interface OpeningDriveOptions {
@@ -89,8 +96,8 @@ export interface OpeningDriveOptions {
    */
   requireBreakout?: boolean;
   /**
-   * Scanner-hold: refuse last >= opening-range high (glued to the 09:30 wick).
-   * Default false.
+   * Scanner-hold: refuse last >= running RTH high (glued to the impulse wick).
+   * That high is often 09:31–09:33, not the 09:30 print. Default false.
    */
   rejectAtOrHigh?: boolean;
   /** Inclusive floor on (last − sessionOpen) / sessionOpen. Default 0 (off). */
@@ -130,9 +137,17 @@ export const SCANNER_HOLD_GATES: Pick<
   requireTape: false,
 };
 
-/** last glued to or above the 09:30 high — the FOMO wick, not a hold. */
-export function isChasingOpeningRangeHigh(last: number, rangeHigh: number): boolean {
-  return last >= rangeHigh;
+/** last glued to or above the session impulse high — the FOMO wick, not a hold. */
+export function isChasingOpeningRangeHigh(last: number, sessionHigh: number): boolean {
+  return last >= sessionHigh;
+}
+
+function chaseReferenceHigh(
+  ctx: OpeningDriveContext,
+  rangeBar: BarData,
+): number {
+  if (ctx.sessionHigh != null && ctx.sessionHigh > 0) return ctx.sessionHigh;
+  return computeSessionImpulseHigh(ctx.oneMinBars, rangeBar) ?? rangeBar.high;
 }
 
 function reject(
@@ -266,7 +281,10 @@ export function evaluateOpeningDrive(
     return reject('extension_too_low', observed);
   }
 
-  if (opts.rejectAtOrHigh === true && isChasingOpeningRangeHigh(price, rangeBar.high)) {
+  if (
+    opts.rejectAtOrHigh === true &&
+    isChasingOpeningRangeHigh(price, chaseReferenceHigh(ctx, rangeBar))
+  ) {
     return reject('chasing_open_high', observed);
   }
 

@@ -33,3 +33,22 @@ export function selectOpeningRangeBar(
   }
   return null;
 }
+
+/**
+ * Running RTH high from the 09:30 bar onward (inclusive). Premarket bars
+ * before `rangeBar` are ignored. Null when no positive high exists.
+ *
+ * Scanner-hold FOMO uses this, not `rangeBar.high`: a quiet 09:30 print
+ * (ASTS/CDE 02/09) is not the wick — the 09:31–09:33 drive is.
+ */
+export function computeSessionImpulseHigh(
+  bars: readonly BarData[],
+  rangeBar: BarData,
+): number | null {
+  let high = rangeBar.high > 0 ? rangeBar.high : 0;
+  for (const bar of bars) {
+    if (bar.timestamp < rangeBar.timestamp) continue;
+    if (bar.high > high) high = bar.high;
+  }
+  return high > 0 ? high : null;
+}

@@ -197,6 +197,8 @@ const oneMinBarHistory = new Map<string, BarData[]>();
 const ONE_MIN_HISTORY_MAX = 30;
 // Session VWAP from seeded 1-min bars (04:00→now). History is truncated; this is not.
 const sessionVwapAccum = new Map<string, { tpv: number; volume: number }>();
+// Max 1-min high since 09:30. History is truncated to 30 bars; this peak is not.
+const sessionImpulseHigh = new Map<string, number>();
 const atrAtEntry = new Map<string, number>();
 let isFlushInProgress = false;
 
@@ -664,6 +666,7 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
     if (!keep.has(symbol)) {
       oneMinBarHistory.delete(symbol);
       sessionVwapAccum.delete(symbol);
+      sessionImpulseHigh.delete(symbol);
     }
   }
 
@@ -695,6 +698,7 @@ function purgeMonitoredSymbol(symbol: string): void {
   lastTradePrice.delete(symbol);
   oneMinBarHistory.delete(symbol);
   sessionVwapAccum.delete(symbol);
+  sessionImpulseHigh.delete(symbol);
   ema9ClosePrices.delete(symbol);
   pullbackTrackers.delete(symbol);
   l2WallSignals.delete(symbol);
@@ -762,8 +766,9 @@ function seedSessionBars(symbol: string, bars: BarData[]): void {
   }
   const selected = selectOpeningRangeBar(bars, marketOpenMinutes());
   if (selected === null) return;
-  if (!sessionOpenPrice.has(symbol)) sessionOpenPrice.set(symbol, selected.sessionOpen);
-  if (!openingRangeBar.has(symbol)) openingRangeBar.set(symbol, selected.rangeBar);
+  // REST 09:30 wins: a live bar received before seed must not freeze a later open.
+  sessionOpenPrice.set(symbol, selected.sessionOpen);
+  openingRangeBar.set(symbol, selected.rangeBar);
 }
 
 function ensureV2SymbolsMonitored(): void {
@@ -774,6 +779,14 @@ function ensureV2SymbolsMonitored(): void {
 // ---------------------------------------------------------------------------
 // Intraday cumulative VWAP
 // ---------------------------------------------------------------------------
+
+function noteSessionImpulseHigh(symbol: string, bar: BarData): void {
+  if (!(bar.high > 0)) return;
+  const mins = minutesSinceMidnight(toESTDate(new Date(bar.timestamp)));
+  if (mins < marketOpenMinutes()) return;
+  const prev = sessionImpulseHigh.get(symbol);
+  if (prev === undefined || bar.high > prev) sessionImpulseHigh.set(symbol, bar.high);
+}
 
 function pushOneMinBar(symbol: string, bar: BarData): void {
   let bars = oneMinBarHistory.get(symbol);
@@ -794,6 +807,7 @@ function pushOneMinBar(symbol: string, bar: BarData): void {
       bars.splice(0, bars.length - ONE_MIN_HISTORY_MAX);
     }
   }
+  noteSessionImpulseHigh(symbol, bar);
 }
 
 function closeWebSocket(): void {
@@ -1381,8 +1395,8 @@ function ingestSignedPrint(symbol: string, price: number, size: number, timestam
 }
 
 /**
- * Opening Drive path. Scanner on: hold after the 09:30 impulse, in the
- * open-extension band, never on the wick. Scanner off: ORB 1-min high break.
+ * Opening Drive path. Scanner on: hold after the RTH impulse, in the
+ * open-extension band, never glued to the running session high.
  */
 function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   if (tradingHalted) return;
@@ -1406,6 +1420,7 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
     tapeDelta: tapeDeltaForBar(symbol, bar1m.timestamp),
     imbalance: l2WallSignals.get(symbol)?.imbalance ?? null,
     inScanner: scannerMoverSymbols.has(symbol),
+    sessionHigh: sessionImpulseHigh.get(symbol) ?? null,
   };
 
   const decision = evaluateOpeningDrive(ctx, openingDriveLiveOptions());
@@ -2686,6 +2701,7 @@ function scheduleDailyReset(): void {
     monitoredSymbols = [];
     oneMinBarHistory.clear();
     sessionVwapAccum.clear();
+    sessionImpulseHigh.clear();
     scannerMoverSymbols.clear();
     sessionOpenPrice.clear();
     openingRangeBar.clear();

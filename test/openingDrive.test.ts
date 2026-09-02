@@ -552,4 +552,102 @@ describe('evaluateOpeningDrive — scanner hold (anti-FOMO)', () => {
     assert.ok(decision.entryPrice !== null && decision.entryPrice <= HOLD_RANGE.high);
     assert.equal(decision.armed, true);
   });
+
+  it('rejects CDE 09:33 glued to the impulse high, arms the 09:34 hold (02/09)', () => {
+    const range = bar(20.89, 2_981, 20.67, 20.89, '2026-09-02T13:30:00Z');
+    const spike = bar(21.42, 5_029, 21.23, 21.42, '2026-09-02T13:33:00Z');
+    const hold = bar(21.38, 3_600, 21.34, 21.41, '2026-09-02T13:34:00Z');
+    const history = [
+      range,
+      bar(20.99, 2_199, 20.91, 20.99, '2026-09-02T13:31:00Z'),
+      bar(21.12, 4_223, 20.96, 21.12, '2026-09-02T13:32:00Z'),
+      spike,
+    ];
+    const base = {
+      rangeBar: range,
+      sessionOpen: 20.67,
+      sessionVwap: 21.10,
+      inScanner: true,
+      sessionHigh: 21.42,
+    };
+
+    const onSpike = evaluateOpeningDrive(
+      context({
+        ...base,
+        impulseBar: spike,
+        oneMinBars: history,
+        barMinutesSinceMidnight: 9 * 60 + 33,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(onSpike.rejection, 'chasing_open_high');
+
+    const pullback = evaluateOpeningDrive(
+      context({
+        ...base,
+        impulseBar: hold,
+        oneMinBars: [...history, hold],
+        barMinutesSinceMidnight: 9 * 60 + 34,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(pullback.armed, true);
+    assert.ok(pullback.entryPrice !== null && pullback.entryPrice < 21.42);
+    assert.ok(pullback.entryPrice !== null && pullback.entryPrice > range.high);
+  });
+
+  it('rejects ASTS 09:32 under 2.5%, arms the pullback off the 09:37 wick (02/09)', () => {
+    const range = bar(58.83, 5_386, 58.03, 58.88, '2026-09-02T13:30:00Z');
+    const early = bar(59.83, 3_894, 59.83, 60.59, '2026-09-02T13:32:00Z');
+    const pullback = bar(60.36, 3_847, 59.95, 60.97, '2026-09-02T13:38:00Z');
+    const tooEarly = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 58.52,
+        sessionVwap: 59.50,
+        impulseBar: early,
+        oneMinBars: [range, early],
+        inScanner: true,
+        sessionHigh: 60.59,
+        barMinutesSinceMidnight: 9 * 60 + 32,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(tooEarly.rejection, 'extension_too_low');
+
+    const hold = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 58.52,
+        sessionVwap: 59.90,
+        impulseBar: pullback,
+        oneMinBars: [range, pullback],
+        inScanner: true,
+        sessionHigh: 61.42,
+        barMinutesSinceMidnight: 9 * 60 + 38,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(hold.armed, true);
+    assert.ok(hold.entryPrice !== null && hold.entryPrice > range.high);
+  });
+
+  it('rejects DKNG 09:34 when the close is the running high (02/09)', () => {
+    const range = bar(23.96, 1_208, 23.88, 24.03, '2026-09-02T13:30:00Z');
+    const spike = bar(24.75, 5_759, 24.67, 24.75, '2026-09-02T13:34:00Z');
+    const decision = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 24.03,
+        sessionVwap: 24.40,
+        impulseBar: spike,
+        oneMinBars: [range, spike],
+        inScanner: true,
+        sessionHigh: 24.75,
+        barMinutesSinceMidnight: 9 * 60 + 34,
+      }),
+      HOLD_OPTS,
+    );
+    assert.equal(decision.rejection, 'chasing_open_high');
+  });
 });

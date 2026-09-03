@@ -1,8 +1,10 @@
 /**
- * Alert-only poller for presidential actions and Trump-related headlines.
+ * Alert-only poller for Trump-family securities trades.
  *
- * Off by default. When disabled, start/stop are silent no-ops: no timer, no
- * HTTP, no disk, no log. The trading path never reads this module's state.
+ * Sources: SEC Form 4 (EDGAR) + Alpaca headlines that describe a buy/sell.
+ * Federal Register / tariff / ceremonial copy is not a trade and is ignored.
+ *
+ * Off by default. When disabled, start/stop are silent no-ops.
  */
 
 import config from './config';
@@ -10,15 +12,8 @@ import { createLogger } from './logger';
 import { readJson, writeJsonAtomic } from './jsonStore';
 import { alertInfo } from './notifier';
 import { toErrorMessage } from './utils';
-import {
-  classifyNewsText,
-  classifyPolicyText,
-  type PolicyMode,
-} from './policyClassifier';
-import {
-  fetchPresidentialDocuments,
-  type FederalRegisterDocument,
-} from './federalRegister';
+import { classifyTrumpTradeNews } from './policyClassifier';
+import { fetchTrumpForm4Filings, type EdgarForm4Filing } from './edgarForm4';
 import { fetchRecentPolicyNews } from './policyNews';
 import type { NewsHeadline } from './newsProvider';
 
@@ -27,7 +22,7 @@ const log = createLogger('POLICY');
 const MAX_CURSOR_IDS = 500;
 
 export interface PolicyAlert {
-  source: 'federal_register' | 'news';
+  source: 'form4' | 'news';
   title: string;
   body: string;
   url: string | null;
@@ -35,17 +30,16 @@ export interface PolicyAlert {
 }
 
 export interface PolicyPollPorts {
-  mode: PolicyMode;
   cursorPath: string;
   newsLookbackMs: number;
-  fetchDocuments: () => Promise<FederalRegisterDocument[]>;
+  fetchForm4: () => Promise<EdgarForm4Filing[]>;
   fetchNews: (start: Date, end: Date) => Promise<NewsHeadline[]>;
   notify: (event: PolicyAlert) => Promise<void>;
   now?: () => Date;
 }
 
 interface PolicyCursor {
-  federalRegisterIds: string[];
+  form4Ids: string[];
   newsIds: string[];
   seededAt: string;
   updatedAt: string;
@@ -68,7 +62,7 @@ function parseCursor(raw: unknown): PolicyCursor | null {
   const updatedAt = typeof raw['updatedAt'] === 'string' ? raw['updatedAt'] : null;
   if (seededAt === null || updatedAt === null) return null;
   return {
-    federalRegisterIds: parseIdList(raw['federalRegisterIds']),
+    form4Ids: parseIdList(raw['form4Ids']),
     newsIds: parseIdList(raw['newsIds']),
     seededAt,
     updatedAt,
@@ -88,58 +82,47 @@ function prependUnique(existing: readonly string[], incoming: readonly string[])
 }
 
 function formatAlert(event: PolicyAlert): { title: string; message: string } {
-  const sourceLabel = event.source === 'federal_register' ? 'Federal Register' : 'News';
+  const sourceLabel = event.source === 'form4' ? 'Form 4' : 'News';
   const hitLine = event.hits.length > 0 ? `\nHits: ${event.hits.join(', ')}` : '';
   const urlLine = event.url !== null ? `\n${event.url}` : '';
   return {
-    title: `Policy — ${sourceLabel}`,
+    title: `Trump trade — ${sourceLabel}`,
     message: `${event.title}${event.body !== '' ? `\n${event.body}` : ''}${hitLine}${urlLine}`,
   };
-}
-
-async function emitAlert(
-  event: PolicyAlert,
-  notify: PolicyPollPorts['notify'],
-): Promise<void> {
-  await notify(event);
 }
 
 export async function runPolicyPoll(ports: PolicyPollPorts): Promise<void> {
   const now = ports.now !== undefined ? ports.now() : new Date();
   const stored = parseCursor(await readJson(ports.cursorPath));
-  const firstRun = stored === null;
   const cursor: PolicyCursor = stored ?? {
-    federalRegisterIds: [],
+    form4Ids: [],
     newsIds: [],
     seededAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };
 
-  const knownFr = new Set(cursor.federalRegisterIds);
+  const knownForm4 = new Set(cursor.form4Ids);
   const knownNews = new Set(cursor.newsIds);
-  const seenFr: string[] = [];
+  const seedForm4 = cursor.form4Ids.length === 0;
+  const seedNews = cursor.newsIds.length === 0;
+  const seenForm4: string[] = [];
   const seenNews: string[] = [];
 
   try {
-    const documents = await ports.fetchDocuments();
-    for (const doc of documents) {
-      seenFr.push(doc.documentNumber);
-      if (firstRun || knownFr.has(doc.documentNumber)) continue;
-      const classified = classifyPolicyText(
-        `${doc.title}\n${doc.abstract ?? ''}`,
-        ports.mode,
-      );
-      if (!classified.relevant) continue;
-      await emitAlert({
-        source: 'federal_register',
-        title: doc.title,
-        body: [doc.subtype, doc.publicationDate].filter(Boolean).join(' · '),
-        url: doc.htmlUrl,
-        hits: classified.hits,
-      }, ports.notify);
+    const filings = await ports.fetchForm4();
+    for (const filing of filings) {
+      seenForm4.push(filing.accessionNumber);
+      if (seedForm4 || knownForm4.has(filing.accessionNumber)) continue;
+      await ports.notify({
+        source: 'form4',
+        title: filing.names[0] ?? `Form ${filing.form} ${filing.accessionNumber}`,
+        body: `${filing.names.slice(1).join(' · ')}${filing.names.length > 1 ? '\n' : ''}Filed: ${filing.filingDate}`,
+        url: filing.url,
+        hits: ['form 4'],
+      });
     }
   } catch (err: unknown) {
-    log.warn(`Federal Register poll skipped: ${toErrorMessage(err)}`);
+    log.warn(`Form 4 poll skipped: ${toErrorMessage(err)}`);
   }
 
   try {
@@ -147,25 +130,24 @@ export async function runPolicyPoll(ports: PolicyPollPorts): Promise<void> {
     const headlines = await ports.fetchNews(start, now);
     for (const headline of headlines) {
       seenNews.push(headline.id);
-      if (firstRun || knownNews.has(headline.id)) continue;
-      const classified = classifyNewsText(
+      if (seedNews || knownNews.has(headline.id)) continue;
+      const classified = classifyTrumpTradeNews(
         `${headline.headline}\n${headline.summary ?? ''}`,
-        ports.mode,
       );
       if (!classified.relevant) continue;
-      await emitAlert({
+      await ports.notify({
         source: 'news',
         title: headline.headline,
         body: headline.source ?? '',
         url: headline.url,
         hits: classified.hits,
-      }, ports.notify);
+      });
     }
   } catch (err: unknown) {
     log.warn(`News poll skipped: ${toErrorMessage(err)}`);
   }
 
-  cursor.federalRegisterIds = prependUnique(cursor.federalRegisterIds, seenFr);
+  cursor.form4Ids = prependUnique(cursor.form4Ids, seenForm4);
   cursor.newsIds = prependUnique(cursor.newsIds, seenNews);
   cursor.updatedAt = now.toISOString();
   await writeJsonAtomic(ports.cursorPath, cursor);
@@ -174,10 +156,12 @@ export async function runPolicyPoll(ports: PolicyPollPorts): Promise<void> {
 function productionPorts(): PolicyPollPorts {
   const cfg = config.policyMonitor;
   return {
-    mode: cfg.mode,
     cursorPath: cfg.cursorPath,
     newsLookbackMs: cfg.newsLookbackMs,
-    fetchDocuments: () => fetchPresidentialDocuments({ limit: cfg.federalRegisterLimit }),
+    fetchForm4: () => fetchTrumpForm4Filings({
+      lookbackDays: cfg.form4LookbackDays,
+      userAgent: cfg.secUserAgent,
+    }),
     fetchNews: (start, end) => fetchRecentPolicyNews(start, end, { limit: cfg.newsLimit }),
     async notify(event: PolicyAlert): Promise<void> {
       const formatted = formatAlert(event);
@@ -195,17 +179,12 @@ async function pollSafe(): Promise<void> {
   }
 }
 
-/**
- * No-op when POLICY_MONITOR_ENABLED is not true. Safe to call from boot
- * on trading and non-trading days alike.
- */
 export function startPolicyMonitor(): void {
   if (!config.policyMonitor.enabled) return;
   if (timer !== null) return;
   log.info(
-    `Started — mode=${config.policyMonitor.mode} ` +
-    `poll=${Math.round(config.policyMonitor.pollIntervalMs / 1000)}s ` +
-    `(alert-only, does not trade)`,
+    `Started — Trump trades only (Form 4 + buy/sell news) ` +
+    `poll=${Math.round(config.policyMonitor.pollIntervalMs / 1000)}s`,
   );
   void pollSafe();
   timer = setInterval(() => { void pollSafe(); }, config.policyMonitor.pollIntervalMs);

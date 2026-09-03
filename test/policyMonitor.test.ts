@@ -10,19 +10,18 @@ import {
   type PolicyAlert,
   type PolicyPollPorts,
 } from '../src/policyMonitor';
-import type { FederalRegisterDocument } from '../src/federalRegister';
+import type { EdgarForm4Filing } from '../src/edgarForm4';
 import type { NewsHeadline } from '../src/newsProvider';
 import { readJson } from '../src/jsonStore';
 import config from '../src/config';
 
-function frDoc(id: string, title: string): FederalRegisterDocument {
+function form4(id: string, name: string): EdgarForm4Filing {
   return {
-    documentNumber: id,
-    title,
-    abstract: null,
-    htmlUrl: `https://www.federalregister.gov/d/${id}`,
-    publicationDate: '2026-09-02',
-    subtype: 'proclamation',
+    accessionNumber: id,
+    filingDate: '2026-08-18',
+    names: [name, 'PSQ Holdings, Inc.'],
+    form: '4',
+    url: `https://www.sec.gov/Archives/edgar/data/2016181/${id.replace(/-/g, '')}/${id}-index.html`,
   };
 }
 
@@ -43,14 +42,13 @@ let cursorPath: string;
 let alerts: PolicyAlert[];
 
 function ports(
-  documents: FederalRegisterDocument[],
+  filings: EdgarForm4Filing[],
   headlines: NewsHeadline[],
 ): PolicyPollPorts {
   return {
-    mode: 'market',
     cursorPath,
     newsLookbackMs: 6 * 60 * 60 * 1000,
-    fetchDocuments: async () => documents,
+    fetchForm4: async () => filings,
     fetchNews: async () => headlines,
     notify: async (event) => { alerts.push(event); },
     now: () => new Date('2026-09-02T16:00:00.000Z'),
@@ -79,11 +77,6 @@ describe('startPolicyMonitor', () => {
     startPolicyMonitor();
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(config.policyMonitor.enabled, false);
-    const cursor = await readJson(config.policyMonitor.cursorPath);
-    // Disabled start must not create or rewrite the production cursor file.
-    // If a leftover file exists from a manual run, its identity is irrelevant
-    // as long as this call did not throw and armed no timer we cannot see.
-    void cursor;
     stopPolicyMonitor();
   });
 });
@@ -91,61 +84,70 @@ describe('startPolicyMonitor', () => {
 describe('runPolicyPoll', () => {
   it('seeds the cursor on first run and does not alert', async () => {
     await runPolicyPoll(ports(
-      [frDoc('2026-1', 'Imposing Additional Duties on Steel')],
-      [news('n1', 'Trump says new China tariffs take effect Monday')],
+      [form4('0002016181-26-000005', 'Trump Donald J. JR')],
+      [news('n1', 'Donald Trump bought 10,000 shares of DJT')],
     ));
     assert.equal(alerts.length, 0);
-    const stored = await readJson(cursorPath) as { federalRegisterIds: string[]; newsIds: string[] };
-    assert.deepEqual(stored.federalRegisterIds, ['2026-1']);
+    const stored = await readJson(cursorPath) as { form4Ids: string[]; newsIds: string[] };
+    assert.deepEqual(stored.form4Ids, ['0002016181-26-000005']);
     assert.deepEqual(stored.newsIds, ['n1']);
   });
 
-  it('alerts only on new market-relevant items after seed', async () => {
+  it('alerts on a new Form 4 after seed', async () => {
     await runPolicyPoll(ports(
-      [frDoc('2026-1', 'Imposing Additional Duties on Steel')],
-      [news('n1', 'Trump says new China tariffs take effect Monday')],
+      [form4('0002016181-26-000005', 'Trump Donald J. JR')],
+      [],
     ));
     alerts = [];
     await runPolicyPoll(ports(
       [
-        frDoc('2026-2', 'Adjusting Imports of Aluminum into the United States'),
-        frDoc('2026-1', 'Imposing Additional Duties on Steel'),
+        form4('0002016181-26-000006', 'Trump Donald J. JR'),
+        form4('0002016181-26-000005', 'Trump Donald J. JR'),
       ],
+      [],
+    ));
+    assert.equal(alerts.length, 1);
+    assert.equal(alerts[0]?.source, 'form4');
+    assert.ok(alerts[0]?.title.includes('Trump'));
+  });
+
+  it('does not alert on tariff or ceremonial news', async () => {
+    await runPolicyPoll(ports([], [news('seed', 'Donald Trump bought 1 share of DJT')]));
+    alerts = [];
+    await runPolicyPoll(ports(
+      [],
       [
-        news('n2', 'Trump honors Purple Heart recipients at the White House'),
-        news('n1', 'Trump says new China tariffs take effect Monday'),
+        news('n-tariff', 'Trump says new China tariffs take effect Monday'),
+        news('n-ceremonial', 'Trump honors Purple Heart recipients at the White House'),
+        news('seed', 'Donald Trump bought 1 share of DJT'),
+      ],
+    ));
+    assert.equal(alerts.length, 0);
+  });
+
+  it('alerts on new buy/sell news after seed', async () => {
+    await runPolicyPoll(ports([], [news('seed', 'Quiet tape')]));
+    alerts = [];
+    await runPolicyPoll(ports(
+      [],
+      [
+        news('n-buy', 'Donald Trump bought 50,000 shares of DJT'),
+        news('seed', 'Quiet tape'),
       ],
     ));
     assert.equal(alerts.length, 1);
-    assert.equal(alerts[0]?.source, 'federal_register');
-    assert.ok(alerts[0]?.title.includes('Aluminum'));
-  });
-
-  it('does not alert on ceremonial presidential documents in market mode', async () => {
-    await runPolicyPoll(ports(
-      [frDoc('seed', 'Imposing Additional Duties on Steel')],
-      [],
-    ));
-    alerts = [];
-    await runPolicyPoll(ports(
-      [
-        frDoc('ceremonial', 'National Purple Heart Day, 2026'),
-        frDoc('seed', 'Imposing Additional Duties on Steel'),
-      ],
-      [],
-    ));
-    assert.equal(alerts.length, 0);
+    assert.equal(alerts[0]?.source, 'news');
   });
 
   it('survives a failed source without dropping the other', async () => {
     await runPolicyPoll(ports(
-      [frDoc('seed', 'Imposing Additional Duties on Steel')],
-      [news('n-seed', 'Trump says China tariffs rise')],
+      [form4('seed-4', 'Trump Donald J. JR')],
+      [news('n-seed', 'Donald Trump bought 1 share of DJT')],
     ));
     alerts = [];
     await runPolicyPoll({
       ...ports(
-        [frDoc('2026-new', 'Imposing Additional Duties on Canadian Dairy')],
+        [form4('new-4', 'Trump Donald J. JR')],
         [],
       ),
       fetchNews: async () => {
@@ -153,6 +155,6 @@ describe('runPolicyPoll', () => {
       },
     });
     assert.equal(alerts.length, 1);
-    assert.equal(alerts[0]?.source, 'federal_register');
+    assert.equal(alerts[0]?.source, 'form4');
   });
 });

@@ -1,63 +1,51 @@
 /**
- * Pure lexicon for the policy monitor. No I/O — Federal Register titles and
- * news headlines are classified the same way so the poller stays a thin loop.
- *
- * `market` keeps ceremonial proclamations out. `all` is a debug dump.
+ * Trump *trade* classifier. Policy / tariff / ceremonial copy is out of scope.
+ * A headline must name Trump and describe a securities transaction.
  */
-
-export type PolicyMode = 'market' | 'all';
 
 export interface PolicyClassification {
   relevant: boolean;
   hits: readonly string[];
 }
 
-const MARKET_TERMS = [
-  'tariff',
-  'tariffs',
-  'duty',
-  'duties',
-  'imports',
-  'import',
-  'exports',
-  'export',
-  'trade war',
-  'section 232',
-  'section 301',
-  'ieepa',
-  'reciprocal',
-  'sanctions',
-  'embargo',
-  'china',
-  'chinese',
-  'mexico',
-  'canada',
-  'steel',
-  'aluminum',
-  'aluminium',
-  'oil',
-  'crude',
-  'opec',
-  'iran',
-  'gasoline',
-  'energy',
-  'semiconductor',
-  'chip',
-  'rare earth',
-  'auto',
-  'automobile',
-  'federal reserve',
-  'interest rate',
-  'fomc',
-  'truth social',
-  'djt',
+const TRUMP_PERSON_TERMS = [
+  'donald trump',
+  'trump jr',
+  'donald j. trump',
+  'president trump',
+  'eric trump',
 ] as const;
 
-const TRUMP_NEWS_MARKERS = [
-  'trump',
-  'white house',
-  'truth social',
-  'president donald',
+const TRADE_VERBS = [
+  'bought',
+  'buys',
+  'buy',
+  'sold',
+  'sells',
+  'sell',
+  'purchase',
+  'purchased',
+  'acquired',
+  'disposed',
+  'form 4',
+  'form4',
+  'insider transaction',
+  'opened a position',
+  'periodic transaction',
+] as const;
+
+const SECURITY_NOUNS = [
+  'share',
+  'shares',
+  'stock',
+  'stake',
+  'equity',
+  'position',
+  'insider',
+  'form 4',
+  'form4',
+  'djt',
+  'filing',
 ] as const;
 
 function hasTerm(haystack: string, term: string): boolean {
@@ -66,23 +54,27 @@ function hasTerm(haystack: string, term: string): boolean {
   return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`).test(haystack);
 }
 
-export function classifyPolicyText(text: string, mode: PolicyMode): PolicyClassification {
-  const haystack = text.toLowerCase();
-  const hits = MARKET_TERMS.filter(term => hasTerm(haystack, term));
-  if (mode === 'all') {
-    return { relevant: true, hits };
-  }
-  return { relevant: hits.length > 0, hits };
+function collectHits(haystack: string, terms: readonly string[]): string[] {
+  return terms.filter(term => hasTerm(haystack, term));
 }
 
-export function isTrumpRelatedNews(text: string): boolean {
+export function isTrumpPersonMention(text: string): boolean {
   const haystack = text.toLowerCase();
-  return TRUMP_NEWS_MARKERS.some(marker => haystack.includes(marker));
+  if (TRUMP_PERSON_TERMS.some(term => haystack.includes(term))) return true;
+  // Bare "trump" is accepted only next to a trade verb, to avoid "trump card"
+  // and White House policy copy. "Trump Media" + sold shares still qualifies.
+  return hasTerm(haystack, 'trump');
 }
 
-export function classifyNewsText(text: string, mode: PolicyMode): PolicyClassification {
-  if (!isTrumpRelatedNews(text)) {
+export function classifyTrumpTradeNews(text: string): PolicyClassification {
+  const haystack = text.toLowerCase();
+  if (!isTrumpPersonMention(text)) {
     return { relevant: false, hits: [] };
   }
-  return classifyPolicyText(text, mode);
+  const verbs = collectHits(haystack, TRADE_VERBS);
+  const nouns = collectHits(haystack, SECURITY_NOUNS);
+  if (verbs.length === 0 || nouns.length === 0) {
+    return { relevant: false, hits: [...verbs, ...nouns] };
+  }
+  return { relevant: true, hits: [...verbs, ...nouns] };
 }

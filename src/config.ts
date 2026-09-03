@@ -344,7 +344,7 @@ const config = {
   },
 
   /**
-   * Presidential-action / Trump-headline alerter. Off by default.
+   * Trump-trade alerter (SEC Form 4 + buy/sell headlines). Off by default.
    * Alert-only: never sizes, never sends orders, never mutates the watchlist.
    */
   policyMonitor: {
@@ -354,6 +354,11 @@ const config = {
     newsLookbackMs: parseIntEnv('POLICY_MONITOR_NEWS_LOOKBACK_MS', 6 * 60 * 60 * 1000),
     federalRegisterLimit: parseIntEnv('POLICY_MONITOR_FR_LIMIT', 20),
     newsLimit: parseIntEnv('POLICY_MONITOR_NEWS_LIMIT', 50),
+    form4LookbackDays: parseIntEnv('POLICY_MONITOR_FORM4_LOOKBACK_DAYS', 30),
+    secUserAgent: parseStringEnv(
+      'POLICY_MONITOR_SEC_USER_AGENT',
+      'trading-bot policy-monitor (personal research)',
+    ),
     cursorPath: parseStringEnv('POLICY_MONITOR_CURSOR_PATH', './data/policy_cursor.json'),
   },
 
@@ -869,6 +874,11 @@ const config = {
   if (policy.newsLimit < 1 || policy.newsLimit > 50) {
     throw new Error(
       `[SYSTEM] POLICY_MONITOR_NEWS_LIMIT out of bounds (1–50): ${policy.newsLimit}`,
+    );
+  }
+  if (policy.form4LookbackDays < 1 || policy.form4LookbackDays > 90) {
+    throw new Error(
+      `[SYSTEM] POLICY_MONITOR_FORM4_LOOKBACK_DAYS out of bounds (1–90): ${policy.form4LookbackDays}`,
     );
   }
 }());

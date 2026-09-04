@@ -137,6 +137,23 @@ export const SCANNER_HOLD_GATES: Pick<
   requireTape: false,
 };
 
+/**
+ * Ranking score in dollars of tape, not share count. Equal dollar flow at $6
+ * and $95 must rank equal before ticket-efficiency is applied at enqueue.
+ */
+export function computeOpeningDriveScore(input: {
+  impulseVolume: number;
+  impulseClose: number;
+  edgePct: number;
+  volumeConviction: number;
+}): number {
+  const { impulseVolume, impulseClose, edgePct, volumeConviction } = input;
+  if (!(impulseVolume > 0) || !(impulseClose > 0) || edgePct <= 0 || !(volumeConviction > 0)) {
+    return 0;
+  }
+  return impulseVolume * impulseClose * edgePct * volumeConviction;
+}
+
 /** last glued to or above the session impulse high — the FOMO wick, not a hold. */
 export function isChasingOpeningRangeHigh(last: number, sessionHigh: number): boolean {
   return last >= sessionHigh;
@@ -331,7 +348,12 @@ export function evaluateOpeningDrive(
   const edgePct = requireBreakout
     ? Math.max(breakPct, 0)
     : Math.max(openExtensionPct ?? 0, 0);
-  const score = impulseBar.volume * edgePct * volumeConviction;
+  const score = computeOpeningDriveScore({
+    impulseVolume: impulseBar.volume,
+    impulseClose: price,
+    edgePct,
+    volumeConviction,
+  });
 
   return {
     armed: true,

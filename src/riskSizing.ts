@@ -80,6 +80,41 @@ export function capQtyByMaxNotional(
   return Math.min(qty, Math.floor(maxNotional / entryPrice));
 }
 
+/**
+ * Notional that integer-share rounding can actually put on the book under the
+ * cash-account ceiling. A $110 ticket at $56 buys 1 share ($56) — half the
+ * ticket — while $55 buys 2 ($110).
+ */
+export function computeDeployableNotional(
+  entryPrice: number,
+  capital: number,
+  maxPositionPct: number,
+): number {
+  if (!(entryPrice > 0) || capital <= 0 || maxPositionPct <= 0) return 0;
+  const maxNotional = capital * maxPositionPct;
+  const qty = Math.floor(maxNotional / entryPrice);
+  return qty < 1 ? 0 : qty * entryPrice;
+}
+
+/**
+ * Fraction of the notional ceiling that one share-rounded ticket deploys.
+ * 0 when the name is untradeable (price above the ceiling). 1 when the ticket
+ * fills the cap. Used to rank signals by dollars at work, not by move size.
+ */
+export function ticketEfficiencyFactor(
+  entryPrice: number,
+  capital: number,
+  maxPositionPct: number,
+): number {
+  if (!(entryPrice > 0) || capital <= 0 || maxPositionPct <= 0) return 0;
+  const maxNotional = capital * maxPositionPct;
+  if (!(maxNotional > 0)) return 0;
+  const deployed = computeDeployableNotional(entryPrice, capital, maxPositionPct);
+  if (deployed <= 0) return 0;
+  if (deployed >= maxNotional - 1e-9) return 1;
+  return deployed / maxNotional;
+}
+
 /** Open slots in the unified pool. Never negative. */
 export function remainingPositionSlots(openCount: number, maxPositions: number): number {
   if (maxPositions < 1) return 0;

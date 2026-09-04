@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   allocateStreamChannels,
+  capMonitoredUniverse,
   countStreams,
   describeStreamPlan,
   uniqueSymbols,
@@ -83,5 +84,41 @@ describe('describeStreamPlan', () => {
       describeStreamPlan({ bars: ['A'], quotes: [], trades: ['A'] }),
       '1 bars, 0 quotes, 1 trades (2 streams)',
     );
+  });
+});
+
+describe('capMonitoredUniverse', () => {
+  it('never drops an open position, even past the cap', () => {
+    const kept = capMonitoredUniverse({
+      ranked: ['A', 'B'],
+      entered: new Set(['POS1', 'POS2']),
+      triggered: new Set(['ARM']),
+      maxSymbols: 2,
+    });
+    assert.deepEqual(kept, ['POS1', 'POS2']);
+  });
+
+  it('fills remaining slots from the ranked movers before armed names', () => {
+    const kept = capMonitoredUniverse({
+      ranked: ['PATH', 'ASAN'],
+      entered: new Set(['SNAP']),
+      triggered: new Set(['SMR', 'CRCL']),
+      maxSymbols: 3,
+    });
+    assert.deepEqual(kept, ['SNAP', 'PATH', 'ASAN']);
+  });
+
+  it('unpins armed names when the IEX bars-only budget is full', () => {
+    const ranked = Array.from({ length: 25 }, (_, i) => `R${i}`);
+    const triggered = new Set(['OLD1', 'OLD2', 'OLD3']);
+    const kept = capMonitoredUniverse({
+      ranked,
+      entered: new Set(['SNAP', 'SMR']),
+      triggered,
+      maxSymbols: 27,
+    });
+    assert.equal(kept.length, 27);
+    assert.ok(kept.includes('SNAP') && kept.includes('SMR'));
+    assert.equal(kept.includes('OLD1'), false);
   });
 });

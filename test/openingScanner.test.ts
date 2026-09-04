@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 import {
+  isScannerClockWindow,
   rankOpeningMovers,
   scanSessionExtension,
   snapshotToOpeningMover,
@@ -107,5 +108,21 @@ describe('scanSessionExtension', () => {
     );
     assert.equal(selected[0]?.symbol, 'PATH');
     assert.equal(selected.some(s => s.symbol === 'AAL'), false);
+  });
+});
+
+describe('isScannerClockWindow', () => {
+  const start = 9 * 60 + 31;
+  const end = 11 * 60 + 30;
+
+  it('opens at 09:31 and stays open past the OD window through 11:30', () => {
+    assert.equal(isScannerClockWindow(9 * 60 + 31, start, end), true);
+    assert.equal(isScannerClockWindow(10 * 60, start, end), true);
+    assert.equal(isScannerClockWindow(11 * 60 + 30, start, end), true);
+  });
+
+  it('is closed before 09:31 and after 11:30', () => {
+    assert.equal(isScannerClockWindow(9 * 60 + 30, start, end), false);
+    assert.equal(isScannerClockWindow(11 * 60 + 31, start, end), false);
   });
 });

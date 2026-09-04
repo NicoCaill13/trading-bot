@@ -85,6 +85,21 @@ export function passesDollarVolume(
   return close * volume >= minDollarVolume;
 }
 
+/**
+ * Inclusive band on previous-session dollar volume. `maxDollarVolume <= 0`
+ * disables the ceiling so the pool stays an eligibility list, not a mega-cap
+ * ranking.
+ */
+export function passesDollarVolumeBand(
+  dollarVolume: number,
+  minDollarVolume: number,
+  maxDollarVolume: number,
+): boolean {
+  if (!(dollarVolume >= minDollarVolume)) return false;
+  if (maxDollarVolume > 0 && dollarVolume > maxDollarVolume) return false;
+  return true;
+}
+
 /** Inclusive float band [minFloat, maxFloat]. */
 export function passesFloatGate(
   floatShares: number,

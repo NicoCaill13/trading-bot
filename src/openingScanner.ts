@@ -25,6 +25,15 @@ import type { WatchlistSymbol } from './types';
 const log = createLogger('OPENING_SCANNER');
 const SNAPSHOT_BATCH_SIZE = 100;
 
+/** Inclusive clock window in minutes since NY midnight. */
+export function isScannerClockWindow(
+  minutesSinceMidnight: number,
+  startMinutes: number,
+  endMinutes: number,
+): boolean {
+  return minutesSinceMidnight >= startMinutes && minutesSinceMidnight <= endMinutes;
+}
+
 export interface SnapshotClient {
   getSnapshots(symbols: string[]): Promise<AlpacaSnapshot[]>;
 }

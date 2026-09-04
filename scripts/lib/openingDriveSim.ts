@@ -75,6 +75,7 @@ export interface SignalCandidate {
   signalIndex: number;
   signalClose: number;
   stopPriceOverride: number;
+  score?: number;
 }
 
 function cumulativeVwap(bars: readonly BarData[]): number | null {
@@ -122,6 +123,8 @@ export function findSignal(
       ask: null,
       tapeDelta: null,
       imbalance: null,
+      inScanner: true,
+      sessionHigh: history.reduce((h, b) => Math.max(h, b.high), 0),
     };
 
     const decision = evaluateOpeningDrive(ctx, odOptions);
@@ -130,6 +133,7 @@ export function findSignal(
         signalIndex: i,
         signalClose: bar.close,
         stopPriceOverride: decision.stopPrice,
+        score: decision.score,
       };
     }
   }

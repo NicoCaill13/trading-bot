@@ -65,3 +65,29 @@ export function describeStreamPlan(plan: StreamChannelPlan): string {
     `${plan.trades.length} trades (${countStreams(plan)} streams)`
   );
 }
+
+/**
+ * Hard cap on the live monitored set. Open positions always stay. Ranked
+ * movers fill the rest. Armed-but-not-entered names are kept only if there
+ * is room — otherwise they unpin so a 2-hour scanner cannot grow past the
+ * IEX stream budget (30 bars-only).
+ */
+export function capMonitoredUniverse(input: {
+  ranked: readonly string[];
+  entered: ReadonlySet<string>;
+  triggered: ReadonlySet<string>;
+  maxSymbols: number;
+}): string[] {
+  const max = Math.max(0, Math.floor(input.maxSymbols));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (symbol: string): void => {
+    if (symbol.length === 0 || seen.has(symbol) || out.length >= max) return;
+    seen.add(symbol);
+    out.push(symbol);
+  };
+  for (const symbol of input.entered) push(symbol);
+  for (const symbol of input.ranked) push(symbol);
+  for (const symbol of input.triggered) push(symbol);
+  return out;
+}

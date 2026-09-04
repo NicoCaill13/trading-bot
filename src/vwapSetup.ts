@@ -17,6 +17,35 @@ export interface OhcBar {
 }
 
 /**
+ * Live setup eligibility by universe membership.
+ *
+ * Hyper-Growth runs V7 Core VWAP pullback on every monitored name. ORB stays
+ * Play-Maker only. Gating Core on `isOrbUniverse` silenced VWAP whenever the
+ * evening screener is off (the whole list is V2).
+ */
+export function liveSetupGates(inOrbUniverse: boolean): {
+  orb: boolean;
+  vwapPullback: boolean;
+} {
+  return {
+    orb: inOrbUniverse,
+    vwapPullback: true,
+  };
+}
+
+/**
+ * Core V1 gates that Hyper-Growth VWAP must not inherit. Continuation buys
+ * strength away from support: Fibonacci proximity, a SPY-bearish hard ban,
+ * and the 3% VWAP-distance cap would empty the 10:00 funnel.
+ * RSI exhaustion still applies at execution.
+ */
+export const VWAP_HYPER_GROWTH_GATES = {
+  skipFibonacci: true,
+  applySpyBearishBan: false,
+  applyVwapDistanceCap: false,
+} as const;
+
+/**
  * V7 Core entry window: startInclusive <= now < endExclusive (EST).
  * Defaults: 10:00 <= t < 11:30.
  */

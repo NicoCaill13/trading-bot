@@ -172,7 +172,7 @@ const config = {
     rvolBaselineDays: parseIntEnv('STRAIGHT_RUN_RVOL_BASELINE_DAYS', 14),
   },
 
-  // Opening Drive — sole live entry path. ORB 1-min high break, 09:30–10:00 EST.
+  // Opening Drive 09:30–10:00 plus VWAP pullback 10:00–11:30 on the scanner universe.
   // Volume + close location first. Spread and signed tape veto when present.
   openingDrive: {
     shadow: process.env.OD_SHADOW === 'true',
@@ -193,6 +193,10 @@ const config = {
     scannerEnabled: process.env.OD_SCANNER_ENABLED !== 'false',
     scannerStartHour: parseIntEnv('OD_SCANNER_START_HOUR', 9),
     scannerStartMinute: parseIntEnv('OD_SCANNER_START_MINUTE', 31),
+    // Independent of OD_WINDOW_END so the ranker can keep swapping names into
+    // the VWAP window (10:00–11:30). Defaults to the Core entry window end.
+    scannerEndHour: parseIntEnv('OD_SCANNER_END_HOUR', 11),
+    scannerEndMinute: parseIntEnv('OD_SCANNER_END_MINUTE', 30),
     scannerIntervalSec: parseIntEnv('OD_SCANNER_INTERVAL_SEC', 60),
     scannerMaxSymbols: parseIntEnv('OD_SCANNER_MAX_SYMBOLS', 25),
     scannerMinExtensionPct: parseFloatEnv('OD_SCANNER_MIN_EXTENSION_PCT', 0.01),
@@ -208,10 +212,18 @@ const config = {
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 30),
-    // Eligible-pool 09:15: structural liquidity on yesterday's close, IEX scale.
-    // SIP ~$20M ≈ IEX ~$1.5–2M. ASAN printed $2.08M IEX on 26/08; GRML/AMIX stay under $0.4M.
-    poolMinPrevDollarVolume: parseFloatEnv('POOL_MIN_PREV_DOLLAR_VOLUME', 1_500_000),
-    poolMaxSize: parseIntEnv('POOL_MAX_SIZE', 1500),
+    // Eligible-pool 09:15: SIP previous-session dollar volume. Snapshots are
+    // IEX-scale (~3% of SIP) and cannot be used as a liquidity floor.
+    // Audit 28/08–03/09: $5M keeps ~2000–2080 names in the $5–$100 band and
+    // retains CHPT on 03/09 ($8.5M). $20M drops it. A dollar-volume ceiling
+    // is a runner killer (CRCL prints $0.7–1.9B; $800M excludes it most days).
+    poolMinPrevDollarVolume: parseFloatEnv('POOL_MIN_PREV_DOLLAR_VOLUME', 5_000_000),
+    // 0 = no ceiling. Do not set one to "clip mega caps": the names that
+    // actually move 10% sit in the same liquidity band as MARA/CRCL.
+    poolMaxPrevDollarVolume: parseFloatEnv('POOL_MAX_PREV_DOLLAR_VOLUME', 0),
+    // Above the measured ~2080 pass count so the pool is an eligibility list.
+    // Overflow, if it ever happens, drops the *most* liquid names first.
+    poolMaxSize: parseIntEnv('POOL_MAX_SIZE', 4000),
   },
 
   entry: {
@@ -656,9 +668,15 @@ const config = {
     );
   }
   const scannerStart = od.scannerStartHour * 60 + od.scannerStartMinute;
-  if (od.scannerEnabled && (scannerStart < odStart || scannerStart >= odEnd)) {
+  const scannerEnd = od.scannerEndHour * 60 + od.scannerEndMinute;
+  if (od.scannerEnabled && scannerStart >= scannerEnd) {
     throw new Error(
-      `[SYSTEM] OD_SCANNER_START must sit inside the OD window: ${scannerStart} not in [${odStart}, ${odEnd})`,
+      `[SYSTEM] OD_SCANNER_START must precede OD_SCANNER_END: ${scannerStart} >= ${scannerEnd}`,
+    );
+  }
+  if (od.scannerEnabled && scannerStart < odStart) {
+    throw new Error(
+      `[SYSTEM] OD_SCANNER_START must not precede the OD window: ${scannerStart} < ${odStart}`,
     );
   }
   if (od.scannerIntervalSec < 15 || od.scannerIntervalSec > 300) {
@@ -768,6 +786,20 @@ const config = {
   if (pm.poolMinPrevDollarVolume <= 0) {
     throw new Error(
       `[SYSTEM] POOL_MIN_PREV_DOLLAR_VOLUME must be > 0: ${pm.poolMinPrevDollarVolume}`,
+    );
+  }
+  if (pm.poolMaxPrevDollarVolume < 0) {
+    throw new Error(
+      `[SYSTEM] POOL_MAX_PREV_DOLLAR_VOLUME must be >= 0: ${pm.poolMaxPrevDollarVolume}`,
+    );
+  }
+  if (
+    pm.poolMaxPrevDollarVolume > 0 &&
+    pm.poolMaxPrevDollarVolume <= pm.poolMinPrevDollarVolume
+  ) {
+    throw new Error(
+      `[SYSTEM] POOL_MAX_PREV_DOLLAR_VOLUME must exceed POOL_MIN_PREV_DOLLAR_VOLUME: ` +
+      `${pm.poolMaxPrevDollarVolume} <= ${pm.poolMinPrevDollarVolume}`,
     );
   }
   if (pm.poolMaxSize < 1) {

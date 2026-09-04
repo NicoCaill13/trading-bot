@@ -18,7 +18,8 @@
  *  - Session VWAP is built from RTH bars only. The live bot seeds it with
  *    pre-market bars, so its VWAP gate behaves slightly differently.
  *
- * Run: npx tsx scripts/backtestOpeningDrive.ts [sessions] [feed]
+ * Run: npx tsx scripts/backtestOpeningDrive.ts [sessions|YYYY-MM-DD] [feed]
+ *      npx tsx scripts/backtestOpeningDrive.ts 2026-09-03 sip --compare-score
  */
 
 import config from '../src/config';
@@ -32,8 +33,10 @@ import {
   capQtyByMaxNotional,
   computeRiskBasedQty,
   resolveSizingCapital,
+  ticketEfficiencyFactor,
 } from '../src/riskSizing';
 import { nyWallTimeToUtc } from '../src/utils';
+import { SCANNER_HOLD_GATES } from '../src/openingDrive';
 import { fetchBars, fetchRecentSessions, type Feed } from './lib/barFetch';
 import { buildSessionFunnel, type Candidate } from './lib/premarketFunnel';
 import {
@@ -47,8 +50,12 @@ import {
 } from './lib/openingDriveSim';
 import type { BarData } from '../src/types';
 
-const SESSIONS = Number(process.argv[2] ?? 10);
-const FEED = (process.argv[3] ?? config.alpaca.dataFeed) as Feed;
+const DATE_ARG = process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
+const COUNT_ARG = process.argv.find(a => /^\d+$/.test(a));
+const FEED_ARG = process.argv.find(a => a === 'iex' || a === 'sip');
+const COMPARE_SCORE = process.argv.includes('--compare-score');
+const SESSIONS = DATE_ARG ? 1 : Number(COUNT_ARG ?? 10);
+const FEED = (FEED_ARG ?? config.alpaca.dataFeed) as Feed;
 
 /** One-way cost in basis points. Micro-caps at $1-15 routinely sit above 50. */
 const SPREAD_SCENARIOS_BPS = [0, 25, 50, 100] as const;
@@ -70,6 +77,22 @@ const OD_OPTIONS: OpeningDriveOptions = {
   maxSpreadPct: config.openingDrive.maxSpreadPct,
   minTapeDelta: config.openingDrive.minTapeDelta,
   hardStopFloorPct: config.risk.hardStopFloorPct,
+  ...(config.openingDrive.scannerEnabled
+    ? {
+        ...SCANNER_HOLD_GATES,
+        minOpenExtensionPct: config.openingDrive.minOpenExtensionPct,
+        maxOpenExtensionPct: config.openingDrive.maxOpenExtensionPct,
+      }
+    : {}),
+};
+
+/** Armed Opening Drive names from the 2026-09-03 live session (shadow journal). */
+const SESSION_COMPARE_SYMBOLS: Readonly<Record<string, readonly string[]>> = {
+  '2026-09-03': [
+    'CRCL', 'CIFR', 'GLXY', 'ALMS', 'CLYM', 'BULL', 'FIGR', 'RARE', 'HPE',
+    'SNAP', 'IONQ', 'AUR', 'FSLY', 'RNG', 'KVYO', 'SOFI', 'SMMT', 'STUB',
+    'RBLX', 'ASST', 'WTTR', 'SMR', 'ONDS', 'MC', 'ZETA', 'G', 'KNX',
+  ],
 };
 
 interface SessionData {
@@ -141,13 +164,15 @@ async function loadSession(
 }
 
 /**
- * Replays one session. Signals from every watchlist symbol compete in
- * chronological order, which is how the live bot fills its slots.
+ * Replays one session. Live ranking is by PendingSignal.score (dollar flow ×
+ * ticket efficiency). `--compare-score` also reports the legacy share-count
+ * ranking so a formula change can be judged on a known session.
  */
 function runSession(
   data: SessionData,
   startEquity: number,
   simOptions: SimOptions,
+  rankBy: 'time' | 'score' = 'score',
 ): SessionResult {
   const result: SessionResult = {
     session: data.session,
@@ -160,7 +185,14 @@ function runSession(
   };
 
   const sizingCapital = resolveSizingCapital(startEquity, config.risk.strategyCapitalUsd);
-  const candidates: { candidate: Candidate; bars: BarData[]; signalIndex: number; signalClose: number; stopPriceOverride: number }[] = [];
+  const candidates: {
+    candidate: Candidate;
+    bars: BarData[];
+    signalIndex: number;
+    signalClose: number;
+    stopPriceOverride: number;
+    score: number;
+  }[] = [];
 
   for (const candidate of data.watchlist) {
     const bars = data.bars.get(candidate.symbol);
@@ -175,14 +207,30 @@ function runSession(
     if (!signal) continue;
 
     result.signals++;
-    candidates.push({ candidate, bars, ...signal });
+    const efficiency = ticketEfficiencyFactor(
+      signal.signalClose,
+      sizingCapital,
+      config.risk.maxPositionPct,
+    );
+    candidates.push({
+      candidate,
+      bars,
+      signalIndex: signal.signalIndex,
+      signalClose: signal.signalClose,
+      stopPriceOverride: signal.stopPriceOverride,
+      score: (signal.score ?? 0) * efficiency,
+    });
   }
 
-  candidates.sort(
-    (a, b) =>
-      Date.parse(a.bars[a.signalIndex].timestamp) -
-      Date.parse(b.bars[b.signalIndex].timestamp),
-  );
+  if (rankBy === 'score') {
+    candidates.sort((a, b) => b.score - a.score);
+  } else {
+    candidates.sort(
+      (a, b) =>
+        Date.parse(a.bars[a.signalIndex].timestamp) -
+        Date.parse(b.bars[b.signalIndex].timestamp),
+    );
+  }
 
   // T+1: proceeds settle overnight, so intraday capital is spent, not recycled.
   let availableToday = sizingCapital;
@@ -376,9 +424,175 @@ function reportBlotter(run: RunResult): void {
   }
 }
 
+async function loadSessionForSymbols(
+  session: string,
+  symbols: readonly string[],
+): Promise<SessionData> {
+  const [year, month, day] = session.split('-').map(Number);
+  const estDay = new Date(year, month - 1, day);
+  const rthStart = nyWallTimeToUtc(estDay, 9, 30);
+  const rthEnd = nyWallTimeToUtc(estDay, 16, 0);
+  const prevStart = nyWallTimeToUtc(new Date(year, month - 1, day - 5), 9, 30);
+
+  const [intraday, daily] = await Promise.all([
+    fetchBars(symbols, '1Min', rthStart, rthEnd, FEED),
+    fetchBars(symbols, '1Day', prevStart, rthStart, FEED),
+  ]);
+
+  const watchlist: Candidate[] = [];
+  const bars = new Map<string, BarData[]>();
+
+  for (const symbol of symbols) {
+    const list = (intraday.get(symbol) ?? [])
+      .filter(b => Date.parse(b.t) >= rthStart.getTime())
+      .sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
+      .map(toBarData);
+    if (list.length === 0) continue;
+    bars.set(symbol, list);
+
+    const dailies = daily.get(symbol) ?? [];
+    const prev = dailies.filter(b => Date.parse(b.t) < rthStart.getTime()).at(-1);
+    watchlist.push({
+      symbol,
+      gapPct: 0,
+      premarketVolume: 0,
+      premarketPrice: list[0].open,
+      previousClose: prev?.c ?? list[0].open,
+    });
+  }
+
+  return { session, watchlist, bars };
+}
+
+interface RankedSignal {
+  symbol: string;
+  liveScore: number;
+  shareScore: number;
+  mfePct: number;
+  netPnl: number;
+}
+
+function simulateAllSignals(
+  data: SessionData,
+  startEquity: number,
+  simOptions: SimOptions,
+): RankedSignal[] {
+  const sizingCapital = resolveSizingCapital(startEquity, config.risk.strategyCapitalUsd);
+  const rows: RankedSignal[] = [];
+
+  for (const candidate of data.watchlist) {
+    const bars = data.bars.get(candidate.symbol);
+    if (!bars || bars.length === 0) continue;
+    const signal = findSignal(candidate.symbol, bars, candidate.previousClose, OD_OPTIONS);
+    if (!signal || signal.score === undefined) continue;
+
+    const close = signal.signalClose;
+    const liveScore = signal.score * ticketEfficiencyFactor(
+      close,
+      sizingCapital,
+      config.risk.maxPositionPct,
+    );
+    const shareScore = close > 0
+      ? (signal.score / close) * ticketEfficiencyFactor(
+        close,
+        sizingCapital,
+        config.risk.maxPositionPct,
+      )
+      : 0;
+
+    const outcome = simulateTrade(
+      candidate.symbol,
+      data.session,
+      bars,
+      signal,
+      simOptions,
+      (entryPrice, stopDistance) => {
+        const riskQty = computeRiskBasedQty(
+          sizingCapital,
+          config.risk.riskPerTradePct,
+          entryPrice,
+          entryPrice - stopDistance,
+        );
+        return capQtyByMaxNotional(
+          riskQty,
+          entryPrice,
+          sizingCapital,
+          config.risk.maxPositionPct,
+        );
+      },
+    );
+    const mfePct = outcome.kind === 'trade' ? outcome.trade.mfePct : 0;
+    const netPnl = outcome.kind === 'trade' ? outcome.trade.netPnl : 0;
+    rows.push({ symbol: candidate.symbol, liveScore, shareScore, mfePct, netPnl });
+  }
+  return rows;
+}
+
+function reportScoreComparison(data: SessionData, startEquity: number): void {
+  const rows = simulateAllSignals(data, startEquity, baseSimOptions(REFERENCE_SPREAD_BPS));
+  const byLive = [...rows].sort((a, b) => b.liveScore - a.liveScore);
+  const byShare = [...rows].sort((a, b) => b.shareScore - a.shareScore);
+  const slots = config.risk.maxPositions;
+
+  console.log(`\n══ score comparison ${data.session} (${rows.length} armed) ${'═'.repeat(20)}`);
+  console.log('  rank  live-$flow              share-count');
+  const n = Math.max(byLive.length, slots);
+  for (let i = 0; i < Math.min(n, 12); i++) {
+    const live = byLive[i];
+    const share = byShare[i];
+    const liveMark = i < slots ? '*' : ' ';
+    const shareMark = i < slots ? '*' : ' ';
+    console.log(
+      `  ${String(i + 1).padStart(4)}  ${liveMark}${(live?.symbol ?? '').padEnd(6)} ` +
+      `MFE ${pct(live?.mfePct ?? 0).padStart(8)}   ` +
+      `${shareMark}${(share?.symbol ?? '').padEnd(6)} MFE ${pct(share?.mfePct ?? 0).padStart(8)}`,
+    );
+  }
+
+  const livePicks = byLive.slice(0, slots).map(r => r.symbol);
+  const sharePicks = byShare.slice(0, slots).map(r => r.symbol);
+  const liveMfe = byLive.slice(0, slots).reduce((s, r) => s + r.mfePct, 0);
+  const shareMfe = byShare.slice(0, slots).reduce((s, r) => s + r.mfePct, 0);
+  console.log(
+    `  selected live   [${livePicks.join(', ')}] sum MFE ${pct(liveMfe)}\n` +
+    `  selected shares [${sharePicks.join(', ')}] sum MFE ${pct(shareMfe)}`,
+  );
+
+  const gateNames = ['CRCL', 'CIFR', 'GLXY', 'SNAP', 'SMR'] as const;
+  console.log('\n  gate names (live rank vs share-count rank):');
+  const liveRank = (sym: string): number => byLive.findIndex(r => r.symbol === sym) + 1;
+  const shareRank = (sym: string): number => byShare.findIndex(r => r.symbol === sym) + 1;
+  for (const sym of gateNames) {
+    const row = rows.find(r => r.symbol === sym);
+    if (row === undefined) {
+      console.log(`    ${sym.padEnd(6)} not armed`);
+      continue;
+    }
+    console.log(
+      `    ${sym.padEnd(6)} live #${String(liveRank(sym)).padStart(2)}  ` +
+      `share #${String(shareRank(sym)).padStart(2)}  MFE ${pct(row.mfePct)}`,
+    );
+  }
+
+  const promoted = (['CRCL', 'CIFR', 'GLXY'] as const).filter(sym => {
+    const live = liveRank(sym);
+    const snap = liveRank('SNAP');
+    const smr = liveRank('SMR');
+    if (live === 0) return false;
+    return (snap === 0 || live < snap) && (smr === 0 || live < smr);
+  });
+  const gatePass = promoted.length > 0;
+  console.log(
+    gatePass
+      ? `  GATE PASS — ${promoted.join(', ')} rank ahead of SNAP and SMR`
+      : '  GATE FAIL — none of CRCL/CIFR/GLXY rank ahead of SNAP and SMR',
+  );
+  if (!gatePass) process.exitCode = 1;
+}
+
 async function main(): Promise<void> {
   const universe = await getDynamicUniverse();
-  const sessionDates = await fetchRecentSessions(SESSIONS);
+  const sessionDates = DATE_ARG ? [DATE_ARG] : await fetchRecentSessions(SESSIONS);
 
   console.log(
     `\nOpening Drive expectancy — ${FEED.toUpperCase()} feed, ${sessionDates.length} sessions\n` +
@@ -400,9 +614,11 @@ async function main(): Promise<void> {
 
   const loaded: SessionData[] = [];
   for (const session of sessionDates) {
-    // One bad session must not discard the whole sweep.
     try {
-      const data = await loadSession(universe, session);
+      const compareSymbols = COMPARE_SCORE ? SESSION_COMPARE_SYMBOLS[session] : undefined;
+      const data = compareSymbols
+        ? await loadSessionForSymbols(session, compareSymbols)
+        : await loadSession(universe, session);
       loaded.push(data);
       console.log(
         `  ${session} watchlist ${data.watchlist.length}, bars for ${data.bars.size} symbol(s)`,
@@ -417,6 +633,11 @@ async function main(): Promise<void> {
   const startEquity = config.risk.strategyCapitalUsd > 0
     ? config.risk.strategyCapitalUsd
     : 200;
+
+  if (COMPARE_SCORE) {
+    for (const data of loaded) reportScoreComparison(data, startEquity);
+    return;
+  }
 
   let reference: RunResult | null = null;
   for (const bps of SPREAD_SCENARIOS_BPS) {

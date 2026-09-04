@@ -39,6 +39,7 @@ import {
 } from './openingDrive';
 import {
   allocateStreamChannels,
+  capMonitoredUniverse,
   describeStreamPlan,
   uniqueSymbols,
   type StreamChannelPlan,
@@ -53,7 +54,7 @@ import { extractV2Symbols, isV2Symbol, readWatchlist, writePremarketWatchlist } 
 import { isWatchlistCurrent } from './watchlistFreshness';
 import { selectOpeningRangeBar } from './openingRange';
 import { buildEligiblePool, readEligiblePool } from './eligiblePool';
-import { moversToWatchlist, scanSessionExtension } from './openingScanner';
+import { moversToWatchlist, scanSessionExtension, isScannerClockWindow } from './openingScanner';
 import {
   addBarToVwap,
   computeVwap,
@@ -74,13 +75,15 @@ import {
   isNearVwap,
   isVwapLagger,
   isVwapPullbackEntryWindow,
+  liveSetupGates,
   minutesSinceMidnight,
   shouldHardBanSpyBearish,
   volumesFromBars,
+  VWAP_HYPER_GROWTH_GATES,
   type EntryWindowBounds,
 } from './vwapSetup';
 import { resolveRiskDollarsAtEntry } from './expectancy';
-import { remainingPositionSlots } from './riskSizing';
+import { remainingPositionSlots, ticketEfficiencyFactor } from './riskSizing';
 import { createMarketDataBus } from './marketDataBus';
 import { createHeartbeatWriter } from './heartbeat';
 import { startPolicyMonitor, stopPolicyMonitor } from './policyMonitor';
@@ -344,11 +347,6 @@ function msUntilESTTime(hour: number, minute: number): number {
   // If target already passed today, aim for tomorrow (avoids infinite loop)
   if (diff <= 0) diff += 24 * 60 * 60 * 1000;
   return diff;
-}
-
-function isLunchPeriod(): boolean {
-  const h = getESTDate().getHours();
-  return h >= config.session.lunchStartHour && h < config.session.lunchEndHour;
 }
 
 function isBlackoutPeriod(): boolean {
@@ -716,9 +714,20 @@ function purgeMonitoredSymbol(symbol: string): void {
 async function swapOpeningUniverse(
   movers: WatchlistSymbol[],
 ): Promise<{ added: string[]; removed: string[] }> {
-  const keep = new Set(movers.map(s => s.symbol));
-  for (const symbol of enteredBySetup.keys()) keep.add(symbol);
-  for (const symbol of openingDriveTriggered) keep.add(symbol);
+  const streamCap = activeStreamFeed === 'iex'
+    ? config.alpaca.iexMaxStreams
+    : config.alpaca.sipMaxStreams;
+  const maxSymbols = Math.min(
+    config.openingDrive.scannerMaxSymbols + enteredBySetup.size,
+    streamCap,
+  );
+  const keptSymbols = capMonitoredUniverse({
+    ranked: movers.map(s => s.symbol),
+    entered: new Set(enteredBySetup.keys()),
+    triggered: openingDriveTriggered,
+    maxSymbols,
+  });
+  const keep = new Set(keptSymbols);
 
   const previous = new Set(monitoredSymbols);
   const removed = monitoredSymbols.filter(s => !keep.has(s));
@@ -975,11 +984,6 @@ function computeIntradayRvol(latestBar: BarData, bars: BarData[]): number | null
   return latestBar.volume / avgVolume;
 }
 
-function passesRvolForPullback(latestBar: BarData, bars: BarData[]): boolean {
-  const rvol = computeIntradayRvol(latestBar, bars);
-  return rvol !== null && rvol >= config.entry.minRvolForPullback;
-}
-
 function alpacaBarToBarData(bar: AlpacaBar): BarData {
   return {
     open: bar.OpenPrice,
@@ -1224,10 +1228,13 @@ async function hydrateIntradayBars(
     if (!bars || bars.length === 0) continue;
 
     const latest = bars[bars.length - 1];
-    if (isOrbUniverse(symbol) && isBlackoutPeriod()) {
+    const gates = liveSetupGates(isOrbUniverse(symbol));
+    if (gates.orb && isBlackoutPeriod()) {
       evaluateOrbSignal(symbol, latest);
     }
-    evaluateSignal(symbol, latest);
+    if (gates.vwapPullback) {
+      evaluateSignal(symbol, latest);
+    }
   }
 }
 
@@ -1240,8 +1247,22 @@ async function hydrateIntradayBars(
  * (near VWAP 0.1% + volume dry-up + green close + RVOL > min).
  * Satellite: same breakout arming; execution still via 1m tick-up (evaluatePullbackState).
  */
+/**
+ * Integer-share rounding at STRATEGY_CAPITAL_USD means a $56 name deploys half
+ * a $110 ticket. Scale the setup score by that ratio so ranking matches dollars
+ * at work. Unconstrained capital (cap 0) leaves the raw score untouched.
+ */
+function applyTicketEfficiency(score: number, entryPrice: number): number {
+  const capital = config.risk.strategyCapitalUsd;
+  if (capital <= 0) return score;
+  return score * ticketEfficiencyFactor(entryPrice, capital, config.risk.maxPositionPct);
+}
+
 function queuePendingSignal(signal: PendingSignal): void {
-  signalQueue.enqueue(signal);
+  signalQueue.enqueue({
+    ...signal,
+    score: applyTicketEfficiency(signal.score, signal.barData.close),
+  });
   schedulePendingSignalFlush();
 }
 
@@ -1502,20 +1523,13 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   const existing = pullbackTrackers.get(symbol);
   if (existing) {
-    if (existing.setup === 'VWAP_PULLBACK' && !isOrbUniverse(symbol)) {
+    if (existing.setup === 'VWAP_PULLBACK') {
       evaluateCoreV7Pullback(symbol, latestBar);
     }
     return;
   }
 
-  const orbName = isOrbUniverse(symbol);
-  if (orbName && isBlackoutPeriod()) return;
-
-  if (!orbName) {
-    if (!isCoreEntryWindowOpen()) return;
-  } else if (!config.entry.tradeDuringLunch && isLunchPeriod()) {
-    return;
-  }
+  if (!isCoreEntryWindowOpen()) return;
 
   const bars = signalBars5m.get(symbol) ?? [];
   if (bars.length < 2) return;
@@ -1531,31 +1545,19 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
 
   if (currentPrice <= vwap) return;
 
-  if (!orbName) {
-    const meta = screenerDataMap.get(symbol);
-    if (
-      isVwapLagger(
-        meta?.gapUp,
-        meta?.relativeReturn,
-        config.entry.vwapLaggerAlphaFloor,
-      )
-    ) {
-      log.info(
-        `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} skipped — lagger ` +
-        `(gap ${((meta?.gapUp ?? 0) * 100).toFixed(1)}%, ` +
-        `alpha ${((meta?.relativeReturn ?? 0) * 100).toFixed(1)}% ` +
-        `< floor ${(config.entry.vwapLaggerAlphaFloor * 100).toFixed(0)}%)`,
-      );
-      return;
-    }
-  }
-
-  // V2 still arms on RVOL at breakout; V1 confirms RVOL on the green 5m later.
-  if (orbName && !passesRvolForPullback(latestBar, bars)) {
-    const rvol = computeIntradayRvol(latestBar, bars);
+  const meta = screenerDataMap.get(symbol);
+  if (
+    isVwapLagger(
+      meta?.gapUp,
+      meta?.relativeReturn,
+      config.entry.vwapLaggerAlphaFloor,
+    )
+  ) {
     log.info(
-      `${symbol}: VWAP breakout below RVOL threshold — ` +
-      `rvol ${rvol === null ? 'N/A' : rvol.toFixed(2)}x (min ${config.entry.minRvolForPullback})`,
+      `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} skipped — lagger ` +
+      `(gap ${((meta?.gapUp ?? 0) * 100).toFixed(1)}%, ` +
+      `alpha ${((meta?.relativeReturn ?? 0) * 100).toFixed(1)}% ` +
+      `< floor ${(config.entry.vwapLaggerAlphaFloor * 100).toFixed(0)}%)`,
     );
     return;
   }
@@ -1566,7 +1568,7 @@ function evaluateSignal(symbol: string, latestBar: BarData): void {
     : latestBar.volume;
 
   const vwapDeviation = (currentPrice - vwap) / vwap;
-  const momentumScore = latestBar.volume * vwapDeviation;
+  const momentumScore = latestBar.volume * latestBar.close * vwapDeviation;
 
   pullbackTrackers.set(symbol, {
     state: 'TRACKING_PULLBACK',
@@ -1600,7 +1602,7 @@ function evaluateCoreV7Pullback(symbol: string, latestBar: BarData): void {
   }
 
   const tracker = pullbackTrackers.get(symbol);
-  if (!tracker || tracker.setup !== 'VWAP_PULLBACK' || isOrbUniverse(symbol)) return;
+  if (!tracker || tracker.setup !== 'VWAP_PULLBACK') return;
 
   if (!isCoreEntryWindowOpen()) {
     if (!isBeforeCoreEntryWindow()) {
@@ -1703,6 +1705,7 @@ function confirmCoreV7Entry(
     vwap,
     avgVolume: tracker.avgVolume,
     fibLevels: tracker.fibLevels,
+    skipFibonacciGate: VWAP_HYPER_GROWTH_GATES.skipFibonacci,
   });
 }
 
@@ -1711,69 +1714,10 @@ function confirmCoreV7Entry(
  * Core never uses this path (V7 confirms on 5m via evaluateCoreV7Pullback).
  */
 function evaluatePullbackState(symbol: string, bar1m: BarData): void {
-  if (!config.entry.vwapPullbackEnabled) return;
-  if (tradingHalted || hasEntered(symbol)) {
-    pullbackTrackers.delete(symbol);
-    return;
-  }
-
-  const tracker = pullbackTrackers.get(symbol);
-  if (!tracker || tracker.setup !== 'VWAP_PULLBACK' || !isOrbUniverse(symbol)) return;
-
-  const session = sessionData.get(symbol);
-  const vwap = session?.vwap ?? tracker.vwapAtDetection;
-  const supportThreshold = bar1m.close * config.entry.pullbackSupportPct;
-
-  if (tracker.state === 'TRACKING_PULLBACK') {
-    if (bar1m.high > tracker.localHigh) {
-      tracker.localHigh = bar1m.high;
-    }
-
-    const ema9 = computeEMA9(symbol);
-    const distVwap = Math.abs(bar1m.close - vwap);
-    const distEma = ema9 === null ? Infinity : Math.abs(bar1m.close - ema9);
-    const distSupport = Math.min(distVwap, distEma);
-
-    if (distSupport <= supportThreshold) {
-      const sessionBars = signalBars5m.get(symbol) ?? [];
-      tracker.fibLevels = deriveFibLevelsFromBars(sessionBars, tracker.localHigh);
-      tracker.state = 'TRIGGERED';
-      tracker.prevClose = bar1m.close;
-
-      const fibProx = tracker.fibLevels
-        ? evaluateFibProximity(bar1m.close, tracker.fibLevels, config.fibonacci.proximityTolerancePct)
-        : null;
-
-      log.info(
-        `${symbol}: pullback support touched — awaiting tick up | ` +
-        `close $${bar1m.close.toFixed(2)} | VWAP $${vwap.toFixed(2)}` +
-        (ema9 !== null ? ` | EMA9 $${ema9.toFixed(2)}` : '') +
-        (fibProx ? ` | ${formatFibLog(fibProx)}` : ' | Fib N/A'),
-      );
-    }
-    return;
-  }
-
-  if (tracker.state === 'TRIGGERED') {
-    if (bar1m.close > tracker.prevClose) {
-      pullbackTrackers.delete(symbol);
-      log.info(
-        `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} tick-up — ` +
-        `tick up $${tracker.prevClose.toFixed(2)} → $${bar1m.close.toFixed(2)} → queued`,
-      );
-      queuePendingSignal({
-        symbol,
-        setup: 'VWAP_PULLBACK',
-        score: tracker.score,
-        barData: bar1m,
-        vwap,
-        avgVolume: tracker.avgVolume,
-        fibLevels: tracker.fibLevels,
-      });
-      return;
-    }
-    tracker.prevClose = bar1m.close;
-  }
+  // Retired: Hyper-Growth confirms VWAP on 5m V7 Core (evaluateCoreV7Pullback).
+  // The 1m tick-up path double-fired on V2 names and is not a second entry style.
+  void symbol;
+  void bar1m;
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,13 +1830,6 @@ async function executeSignals(
       const spyTrend = await fetchSpyTrend5m();
       const filters = feedbackEngine.getFilters();
 
-      if (setup === 'VWAP_PULLBACK' && shouldHardBanSpyBearish(spyTrend)) {
-        traderLog.warn(
-          `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} hard-banned — SPY 5m trend bearish`,
-        );
-        continue;
-      }
-
       if (
         setup === 'VWAP_PULLBACK' &&
         isVwapLagger(
@@ -1909,8 +1846,22 @@ async function executeSignals(
         continue;
       }
 
+      if (
+        setup === 'VWAP_PULLBACK' &&
+        VWAP_HYPER_GROWTH_GATES.applySpyBearishBan &&
+        shouldHardBanSpyBearish(spyTrend)
+      ) {
+        log.warn(
+          `${symbol}: ${formatSetupTag('VWAP_PULLBACK')} entry blocked — SPY 5m bearish`,
+        );
+        continue;
+      }
+
       const vwapDist = ((referencePrice - vwap) / vwap) * 100;
-      if (setup !== 'OPENING_DRIVE' && vwapDist > filters.maxVwapEntryDistancePct) {
+      const applyVwapDistanceCap =
+        setup === 'ORB' ||
+        (setup === 'VWAP_PULLBACK' && VWAP_HYPER_GROWTH_GATES.applyVwapDistanceCap);
+      if (applyVwapDistanceCap && vwapDist > filters.maxVwapEntryDistancePct) {
         log.warn(
           `${symbol}: entry blocked by FeedbackEngine — VWAP dist ` +
           `${vwapDist.toFixed(2)}% > cap ${filters.maxVwapEntryDistancePct.toFixed(2)}%`,
@@ -2277,10 +2228,13 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   const bars5m = upsertSignalBar(symbol, completed5m);
   updateSessionDataFromBars(symbol, bars5m);
 
-  if (isOrbUniverse(symbol) && isOrbWindow()) {
+  const gates = liveSetupGates(isOrbUniverse(symbol));
+  if (gates.orb && isOrbWindow()) {
     evaluateOrbSignal(symbol, completed5m);
   }
-  evaluateSignal(symbol, completed5m);
+  if (gates.vwapPullback) {
+    evaluateSignal(symbol, completed5m);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2832,8 +2786,10 @@ function schedulePreMarketReconciliation(): void {
           streamBarsOnly = true;
           log.info(
             `Hyper-Growth eligible pool ready — warmup ${symbols.length} symbol(s), ` +
-            `scanner from ${config.openingDrive.scannerStartHour}:` +
-            `${String(config.openingDrive.scannerStartMinute).padStart(2, '0')}`,
+            `scanner ${config.openingDrive.scannerStartHour}:` +
+            `${String(config.openingDrive.scannerStartMinute).padStart(2, '0')}` +
+            `–${config.openingDrive.scannerEndHour}:` +
+            `${String(config.openingDrive.scannerEndMinute).padStart(2, '0')}`,
           );
           reconnectWatchlistStream();
         } else {
@@ -2925,8 +2881,8 @@ function isOpeningScannerWindow(): boolean {
   const start =
     config.openingDrive.scannerStartHour * 60 + config.openingDrive.scannerStartMinute;
   const end =
-    config.openingDrive.windowEndHour * 60 + config.openingDrive.windowEndMinute;
-  return mins >= start && mins <= end;
+    config.openingDrive.scannerEndHour * 60 + config.openingDrive.scannerEndMinute;
+  return isScannerClockWindow(mins, start, end);
 }
 
 async function runOpeningScannerTick(): Promise<void> {

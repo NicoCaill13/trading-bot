@@ -3,23 +3,30 @@
  *
  * When the opening-extension scanner is on, this list is NOT the entry universe.
  * It is the snapshot universe the 09:31 scanner ranks by (last − open) / open.
+ *
+ * Previous close and volume come from SIP daily bars. Alpaca getSnapshots does
+ * not pass a feed query param (SDK 3.1.x), so PrevDailyBar is IEX-scale and
+ * silently drops quiet-yesterday runners (CHPT 03/09: $265k IEX vs $8.5M SIP).
+ * Snapshots are kept only for the pre-market last print.
  */
 
 import path from 'path';
 import alpaca from './alpacaClient';
 import config from './config';
 import { createLogger } from './logger';
-import { queryRequiredWatchlistTradingDay } from './marketCalendar';
+import {
+  getPreviousTradingDay,
+  queryRequiredWatchlistTradingDay,
+} from './marketCalendar';
 import { readJson, writeJsonAtomic } from './jsonStore';
 import { getDynamicUniverse } from './screener';
-import { passesDollarVolume, passesPremarketPricePair } from './screenerMath';
+import { dailyLiquidityBySymbol, fetchDailyBars, type DailyLiquidity } from './dailyBars';
+import { passesDollarVolumeBand, passesPremarketPricePair } from './screenerMath';
 import {
   extractLastPrint,
-  extractPreviousClose,
-  extractPreviousVolume,
   resolveSnapshotTicker,
 } from './snapshotFields';
-import { toErrorMessage } from './utils';
+import { nyWallTimeToUtc, toErrorMessage } from './utils';
 import { writePremarketWatchlist } from './watchlistIO';
 import type { Watchlist, WatchlistSymbol } from './types';
 
@@ -38,6 +45,19 @@ export interface EligiblePool {
   tradingDay: string;
   universeSize: number;
   symbols: EligiblePoolEntry[];
+}
+
+export interface PoolPrint {
+  symbol: string;
+  lastPrice: number;
+}
+
+export interface EligiblePoolSelectOpts {
+  minPrice: number;
+  maxPrice: number;
+  minPrevDollarVolume: number;
+  maxPrevDollarVolume: number;
+  maxSize: number;
 }
 
 function isEligiblePool(value: unknown): value is EligiblePool {
@@ -59,11 +79,71 @@ export async function writeEligiblePool(pool: EligiblePool): Promise<void> {
   await writeJsonAtomic(path.resolve(config.paths.eligiblePool), pool, { pretty: true });
 }
 
-async function scanPool(universe: string[]): Promise<EligiblePoolEntry[]> {
+/**
+ * Join pre-market last prints with SIP previous-session liquidity.
+ *
+ * Overflow past `maxSize` drops the *most* liquid names first so mega caps
+ * cannot crowd out the small names that actually move 10%.
+ */
+export function selectEligiblePoolEntries(
+  prints: readonly PoolPrint[],
+  daily: ReadonlyMap<string, DailyLiquidity>,
+  opts: EligiblePoolSelectOpts,
+): {
+  hits: EligiblePoolEntry[];
+  rejectedPrice: number;
+  rejectedLiquidity: number;
+  rejectedMissing: number;
+} {
   const hits: EligiblePoolEntry[] = [];
   let rejectedPrice = 0;
   let rejectedLiquidity = 0;
   let rejectedMissing = 0;
+
+  for (const print of prints) {
+    const liq = daily.get(print.symbol);
+    if (liq === undefined) {
+      rejectedMissing++;
+      continue;
+    }
+    if (!passesPremarketPricePair(
+      print.lastPrice,
+      liq.previousClose,
+      opts.minPrice,
+      opts.maxPrice,
+    )) {
+      rejectedPrice++;
+      continue;
+    }
+    const prevDollarVolume = liq.previousClose * liq.previousVolume;
+    if (!passesDollarVolumeBand(
+      prevDollarVolume,
+      opts.minPrevDollarVolume,
+      opts.maxPrevDollarVolume,
+    )) {
+      rejectedLiquidity++;
+      continue;
+    }
+    hits.push({
+      symbol: print.symbol,
+      previousClose: liq.previousClose,
+      lastPrice: print.lastPrice,
+      prevDollarVolume,
+    });
+  }
+
+  hits.sort((a, b) => a.prevDollarVolume - b.prevDollarVolume);
+  const capped = hits.length > opts.maxSize ? hits.slice(0, opts.maxSize) : hits;
+  return {
+    hits: capped,
+    rejectedPrice,
+    rejectedLiquidity,
+    rejectedMissing: rejectedMissing + (hits.length - capped.length),
+  };
+}
+
+async function collectPremarketPrints(universe: string[]): Promise<PoolPrint[]> {
+  const prints: PoolPrint[] = [];
 
   for (let i = 0; i < universe.length; i += SNAPSHOT_BATCH_SIZE) {
     const batch = universe.slice(i, i + SNAPSHOT_BATCH_SIZE);
@@ -73,35 +153,8 @@ async function scanPool(universe: string[]): Promise<EligiblePoolEntry[]> {
         const ticker = resolveSnapshotTicker(snap);
         if (ticker === null) continue;
         const lastPrice = extractLastPrint(snap);
-        const previousClose = extractPreviousClose(snap);
-        if (lastPrice === null || previousClose === null) {
-          rejectedMissing++;
-          continue;
-        }
-        if (!passesPremarketPricePair(
-          lastPrice,
-          previousClose,
-          config.screener.minClosePrice,
-          config.screener.maxClosePrice,
-        )) {
-          rejectedPrice++;
-          continue;
-        }
-        const prevVolume = extractPreviousVolume(snap);
-        if (!passesDollarVolume(
-          previousClose,
-          prevVolume,
-          config.premarket.poolMinPrevDollarVolume,
-        )) {
-          rejectedLiquidity++;
-          continue;
-        }
-        hits.push({
-          symbol: ticker,
-          previousClose,
-          lastPrice,
-          prevDollarVolume: previousClose * prevVolume,
-        });
+        if (lastPrice === null) continue;
+        prints.push({ symbol: ticker, lastPrice });
       }
     } catch (err) {
       log.warn(
@@ -115,19 +168,55 @@ async function scanPool(universe: string[]): Promise<EligiblePoolEntry[]> {
     }
   }
 
-  hits.sort((a, b) => b.prevDollarVolume - a.prevDollarVolume);
+  return prints;
+}
+
+function sessionUtcDay(tradingDay: string): { start: Date; cutoff: Date } {
+  const [year, month, day] = tradingDay.split('-').map(Number);
+  const estDay = new Date(year, month - 1, day);
+  return {
+    start: nyWallTimeToUtc(new Date(year, month - 1, day - 10), 0, 0),
+    cutoff: nyWallTimeToUtc(estDay, 0, 0),
+  };
+}
+
+async function scanPool(universe: string[], tradingDay: string): Promise<EligiblePoolEntry[]> {
+  const previousDay = await getPreviousTradingDay();
+  if (previousDay === null) {
+    throw new Error('[ELIGIBLE_POOL] Cannot resolve previous trading day');
+  }
+
+  const { start, cutoff } = sessionUtcDay(tradingDay);
   log.info(
-    `Pool scan: ${hits.length} eligible | rejects price=${rejectedPrice} ` +
-    `liquidity=${rejectedLiquidity} missing=${rejectedMissing}`,
+    `Fetching SIP daily bars for ${universe.length} names ` +
+    `(prev session ${previousDay})...`,
   );
-  return hits;
+  const dailyBars = await fetchDailyBars(universe, start, cutoff, config.alpaca.dataFeed);
+  const daily = dailyLiquidityBySymbol(dailyBars, cutoff.getTime());
+  log.info(`SIP daily liquidity for ${daily.size} name(s)`);
+
+  const prints = await collectPremarketPrints(universe);
+  const selected = selectEligiblePoolEntries(prints, daily, {
+    minPrice: config.screener.minClosePrice,
+    maxPrice: config.screener.maxClosePrice,
+    minPrevDollarVolume: config.premarket.poolMinPrevDollarVolume,
+    maxPrevDollarVolume: config.premarket.poolMaxPrevDollarVolume,
+    maxSize: config.premarket.poolMaxSize,
+  });
+
+  log.info(
+    `Pool scan: ${selected.hits.length} eligible | rejects price=${selected.rejectedPrice} ` +
+    `liquidity=${selected.rejectedLiquidity} missing=${selected.rejectedMissing}`,
+  );
+  return selected.hits;
 }
 
 export function toWarmupWatchlist(
   pool: EligiblePool,
   maxSymbols: number,
 ): WatchlistSymbol[] {
-  return pool.symbols.slice(0, maxSymbols).map(entry => ({
+  const ranked = [...pool.symbols].sort((a, b) => b.prevDollarVolume - a.prevDollarVolume);
+  return ranked.slice(0, maxSymbols).map(entry => ({
     symbol: entry.symbol,
     origin: 'V2_PLAYMAKER' as const,
     source: 'satellite' as const,
@@ -151,12 +240,12 @@ export async function buildEligiblePool(): Promise<{ pool: EligiblePool; warmup:
   const existing = await readEligiblePool();
   let pool = existing;
   if (pool === null || pool.tradingDay !== tradingDay || pool.symbols.length === 0) {
-    log.info('Building eligible pool from Alpaca snapshots...');
+    log.info('Building eligible pool from SIP daily bars + Alpaca snapshots...');
     const universe = await getDynamicUniverse();
     if (universe.length === 0) {
       throw new Error('[ELIGIBLE_POOL] Empty tradable universe');
     }
-    const symbols = (await scanPool(universe)).slice(0, config.premarket.poolMaxSize);
+    const symbols = await scanPool(universe, tradingDay);
     pool = {
       generatedAt: new Date().toISOString(),
       tradingDay,
@@ -164,10 +253,13 @@ export async function buildEligiblePool(): Promise<{ pool: EligiblePool; warmup:
       symbols,
     };
     await writeEligiblePool(pool);
+    const maxDv = config.premarket.poolMaxPrevDollarVolume;
     log.info(
       `Eligible pool written — ${pool.symbols.length} names ` +
       `(cap ${config.premarket.poolMaxSize}, prev $ vol ≥ ` +
-      `$${Math.round(config.premarket.poolMinPrevDollarVolume).toLocaleString()})`,
+      `$${Math.round(config.premarket.poolMinPrevDollarVolume).toLocaleString()}` +
+      (maxDv > 0 ? ` ≤ $${Math.round(maxDv).toLocaleString()}` : '') +
+      `)`,
     );
   } else {
     log.info(

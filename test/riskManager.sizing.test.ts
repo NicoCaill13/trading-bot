@@ -9,6 +9,8 @@ import {
   passesMinRiskReward,
   remainingPositionSlots,
   resolveSizingCapital,
+  computeDeployableNotional,
+  ticketEfficiencyFactor,
 } from '../src/riskSizing';
 
 describe('resolveSizingCapital', () => {
@@ -82,6 +84,33 @@ describe('capQtyByMaxNotional', () => {
     const capped = capQtyByMaxNotional(riskQty, 100, 100_000, 0.40);
     assert.equal(capped, 400);
     assert.ok(capped * 100 <= 100_000 * 0.40);
+  });
+});
+
+describe('computeDeployableNotional + ticketEfficiencyFactor', () => {
+  const capital = 200;
+  const maxPct = 0.55;
+
+  it('fills the $110 ticket at $10 and at $55', () => {
+    assert.equal(computeDeployableNotional(10, capital, maxPct), 110);
+    assert.equal(ticketEfficiencyFactor(10, capital, maxPct), 1);
+    assert.equal(computeDeployableNotional(55, capital, maxPct), 110);
+    assert.equal(ticketEfficiencyFactor(55, capital, maxPct), 1);
+  });
+
+  it('halves the ticket at $56 (1 share vs 2 at $55)', () => {
+    assert.equal(computeDeployableNotional(56, capital, maxPct), 56);
+    assert.equal(ticketEfficiencyFactor(56, capital, maxPct), 56 / 110);
+  });
+
+  it('returns 0 when the name is above the notional ceiling', () => {
+    assert.equal(computeDeployableNotional(144.85, capital, maxPct), 0);
+    assert.equal(ticketEfficiencyFactor(144.85, capital, maxPct), 0);
+  });
+
+  it('is inert on non-positive inputs', () => {
+    assert.equal(ticketEfficiencyFactor(10, 0, maxPct), 0);
+    assert.equal(computeDeployableNotional(0, capital, maxPct), 0);
   });
 });
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   computeCloseLocation,
   computeOneMinuteRvol,
+  computeOpeningDriveScore,
   computeOrbVolumeMultiple,
   computeSpreadPct,
   evaluateOpeningDrive,
@@ -396,6 +397,39 @@ describe('evaluateOpeningDrive — score', () => {
     );
 
     assert.ok(strong.score > weak.score);
+  });
+
+  it('ranks equal share-volume by dollar flow, not print count', () => {
+    const snap = computeOpeningDriveScore({
+      impulseVolume: 200_000,
+      impulseClose: 5.95,
+      edgePct: 0.04,
+      volumeConviction: 1,
+    });
+    const crcl = computeOpeningDriveScore({
+      impulseVolume: 200_000,
+      impulseClose: 94.69,
+      edgePct: 0.04,
+      volumeConviction: 1,
+    });
+    assert.ok(crcl > snap);
+    assert.ok(Math.abs(crcl / snap - 94.69 / 5.95) < 1e-9);
+  });
+
+  it('ranks equal dollar flow equally, regardless of price', () => {
+    const low = computeOpeningDriveScore({
+      impulseVolume: 200_000,
+      impulseClose: 6,
+      edgePct: 0.04,
+      volumeConviction: 1,
+    });
+    const high = computeOpeningDriveScore({
+      impulseVolume: 200_000 * (6 / 95),
+      impulseClose: 95,
+      edgePct: 0.04,
+      volumeConviction: 1,
+    });
+    assert.ok(Math.abs(low - high) < 1e-6);
   });
 });
 

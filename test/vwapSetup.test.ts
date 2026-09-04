@@ -7,9 +7,11 @@ import {
   isNearVwap,
   isVwapLagger,
   isVwapPullbackEntryWindow,
+  liveSetupGates,
   minutesSinceMidnight,
   shouldHardBanSpyBearish,
   volumesFromBars,
+  VWAP_HYPER_GROWTH_GATES,
 } from '../src/vwapSetup';
 import type { BarData } from '../src/types';
 
@@ -142,6 +144,28 @@ describe('shouldHardBanSpyBearish', () => {
     assert.equal(shouldHardBanSpyBearish('bullish'), false);
     assert.equal(shouldHardBanSpyBearish('neutral'), false);
     assert.equal(shouldHardBanSpyBearish('unknown'), false);
+  });
+});
+
+describe('liveSetupGates', () => {
+  it('arms V7 Core VWAP on the V2 / Hyper-Growth universe', () => {
+    const v2 = liveSetupGates(true);
+    assert.equal(v2.vwapPullback, true);
+    assert.equal(v2.orb, true);
+  });
+
+  it('still arms V7 Core when the name is outside the ORB subset', () => {
+    const core = liveSetupGates(false);
+    assert.equal(core.vwapPullback, true);
+    assert.equal(core.orb, false);
+  });
+});
+
+describe('VWAP_HYPER_GROWTH_GATES', () => {
+  it('does not inherit Fibonacci, SPY-bearish, or VWAP-distance Core V1 gates', () => {
+    assert.equal(VWAP_HYPER_GROWTH_GATES.skipFibonacci, true);
+    assert.equal(VWAP_HYPER_GROWTH_GATES.applySpyBearishBan, false);
+    assert.equal(VWAP_HYPER_GROWTH_GATES.applyVwapDistanceCap, false);
   });
 });
 

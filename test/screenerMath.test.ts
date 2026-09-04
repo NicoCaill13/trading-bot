@@ -12,6 +12,7 @@ import {
   passesAdrGate,
   passesClosePrice,
   passesDollarVolume,
+  passesDollarVolumeBand,
   passesOpeningExtensionGates,
   passesPremarketPricePair,
   passesPriceBand,
@@ -273,6 +274,21 @@ describe('isOpeningExtensionInBand — entry vs 09:30 open', () => {
 
   it('fails closed on a null extension', () => {
     assert.equal(isOpeningExtensionInBand(null, min, max), false);
+  });
+});
+
+describe('passesDollarVolumeBand', () => {
+  it('keeps CHPT SIP $8.5M above a $5M floor', () => {
+    assert.equal(passesDollarVolumeBand(8_463_494, 5_000_000, 0), true);
+  });
+
+  it('rejects IEX-scale $265k under the same floor', () => {
+    assert.equal(passesDollarVolumeBand(265_212, 5_000_000, 0), false);
+  });
+
+  it('rejects above an optional ceiling', () => {
+    assert.equal(passesDollarVolumeBand(1_800_000_000, 5_000_000, 800_000_000), false);
+    assert.equal(passesDollarVolumeBand(741_738_190, 5_000_000, 800_000_000), true);
   });
 });
 

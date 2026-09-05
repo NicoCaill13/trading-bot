@@ -1,6 +1,10 @@
 // Importing './env' loads the environment file — see the note in that module.
 import { parseFloatEnv, parseIntEnv, parseStringEnv, requireEnv } from './env';
 import { computeTrailLockedPct, isProfitLockingTrail, minProfitLockingTriggerPct } from './exitPredicates';
+import {
+  assertSipPoolThresholds,
+  retiredPoolEnvKeysPresent,
+} from './poolThresholds';
 
 function parseFeed(envKey: string, raw: string | undefined, fallback: 'iex' | 'sip'): 'iex' | 'sip' {
   const value = (raw ?? fallback).trim().toLowerCase();
@@ -212,18 +216,12 @@ const config = {
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
     minPreMarketShareVolume: parseIntEnv('PREMARKET_MIN_SHARE_VOLUME', 300_000),
     watchlistMaxSize: parseIntEnv('PREMARKET_WATCHLIST_MAX_SIZE', 30),
-    // Eligible-pool 09:15: SIP previous-session dollar volume. Snapshots are
-    // IEX-scale (~3% of SIP) and cannot be used as a liquidity floor.
-    // Audit 28/08–03/09: $5M keeps ~2000–2080 names in the $5–$100 band and
-    // retains CHPT on 03/09 ($8.5M). $20M drops it. A dollar-volume ceiling
-    // is a runner killer (CRCL prints $0.7–1.9B; $800M excludes it most days).
-    poolMinPrevDollarVolume: parseFloatEnv('POOL_MIN_PREV_DOLLAR_VOLUME', 5_000_000),
-    // 0 = no ceiling. Do not set one to "clip mega caps": the names that
-    // actually move 10% sit in the same liquidity band as MARA/CRCL.
-    poolMaxPrevDollarVolume: parseFloatEnv('POOL_MAX_PREV_DOLLAR_VOLUME', 0),
-    // Above the measured ~2080 pass count so the pool is an eligibility list.
-    // Overflow, if it ever happens, drops the *most* liquid names first.
-    poolMaxSize: parseIntEnv('POOL_MAX_SIZE', 4000),
+    // SIP previous-session dollar volume. Old IEX keys
+    // (POOL_MIN_PREV_DOLLAR_VOLUME / POOL_MAX_SIZE) are retired and ignored:
+    // 1.5M + cap 1500 + least-liquid overflow keeps the thinnest names.
+    poolMinPrevDollarVolume: parseFloatEnv('POOL_SIP_MIN_DOLLAR_VOLUME', 5_000_000),
+    poolMaxPrevDollarVolume: parseFloatEnv('POOL_SIP_MAX_DOLLAR_VOLUME', 0),
+    poolMaxSize: parseIntEnv('POOL_SIP_MAX_SIZE', 4000),
   },
 
   entry: {
@@ -231,7 +229,9 @@ const config = {
     minBarsForVolumeAvg: 5,
     signalBatchWindowMs: parseIntEnv('SIGNAL_BATCH_WINDOW_MS', 10000),
     tradeDuringLunch: process.env.TRADE_DURING_LUNCH === 'true',
-    vwapPullbackEnabled: process.env.VWAP_PULLBACK_ENABLED === 'true',
+    // New key. VWAP_PULLBACK_ENABLED is retired and ignored so an old
+    // `=false` on the box cannot keep Core dark after a code-only deploy.
+    vwapPullbackEnabled: process.env.VWAP_CORE_ENABLED !== 'false',
     orbFiveMinEnabled: process.env.ORB_FIVE_MIN_ENABLED === 'true',
     orbWindowBars: parseIntEnv('ORB_WINDOW_BARS', 1),
     // V7 Core VWAP pullback: green 5m confirmation RVOL (was 1.2 legacy).
@@ -783,14 +783,9 @@ const config = {
       `[SYSTEM] PREMARKET_WATCHLIST_MAX_SIZE must be >= 1: ${pm.watchlistMaxSize}`,
     );
   }
-  if (pm.poolMinPrevDollarVolume <= 0) {
-    throw new Error(
-      `[SYSTEM] POOL_MIN_PREV_DOLLAR_VOLUME must be > 0: ${pm.poolMinPrevDollarVolume}`,
-    );
-  }
   if (pm.poolMaxPrevDollarVolume < 0) {
     throw new Error(
-      `[SYSTEM] POOL_MAX_PREV_DOLLAR_VOLUME must be >= 0: ${pm.poolMaxPrevDollarVolume}`,
+      `[SYSTEM] POOL_SIP_MAX_DOLLAR_VOLUME must be >= 0: ${pm.poolMaxPrevDollarVolume}`,
     );
   }
   if (
@@ -798,12 +793,17 @@ const config = {
     pm.poolMaxPrevDollarVolume <= pm.poolMinPrevDollarVolume
   ) {
     throw new Error(
-      `[SYSTEM] POOL_MAX_PREV_DOLLAR_VOLUME must exceed POOL_MIN_PREV_DOLLAR_VOLUME: ` +
+      `[SYSTEM] POOL_SIP_MAX_DOLLAR_VOLUME must exceed POOL_SIP_MIN_DOLLAR_VOLUME: ` +
       `${pm.poolMaxPrevDollarVolume} <= ${pm.poolMinPrevDollarVolume}`,
     );
   }
-  if (pm.poolMaxSize < 1) {
-    throw new Error(`[SYSTEM] POOL_MAX_SIZE must be >= 1: ${pm.poolMaxSize}`);
+  assertSipPoolThresholds(pm.poolMinPrevDollarVolume, pm.poolMaxSize);
+
+  const retired = retiredPoolEnvKeysPresent();
+  if (retired.length > 0) {
+    console.warn(
+      `[SYSTEM] Retired env keys ignored (SIP defaults apply): ${retired.join(', ')}`,
+    );
   }
 
   const sess = config.session;

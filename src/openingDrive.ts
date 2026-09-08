@@ -138,6 +138,30 @@ export const SCANNER_HOLD_GATES: Pick<
 };
 
 /**
+ * Textbook ORB on the live scanner: buy the first-minute high with volume
+ * and impulse body. No hold band, no anti-chase of the running high — the
+ * break is the high. Band cap stays in the caller (anti-vertical wick).
+ */
+export const ORB_SCANNER_GATES: Pick<
+  OpeningDriveOptions,
+  | 'requireScannerMember'
+  | 'requireBreakout'
+  | 'rejectAtOrHigh'
+  | 'requireAboveVwap'
+  | 'requireMomentum'
+  | 'requireImpulseBody'
+  | 'requireTape'
+> = {
+  requireScannerMember: true,
+  requireBreakout: true,
+  rejectAtOrHigh: false,
+  requireAboveVwap: true,
+  requireMomentum: true,
+  requireImpulseBody: true,
+  requireTape: true,
+};
+
+/**
  * Ranking score in dollars of tape, not share count. Equal dollar flow at $6
  * and $95 must rank equal before ticket-efficiency is applied at enqueue.
  */

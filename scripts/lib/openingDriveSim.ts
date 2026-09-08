@@ -96,6 +96,7 @@ export function findSignal(
   rthBars: readonly BarData[],
   previousClose: number | null,
   odOptions: OpeningDriveOptions,
+  inScannerAt?: (minutesSinceMidnight: number) => boolean,
 ): SignalCandidate | null {
   if (rthBars.length === 0) return null;
 
@@ -123,7 +124,7 @@ export function findSignal(
       ask: null,
       tapeDelta: null,
       imbalance: null,
-      inScanner: true,
+      inScanner: inScannerAt === undefined ? true : inScannerAt(minutes),
       sessionHigh: history.reduce((h, b) => Math.max(h, b.high), 0),
     };
 

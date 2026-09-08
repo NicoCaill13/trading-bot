@@ -20,6 +20,7 @@
  *
  * Run: npx tsx scripts/backtestOpeningDrive.ts [sessions|YYYY-MM-DD] [feed]
  *      npx tsx scripts/backtestOpeningDrive.ts 2026-09-03 sip --compare-score
+ *      npx tsx scripts/backtestOpeningDrive.ts 20 sip --orb
  */
 
 import config from '../src/config';
@@ -36,9 +37,14 @@ import {
   ticketEfficiencyFactor,
 } from '../src/riskSizing';
 import { nyWallTimeToUtc } from '../src/utils';
-import { SCANNER_HOLD_GATES } from '../src/openingDrive';
-import { fetchBars, fetchRecentSessions, type Feed } from './lib/barFetch';
+import { ORB_SCANNER_GATES, SCANNER_HOLD_GATES } from '../src/openingDrive';
+import { fetchBars, fetchRecentSessions, type Feed, type RawBar } from './lib/barFetch';
 import { buildSessionFunnel, type Candidate } from './lib/premarketFunnel';
+import {
+  buildEligiblePool,
+  buildScannerMembership,
+  lastDailyBefore,
+} from './lib/scannerReplay';
 import {
   findSignal,
   simulateTrade,
@@ -54,8 +60,11 @@ const DATE_ARG = process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a));
 const COUNT_ARG = process.argv.find(a => /^\d+$/.test(a));
 const FEED_ARG = process.argv.find(a => a === 'iex' || a === 'sip');
 const COMPARE_SCORE = process.argv.includes('--compare-score');
+const STYLE_ORB = process.argv.includes('--orb');
+const LIVE_SCANNER = process.argv.includes('--live-scanner') || STYLE_ORB;
 const SESSIONS = DATE_ARG ? 1 : Number(COUNT_ARG ?? 10);
 const FEED = (FEED_ARG ?? config.alpaca.dataFeed) as Feed;
+const PREV_CLOSE_LOOKBACK_DAYS = 8;
 
 /** One-way cost in basis points. Micro-caps at $1-15 routinely sit above 50. */
 const SPREAD_SCENARIOS_BPS = [0, 25, 50, 100] as const;
@@ -77,13 +86,19 @@ const OD_OPTIONS: OpeningDriveOptions = {
   maxSpreadPct: config.openingDrive.maxSpreadPct,
   minTapeDelta: config.openingDrive.minTapeDelta,
   hardStopFloorPct: config.risk.hardStopFloorPct,
-  ...(config.openingDrive.scannerEnabled
+  ...(STYLE_ORB
     ? {
-        ...SCANNER_HOLD_GATES,
-        minOpenExtensionPct: config.openingDrive.minOpenExtensionPct,
+        ...ORB_SCANNER_GATES,
+        minOpenExtensionPct: 0,
         maxOpenExtensionPct: config.openingDrive.maxOpenExtensionPct,
       }
-    : {}),
+    : config.openingDrive.scannerEnabled
+      ? {
+          ...SCANNER_HOLD_GATES,
+          minOpenExtensionPct: config.openingDrive.minOpenExtensionPct,
+          maxOpenExtensionPct: config.openingDrive.maxOpenExtensionPct,
+        }
+      : {}),
 };
 
 /** Armed Opening Drive names from the 2026-09-03 live session (shadow journal). */
@@ -100,6 +115,11 @@ interface SessionData {
   watchlist: Candidate[];
   /** RTH 1-min bars per symbol, ascending, starting at the session open. */
   bars: Map<string, BarData[]>;
+  /**
+   * Live scanner membership at a given minute since NY midnight.
+   * Absent on the pre-market funnel path (every watchlist name is in-scanner).
+   */
+  inScannerAt?: (symbol: string, minutesSinceMidnight: number) => boolean;
 }
 
 interface SessionResult {
@@ -164,6 +184,93 @@ async function loadSession(
 }
 
 /**
+ * Universe = live opening-extension ranker (top N at each minute), not the
+ * pre-market $vol list. Membership is evaluated at the signal bar's minute.
+ */
+async function loadSessionFromScanner(
+  universe: readonly string[],
+  session: string,
+  dailyBars: ReadonlyMap<string, readonly RawBar[]>,
+): Promise<SessionData> {
+  const [year, month, day] = session.split('-').map(Number);
+  const estDay = new Date(year, month - 1, day);
+  const rthStart = nyWallTimeToUtc(estDay, 9, 30);
+  const windowEnd = new Date(
+    nyWallTimeToUtc(
+      estDay,
+      config.openingDrive.windowEndHour,
+      config.openingDrive.windowEndMinute,
+    ).getTime() + 60_000,
+  );
+  const rthEnd = nyWallTimeToUtc(estDay, 16, 0);
+  const marketOpenMinutes =
+    config.session.marketOpenHour * 60 + config.session.marketOpenMinute;
+  const scannerStart =
+    config.openingDrive.scannerStartHour * 60 + config.openingDrive.scannerStartMinute;
+  const windowEndMinutes =
+    config.openingDrive.windowEndHour * 60 + config.openingDrive.windowEndMinute;
+
+  const pool = buildEligiblePool(universe, dailyBars, rthStart.getTime(), {
+    minPrice: config.screener.minClosePrice,
+    maxPrice: config.screener.maxClosePrice,
+    minPrevDollarVolume: config.premarket.poolMinPrevDollarVolume,
+    maxSize: config.premarket.poolMaxSize,
+  });
+  if (pool.length === 0) {
+    return { session, watchlist: [], bars: new Map() };
+  }
+
+  const poolSymbols = pool.map(p => p.symbol);
+  const prevClose = new Map(pool.map(p => [p.symbol, p.previousClose]));
+  const openWindow = await fetchBars(poolSymbols, '1Min', rthStart, windowEnd, FEED);
+  const membership = buildScannerMembership(
+    poolSymbols,
+    openWindow,
+    prevClose,
+    scannerStart,
+    windowEndMinutes,
+    marketOpenMinutes,
+  );
+
+  if (membership.union.length === 0) {
+    console.log(`    ${session} scanner union empty (pool ${pool.length})`);
+    return { session, watchlist: [], bars: new Map() };
+  }
+
+  const raw = await fetchBars(membership.union, '1Min', rthStart, rthEnd, FEED);
+  const bars = new Map<string, BarData[]>();
+  const watchlist: Candidate[] = [];
+
+  for (const symbol of membership.union) {
+    const previousClose = prevClose.get(symbol);
+    if (previousClose === undefined) continue;
+    const rth = (raw.get(symbol) ?? [])
+      .filter(b => Date.parse(b.t) >= rthStart.getTime())
+      .sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
+      .map(toBarData);
+    if (rth.length === 0) continue;
+    bars.set(symbol, rth);
+    watchlist.push({
+      symbol,
+      gapPct: 0,
+      premarketVolume: 0,
+      premarketPrice: rth[0].open,
+      previousClose,
+    });
+  }
+
+  const inScannerAt = (symbol: string, minutesSinceMidnight: number): boolean =>
+    membership.atMinute.get(minutesSinceMidnight)?.has(symbol) === true;
+
+  console.log(
+    `    ${session} pool ${pool.length} → scanner union ${membership.union.length} ` +
+    `(bars ${bars.size})`,
+  );
+
+  return { session, watchlist, bars, inScannerAt };
+}
+
+/**
  * Replays one session. Live ranking is by PendingSignal.score (dollar flow ×
  * ticket efficiency). `--compare-score` also reports the legacy share-count
  * ranking so a formula change can be judged on a known session.
@@ -203,6 +310,9 @@ function runSession(
       bars,
       candidate.previousClose,
       OD_OPTIONS,
+      data.inScannerAt === undefined
+        ? undefined
+        : minutes => data.inScannerAt!(candidate.symbol, minutes),
     );
     if (!signal) continue;
 
@@ -483,7 +593,15 @@ function simulateAllSignals(
   for (const candidate of data.watchlist) {
     const bars = data.bars.get(candidate.symbol);
     if (!bars || bars.length === 0) continue;
-    const signal = findSignal(candidate.symbol, bars, candidate.previousClose, OD_OPTIONS);
+    const signal = findSignal(
+      candidate.symbol,
+      bars,
+      candidate.previousClose,
+      OD_OPTIONS,
+      data.inScannerAt === undefined
+        ? undefined
+        : minutes => data.inScannerAt!(candidate.symbol, minutes),
+    );
     if (!signal || signal.score === undefined) continue;
 
     const close = signal.signalClose;
@@ -596,9 +714,15 @@ async function main(): Promise<void> {
 
   console.log(
     `\nOpening Drive expectancy — ${FEED.toUpperCase()} feed, ${sessionDates.length} sessions\n` +
+    `  style     ${STYLE_ORB ? 'ORB textbook (break 09:30 high)' : 'scanner hold'}\n` +
+    `  universe  ${LIVE_SCANNER
+      ? `LIVE scanner ext >= ${pct(config.openingDrive.scannerMinExtensionPct)} | ` +
+      `RTH $vol >= $${config.openingDrive.scannerMinRthDollarVolume} | ` +
+      `top ${config.openingDrive.scannerMaxSymbols} / min`
+      : `PM funnel gap >= ${pct(config.premarket.minGapUpPct)} | ` +
+      `pm volume >= ${(config.premarket.minPreMarketShareVolume / 1e6).toFixed(1)}M`}\n` +
     `  screener  price $${config.screener.minClosePrice}-$${config.screener.maxClosePrice} | ` +
-    `gap >= ${pct(config.premarket.minGapUpPct)} | ` +
-    `pm volume >= ${(config.premarket.minPreMarketShareVolume / 1e6).toFixed(1)}M\n` +
+    `prev $vol >= $${config.premarket.poolMinPrevDollarVolume}\n` +
     `  entry     window ${OD_OPTIONS.windowStartMinutes / 60 | 0}:` +
     `${String(OD_OPTIONS.windowStartMinutes % 60).padStart(2, '0')}-` +
     `${OD_OPTIONS.windowEndMinutes / 60 | 0}:` +
@@ -612,13 +736,30 @@ async function main(): Promise<void> {
     `time stop ${config.risk.timeStopMinutes}min | max ${config.risk.maxPositions} pos`,
   );
 
+  let dailyBars: Map<string, RawBar[]> | null = null;
+  if (LIVE_SCANNER && !COMPARE_SCORE) {
+    const first = sessionDates[0];
+    const last = sessionDates[sessionDates.length - 1];
+    const [fy, fm, fd] = first.split('-').map(Number);
+    const [ly, lm, ld] = last.split('-').map(Number);
+    const dailyStart = new Date(
+      nyWallTimeToUtc(new Date(fy, fm - 1, fd), 4, 0).getTime()
+      - PREV_CLOSE_LOOKBACK_DAYS * 86_400_000,
+    );
+    const dailyEnd = nyWallTimeToUtc(new Date(ly, lm - 1, ld), 9, 30);
+    console.log(`  fetching 1Day ${FEED} for ${universe.length} symbols...`);
+    dailyBars = await fetchBars(universe, '1Day', dailyStart, dailyEnd, FEED);
+  }
+
   const loaded: SessionData[] = [];
   for (const session of sessionDates) {
     try {
       const compareSymbols = COMPARE_SCORE ? SESSION_COMPARE_SYMBOLS[session] : undefined;
       const data = compareSymbols
         ? await loadSessionForSymbols(session, compareSymbols)
-        : await loadSession(universe, session);
+        : LIVE_SCANNER && dailyBars !== null
+          ? await loadSessionFromScanner(universe, session, dailyBars)
+          : await loadSession(universe, session);
       loaded.push(data);
       console.log(
         `  ${session} watchlist ${data.watchlist.length}, bars for ${data.bars.size} symbol(s)`,

@@ -9,6 +9,7 @@ import {
   evaluateOpeningDrive,
   isChasingOpeningRangeHigh,
   isOpeningDriveFunnelRejection,
+  ORB_SCANNER_GATES,
   SCANNER_HOLD_GATES,
   type OpeningDriveContext,
   type OpeningDriveOptions,
@@ -683,5 +684,65 @@ describe('evaluateOpeningDrive — scanner hold (anti-FOMO)', () => {
       HOLD_OPTS,
     );
     assert.equal(decision.rejection, 'chasing_open_high');
+  });
+});
+
+const ORB_OPTS: OpeningDriveOptions = {
+  ...OPTS,
+  windowEndMinutes: 10 * 60,
+  ...ORB_SCANNER_GATES,
+  minOpenExtensionPct: 0,
+  maxOpenExtensionPct: 0.055,
+};
+
+describe('evaluateOpeningDrive — ORB on scanner', () => {
+  it('refuses the hold-in-band print that scanner-hold would arm (no break of 09:30 high)', () => {
+    const decision = evaluateOpeningDrive(holdContext(), ORB_OPTS);
+    assert.equal(decision.rejection, 'no_breakout');
+    assert.equal(decision.armed, false);
+  });
+
+  it('arms a first-minute break with volume, body, and last still inside the 5.5% cap', () => {
+    const range = bar(50.00, 80_000, 49.50, 50.80, '2026-08-18T13:30:00Z');
+    const impulse = bar(51.20, 200_000, 50.70, 51.25);
+    const decision = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 50,
+        sessionVwap: 50.40,
+        impulseBar: impulse,
+        oneMinBars: [
+          ...Array.from({ length: 18 }, () => bar(49.5, 10_000, 49.4, 49.6, '2026-08-18T12:00:00Z')),
+          range,
+          impulse,
+        ],
+        inScanner: true,
+      }),
+      ORB_OPTS,
+    );
+    assert.equal(decision.armed, true);
+    assert.equal(decision.rejection, null);
+  });
+
+  it('refuses a warmup name that is not in the scanner ranking', () => {
+    const range = bar(50.00, 80_000, 49.50, 50.80, '2026-08-18T13:30:00Z');
+    const impulse = bar(51.20, 200_000, 50.70, 51.25);
+    const decision = evaluateOpeningDrive(
+      context({
+        rangeBar: range,
+        sessionOpen: 50,
+        sessionVwap: 50.40,
+        impulseBar: impulse,
+        oneMinBars: [
+          ...Array.from({ length: 18 }, () => bar(49.5, 10_000, 49.4, 49.6, '2026-08-18T12:00:00Z')),
+          range,
+          impulse,
+        ],
+        inScanner: false,
+      }),
+      ORB_OPTS,
+    );
+    assert.equal(decision.rejection, 'not_in_scanner');
+    assert.equal(decision.armed, false);
   });
 });

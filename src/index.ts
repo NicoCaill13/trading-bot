@@ -3113,6 +3113,16 @@ async function runOpeningScannerTick(): Promise<void> {
         maxSymbols: config.openingDrive.scannerMaxSymbols,
         pinned,
       });
+  // An empty rank must not unsubscribe the socket. Gap Hold often prints 0
+  // names; swapping to [] left ws authenticated with no bars and paged
+  // MARKET_DATA_STALE for ~30 min this morning.
+  if (movers.length === 0) {
+    log.info(
+      `${gh.enabled ? 'Gap Hold' : 'Opening'} scanner — 0 movers, keep current universe ` +
+      `(${monitoredSymbols.length} symbol(s))`,
+    );
+    return;
+  }
   scannerMoverSymbols.clear();
   gapHoldTracks.clear();
   for (const mover of movers) {

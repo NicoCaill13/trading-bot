@@ -18,6 +18,10 @@ function parseInstant(value: string | null): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
+/** IEX 1-min bars fire on prints. A 1–2 name Gap Hold tape routinely goes 3–4 min silent. */
+const THIN_UNIVERSE_SYMBOLS = 5;
+const THIN_UNIVERSE_STALE_MS = 600_000;
+
 function evaluateMarketDataFreshness(
   snapshot: HeartbeatSnapshot,
   nowMs: number,
@@ -32,11 +36,18 @@ function evaluateMarketDataFreshness(
 
   if (!isLiveSession) return null;
 
-  // Grace period: right after the open, or right after a reconnect, no bar has
-  // legitimately arrived yet. Only complain once the phase itself is old enough.
+  const staleLimitMs = snapshot.monitoredSymbols < THIN_UNIVERSE_SYMBOLS
+    ? Math.max(thresholds.marketDataStaleMs, THIN_UNIVERSE_STALE_MS)
+    : thresholds.marketDataStaleMs;
+
+  // Grace: phase change (open / reconnect) OR a universe swap that just added
+  // the first name after an empty Gap Hold scan. sessionPhaseSince stays at
+  // 09:30; watchlistGeneratedAt is the clock that actually moved.
   const phaseSinceMs = parseInstant(snapshot.sessionPhaseSince);
-  if (phaseSinceMs === null) return null;
-  if (nowMs - phaseSinceMs <= thresholds.marketDataStaleMs) return null;
+  const universeSinceMs = parseInstant(snapshot.watchlistGeneratedAt);
+  const graceSinceMs = Math.max(phaseSinceMs ?? 0, universeSinceMs ?? 0);
+  if (graceSinceMs <= 0) return null;
+  if (nowMs - graceSinceMs <= staleLimitMs) return null;
 
   const lastBarMs = parseInstant(snapshot.lastBarAt);
   if (lastBarMs === null) {
@@ -44,17 +55,17 @@ function evaluateMarketDataFreshness(
       code: 'MARKET_DATA_STALE',
       message:
         `No bar received since the session opened ` +
-        `(${ageSeconds(nowMs, phaseSinceMs)}s), ws=${snapshot.wsState}`,
+        `(${ageSeconds(nowMs, graceSinceMs)}s), ws=${snapshot.wsState}`,
     };
   }
 
   const staleMs = nowMs - lastBarMs;
-  if (staleMs > thresholds.marketDataStaleMs) {
+  if (staleMs > staleLimitMs) {
     return {
       code: 'MARKET_DATA_STALE',
       message:
         `Last bar ${ageSeconds(nowMs, lastBarMs)}s ago ` +
-        `(limit ${Math.round(thresholds.marketDataStaleMs / 1000)}s), ws=${snapshot.wsState}`,
+        `(limit ${Math.round(staleLimitMs / 1000)}s), ws=${snapshot.wsState}`,
     };
   }
 

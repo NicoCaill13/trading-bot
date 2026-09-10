@@ -113,6 +113,35 @@ describe('evaluateHeartbeat — market data freshness', () => {
     assert.deepEqual(evaluateHeartbeat(snapshot, now, THRESHOLDS), []);
   });
 
+  it('does not page a 1–2 name IEX tape at the 180s bar gap', () => {
+    const now = estInstant(11, 0);
+    const snapshot = buildSnapshot(now, {
+      monitoredSymbols: 2,
+      lastBarAt: new Date(now.getTime() - 204_000).toISOString(),
+    });
+    assert.deepEqual(evaluateHeartbeat(snapshot, now, THRESHOLDS), []);
+  });
+
+  it('still pages a thin tape after 10 minutes without a bar', () => {
+    const now = estInstant(11, 0);
+    const snapshot = buildSnapshot(now, {
+      monitoredSymbols: 2,
+      lastBarAt: new Date(now.getTime() - 601_000).toISOString(),
+    });
+    assert.deepEqual(codes(evaluateHeartbeat(snapshot, now, THRESHOLDS)), ['MARKET_DATA_STALE']);
+  });
+
+  it('grants grace from a fresh universe swap, not the 09:30 phase clock', () => {
+    const now = estInstant(10, 30);
+    const snapshot = buildSnapshot(now, {
+      sessionPhaseSince: new Date(now.getTime() - 90 * 60_000).toISOString(),
+      watchlistGeneratedAt: new Date(now.getTime() - 60_000).toISOString(),
+      lastBarAt: null,
+      monitoredSymbols: 1,
+    });
+    assert.deepEqual(evaluateHeartbeat(snapshot, now, THRESHOLDS), []);
+  });
+
   it('stays silent once trading is halted', () => {
     const now = estInstant(11, 0);
     const snapshot = buildSnapshot(now, {

@@ -36,6 +36,26 @@ export function extractPreviousVolume(snap: AlpacaSnapshot): number {
   return vol !== undefined && vol > 0 ? vol : 0;
 }
 
+function positiveBarField(value: number | undefined): number | null {
+  return value !== undefined && value > 0 ? value : null;
+}
+
+export function extractPreviousOpen(snap: AlpacaSnapshot): number | null {
+  return positiveBarField(snap.PrevDailyBar?.OpenPrice);
+}
+
+export function extractPreviousHigh(snap: AlpacaSnapshot): number | null {
+  return positiveBarField(snap.PrevDailyBar?.HighPrice);
+}
+
+export function extractPreviousLow(snap: AlpacaSnapshot): number | null {
+  return positiveBarField(snap.PrevDailyBar?.LowPrice);
+}
+
+export function extractSessionLow(snap: AlpacaSnapshot): number | null {
+  return positiveBarField(snap.DailyBar?.LowPrice);
+}
+
 export function extractSessionOpen(snap: AlpacaSnapshot): number | null {
   const open = snap.DailyBar?.OpenPrice;
   if (open !== undefined && open > 0) return open;

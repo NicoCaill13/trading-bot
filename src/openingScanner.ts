@@ -7,20 +7,27 @@
 import type { AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 import {
   compareOpeningExtensionRank,
+  computeCloseLocationPct,
+  computeDailyReturnPct,
   computeOpeningExtensionPct,
+  computeOvernightGapPct,
   passesOpeningExtensionGates,
 } from './screenerMath';
 import {
   extractLastPrint,
   extractPreviousClose,
+  extractPreviousHigh,
+  extractPreviousLow,
+  extractPreviousOpen,
+  extractSessionLow,
   extractSessionOpen,
   extractSessionVolume,
   resolveSnapshotTicker,
 } from './snapshotFields';
+import type { EligiblePoolEntry } from './eligiblePool';
+import type { GapHoldTrack, WatchlistSymbol } from './types';
 import { toErrorMessage } from './utils';
 import { createLogger } from './logger';
-import type { EligiblePoolEntry } from './eligiblePool';
-import type { WatchlistSymbol } from './types';
 
 const log = createLogger('OPENING_SCANNER');
 const SNAPSHOT_BATCH_SIZE = 100;
@@ -45,6 +52,13 @@ export interface OpeningMover {
   previousClose: number;
   rthDollarVolume: number;
   extensionPct: number;
+  overnightGapPct: number | null;
+  yesterdayReturnPct: number | null;
+  yesterdayCloseLocation: number | null;
+  previousHigh: number | null;
+  previousOpen: number | null;
+  sessionLow: number | null;
+  track?: GapHoldTrack;
 }
 
 export interface OpeningScannerOpts {
@@ -67,6 +81,9 @@ export function snapshotToOpeningMover(snap: AlpacaSnapshot): OpeningMover | nul
   const extensionPct = computeOpeningExtensionPct(last, sessionOpen);
   if (extensionPct === null) return null;
   const sessionVolume = extractSessionVolume(snap);
+  const previousOpen = extractPreviousOpen(snap);
+  const previousHigh = extractPreviousHigh(snap);
+  const previousLow = extractPreviousLow(snap);
   return {
     symbol,
     last,
@@ -74,6 +91,16 @@ export function snapshotToOpeningMover(snap: AlpacaSnapshot): OpeningMover | nul
     previousClose,
     rthDollarVolume: last * sessionVolume,
     extensionPct,
+    overnightGapPct: computeOvernightGapPct(sessionOpen, previousClose),
+    yesterdayReturnPct:
+      previousOpen !== null ? computeDailyReturnPct(previousOpen, previousClose) : null,
+    yesterdayCloseLocation:
+      previousHigh !== null && previousLow !== null
+        ? computeCloseLocationPct(previousHigh, previousLow, previousClose)
+        : null,
+    previousHigh,
+    previousOpen,
+    sessionLow: extractSessionLow(snap),
   };
 }
 
@@ -131,6 +158,12 @@ export function rankOpeningMovers(
       previousClose: 0,
       rthDollarVolume: 0,
       extensionPct: 0,
+      overnightGapPct: null,
+      yesterdayReturnPct: null,
+      yesterdayCloseLocation: null,
+      previousHigh: null,
+      previousOpen: null,
+      sessionLow: null,
     });
     seen.add(symbol);
   }
@@ -154,10 +187,9 @@ export function moversToWatchlist(movers: readonly OpeningMover[]): WatchlistSym
   }));
 }
 
-export async function scanSessionExtension(
+export async function collectSnapshotMovers(
   pool: readonly EligiblePoolEntry[],
   client: SnapshotClient,
-  opts: OpeningScannerOpts,
 ): Promise<OpeningMover[]> {
   const hits: OpeningMover[] = [];
   const symbols = pool.map(e => e.symbol);
@@ -182,6 +214,15 @@ export async function scanSessionExtension(
     }
   }
 
+  return hits;
+}
+
+export async function scanSessionExtension(
+  pool: readonly EligiblePoolEntry[],
+  client: SnapshotClient,
+  opts: OpeningScannerOpts,
+): Promise<OpeningMover[]> {
+  const hits = await collectSnapshotMovers(pool, client);
   const selected = rankOpeningMovers(hits, opts);
   log.info(
     `Scan ${hits.length} prints → ${selected.length} movers ` +

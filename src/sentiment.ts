@@ -41,6 +41,12 @@ const BULLISH_TERMS = [
   'initiates buy',
   'price target raised',
   'strong buy',
+  'earnings beat',
+  'lifts annual',
+  'lifts forecast',
+  'raises full-year',
+  'positive data',
+  'trial results',
 ] as const;
 
 const BEARISH_TERMS = [
@@ -69,6 +75,10 @@ const BEARISH_TERMS = [
   'sell rating',
   'sec charges',
   'delisting',
+  'adverse event',
+  'adverse events',
+  'clinical hold',
+  'trial halt',
 ] as const;
 
 export interface HeadlineSentiment {
@@ -162,6 +172,31 @@ export function assessBullishCatalyst(
     catalystHeadline: headlines[0]?.headline ?? null,
     headlineCount: headlines.length,
   };
+}
+
+/**
+ * Gap-hold news track: at least one bullish headline, and no bearish one.
+ * Mixed tape (TYRA: data then adverse events) fails closed.
+ */
+export function assessStrictBullishCatalyst(
+  headlines: readonly NewsHeadline[],
+): CatalystAssessment {
+  const base = assessBullishCatalyst(headlines);
+  if (!base.passes) return base;
+
+  for (const h of headlines) {
+    if (classifyHeadline(h.headline).sentiment === 'BEARISH') {
+      return {
+        passes: false,
+        sentiment: 'BEARISH',
+        catalystScore: 0,
+        catalystHeadline: h.headline,
+        headlineCount: headlines.length,
+      };
+    }
+  }
+
+  return base;
 }
 
 export function isSentimentFilterActive(): boolean {

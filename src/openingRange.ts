@@ -52,3 +52,16 @@ export function computeSessionImpulseHigh(
   }
   return high > 0 ? high : null;
 }
+
+/** Running RTH low from the 09:30 bar onward (inclusive). */
+export function computeSessionImpulseLow(
+  bars: readonly BarData[],
+  rangeBar: BarData,
+): number | null {
+  let low = rangeBar.low > 0 ? rangeBar.low : Number.POSITIVE_INFINITY;
+  for (const bar of bars) {
+    if (bar.timestamp < rangeBar.timestamp) continue;
+    if (bar.low > 0 && bar.low < low) low = bar.low;
+  }
+  return Number.isFinite(low) ? low : null;
+}

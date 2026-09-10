@@ -46,13 +46,14 @@ export interface ShadowSignalInput {
   straightRunScore: number;
   rejectedBy: OpeningDriveRejection | null;
   horizonMinutes: number;
+  strategy?: ShadowSignalRecord['strategy'];
 }
 
 export function createShadowRecord(input: ShadowSignalInput): ShadowSignalRecord {
   const { decision } = input;
   return {
     symbol: input.symbol,
-    strategy: 'opening_drive',
+    strategy: input.strategy ?? 'opening_drive',
     tradingDay: estCalendarDayKey(toESTDate(new Date(input.signalAt))),
     signalAt: input.signalAt,
     rejectedBy: input.rejectedBy,

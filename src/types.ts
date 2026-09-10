@@ -2,13 +2,25 @@
 export type SignalTier = 'core' | 'satellite';
 
 /** Intraday playbook that produced a signal or fill (#31). */
-export type SetupKind = 'VWAP_PULLBACK' | 'ORB' | 'OPENING_DRIVE';
+export type SetupKind = 'VWAP_PULLBACK' | 'ORB' | 'OPENING_DRIVE' | 'GAP_HOLD';
 
-const SETUP_KINDS: readonly SetupKind[] = ['VWAP_PULLBACK', 'ORB', 'OPENING_DRIVE'];
+const SETUP_KINDS: readonly SetupKind[] = [
+  'VWAP_PULLBACK',
+  'ORB',
+  'OPENING_DRIVE',
+  'GAP_HOLD',
+];
 
 export function isSetupKind(value: unknown): value is SetupKind {
   return typeof value === 'string' && (SETUP_KINDS as readonly string[]).includes(value);
 }
+
+/** Opening Drive and Gap Hold may enter from the regular open, not the Core window. */
+export function isMorningMomentumSetup(setup: SetupKind): boolean {
+  return setup === 'OPENING_DRIVE' || setup === 'GAP_HOLD';
+}
+
+export type GapHoldTrack = 'news_gap' | 'continuation';
 
 export function formatSetupTag(setup: SetupKind): string {
   return `[${setup}]`;
@@ -236,6 +248,30 @@ export type OpeningDriveRejection =
   | 'wide_spread'
   | 'max_extension';
 
+export type GapHoldRejection =
+  | 'outside_window'
+  | 'insufficient_data'
+  | 'not_in_scanner'
+  | 'no_catalyst'
+  | 'gap_out_of_band'
+  | 'gap_filled'
+  | 'open_broken'
+  | 'below_vwap'
+  | 'wide_spread'
+  | 'no_breakout';
+
+export interface GapHoldDecision {
+  armed: boolean;
+  rejection: GapHoldRejection | null;
+  track: GapHoldTrack | null;
+  overnightGapPct: number | null;
+  extensionPct: number | null;
+  spreadPct: number | null;
+  entryPrice: number | null;
+  stopPrice: number | null;
+  score: number;
+}
+
 export interface OpeningDriveDecision {
   armed: boolean;
   rejection: OpeningDriveRejection | null;
@@ -270,7 +306,7 @@ export interface OpeningDriveDecision {
  */
 export interface ShadowSignalRecord {
   symbol: string;
-  strategy: 'opening_drive';
+  strategy: 'opening_drive' | 'gap_hold';
   /** NY trading day, so records stay groupable without re-deriving timezones. */
   tradingDay: string;
   signalAt: string;
@@ -325,6 +361,8 @@ export interface WatchlistSymbol {
   lastOpen?: number;
   /** Previous session close — Opening Drive gap-down gate (V2). */
   previousClose?: number;
+  /** Previous session high — Gap Hold continuation breakout. */
+  previousHigh?: number;
   preMarketGapPct?: number;
   catalystScore?: number;
   /** Lexicon sentiment of the strongest recent catalyst headline. */

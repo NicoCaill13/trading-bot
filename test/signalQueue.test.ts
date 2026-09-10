@@ -63,8 +63,8 @@ describe('signalQueue — unified score order', () => {
 describe('parseEnteredSetup', () => {
   it('maps a fill-stamped setup through', () => {
     assert.equal(
-      parseEnteredSetup({ symbol: 'AAPL', setup: 'OPENING_DRIVE' }),
-      'OPENING_DRIVE',
+      parseEnteredSetup({ symbol: 'CHPT', setup: 'GAP_HOLD' }),
+      'GAP_HOLD',
     );
   });
 

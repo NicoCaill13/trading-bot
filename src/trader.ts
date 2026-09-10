@@ -14,6 +14,7 @@ import {
 } from './notificationManager';
 import type { AlpacaOrder, AlpacaOrderParams, AlpacaPosition, AlpacaSnapshot } from '@alpacahq/alpaca-trade-api';
 import type { BarData, SetupKind } from './types';
+import { isMorningMomentumSetup } from './types';
 
 const log = createLogger('TRADER');
 
@@ -445,8 +446,8 @@ function computeMarketableLimitPrice(askPrice: number): number {
 
 /**
  * Bracket order on entry: aggressive marketable limit + stop-loss + take-profit (R:R).
- * VWAP_PULLBACK respects the 10:00–11:30 EST window; ORB / OPENING_DRIVE may enter
- * from the regular open, including the morning blackout.
+ * VWAP_PULLBACK respects the 10:00–11:30 EST window; ORB / OPENING_DRIVE / GAP_HOLD
+ * may enter from the regular open, including the morning blackout.
  */
 export async function placeBracketOrder(
   symbol: string,
@@ -465,7 +466,7 @@ export async function placeBracketOrder(
       `–${config.entry.entryWindowEndHour}:${String(config.entry.entryWindowEndMinute).padStart(2, '0')} EST`,
     );
   }
-  if ((setup === 'ORB' || setup === 'OPENING_DRIVE') && isPreMarketPeriod()) {
+  if ((setup === 'ORB' || isMorningMomentumSetup(setup)) && isPreMarketPeriod()) {
     throw new Error(`Pre-market — ${setup} order ${symbol} blocked before 09:30 EST`);
   }
 

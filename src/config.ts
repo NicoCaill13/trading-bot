@@ -211,6 +211,27 @@ const config = {
     maxOpenExtensionPct: parseFloatEnv('OD_MAX_OPEN_EXTENSION_PCT', 0.055),
   },
 
+  // Overnight-gap hold + yesterday-continuation. Replaces the 2.5–5.5% OD band
+  // when enabled: scanner ranks by (open − prev close), entry waits for the gap
+  // to hold after 09:35. OD evaluate is skipped so the two paths cannot compete.
+  gapHold: {
+    enabled: process.env.GAP_HOLD_ENABLED === 'true',
+    shadow: process.env.GAP_HOLD_SHADOW === 'true',
+    windowStartHour: parseIntEnv('GAP_HOLD_WINDOW_START_HOUR', 9),
+    windowStartMinute: parseIntEnv('GAP_HOLD_WINDOW_START_MINUTE', 35),
+    windowEndHour: parseIntEnv('GAP_HOLD_WINDOW_END_HOUR', 10),
+    windowEndMinute: parseIntEnv('GAP_HOLD_WINDOW_END_MINUTE', 30),
+    minOvernightGapPct: parseFloatEnv('GAP_HOLD_MIN_OVERNIGHT_GAP_PCT', 0.08),
+    maxOvernightGapPct: parseFloatEnv('GAP_HOLD_MAX_OVERNIGHT_GAP_PCT', 0.55),
+    continuationMaxGapPct: parseFloatEnv('GAP_HOLD_CONTINUATION_MAX_GAP_PCT', 0.12),
+    minYesterdayReturnPct: parseFloatEnv('GAP_HOLD_MIN_YDAY_RETURN_PCT', 0.03),
+    minYesterdayCloseLocation: parseFloatEnv('GAP_HOLD_MIN_YDAY_CLOSE_LOC', 0.60),
+    gapFillTolerancePct: parseFloatEnv('GAP_HOLD_FILL_TOLERANCE_PCT', 0.01),
+    newsSlots: parseIntEnv('GAP_HOLD_NEWS_SLOTS', 15),
+    continuationSlots: parseIntEnv('GAP_HOLD_CONTINUATION_SLOTS', 10),
+    requireCatalyst: process.env.GAP_HOLD_REQUIRE_CATALYST !== 'false',
+  },
+
   premarket: {
     minGapUpPct: parseFloatEnv('PREMARKET_MIN_GAP_UP_PCT', 0),
     // Share volume summed on 1Min bars in EST [04:00, 09:30)
@@ -711,6 +732,58 @@ const config = {
     throw new Error(
       `[SYSTEM] OD_MAX_OPEN_EXTENSION_PCT must sit above OD_MIN_OPEN_EXTENSION_PCT ` +
       `and <= 0.2: ${od.maxOpenExtensionPct}`,
+    );
+  }
+
+  const gh = config.gapHold;
+  const ghStart = gh.windowStartHour * 60 + gh.windowStartMinute;
+  const ghEnd = gh.windowEndHour * 60 + gh.windowEndMinute;
+  if (ghStart >= ghEnd) {
+    throw new Error(`[SYSTEM] GAP_HOLD window start must precede end: ${ghStart} >= ${ghEnd}`);
+  }
+  if (gh.minOvernightGapPct < 0 || gh.minOvernightGapPct > 0.5) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_MIN_OVERNIGHT_GAP_PCT out of bounds [0, 0.5]: ${gh.minOvernightGapPct}`,
+    );
+  }
+  if (
+    gh.maxOvernightGapPct <= gh.minOvernightGapPct ||
+    gh.maxOvernightGapPct > 0.8
+  ) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_MAX_OVERNIGHT_GAP_PCT must sit above the min and <= 0.8: ` +
+      `${gh.maxOvernightGapPct}`,
+    );
+  }
+  if (gh.continuationMaxGapPct < 0 || gh.continuationMaxGapPct >= gh.maxOvernightGapPct) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_CONTINUATION_MAX_GAP_PCT must sit in [0, news-gap max): ` +
+      `${gh.continuationMaxGapPct}`,
+    );
+  }
+  if (gh.minYesterdayReturnPct < 0 || gh.minYesterdayReturnPct > 0.3) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_MIN_YDAY_RETURN_PCT out of bounds [0, 0.3]: ${gh.minYesterdayReturnPct}`,
+    );
+  }
+  if (gh.minYesterdayCloseLocation < 0.5 || gh.minYesterdayCloseLocation > 1) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_MIN_YDAY_CLOSE_LOC must be in [0.5, 1]: ${gh.minYesterdayCloseLocation}`,
+    );
+  }
+  if (gh.gapFillTolerancePct < 0 || gh.gapFillTolerancePct > 0.05) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD_FILL_TOLERANCE_PCT out of bounds [0, 0.05]: ${gh.gapFillTolerancePct}`,
+    );
+  }
+  if (gh.newsSlots < 1 || gh.continuationSlots < 0) {
+    throw new Error('[SYSTEM] GAP_HOLD_NEWS_SLOTS must be >= 1 and CONTINUATION_SLOTS >= 0');
+  }
+  if (gh.newsSlots + gh.continuationSlots > od.scannerMaxSymbols) {
+    throw new Error(
+      `[SYSTEM] GAP_HOLD news+continuation slots ` +
+      `(${gh.newsSlots + gh.continuationSlots}) exceed OD_SCANNER_MAX_SYMBOLS ` +
+      `(${od.scannerMaxSymbols})`,
     );
   }
   if (s.springReclaimRvol <= 0) {

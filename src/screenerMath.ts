@@ -168,6 +168,35 @@ export function compareWatchlistRank(
   return (b.gapUp ?? 0) - (a.gapUp ?? 0);
 }
 
+/** (sessionOpen − previousClose) / previousClose. Null when either leg is unusable. */
+export function computeOvernightGapPct(
+  sessionOpen: number,
+  previousClose: number,
+): number | null {
+  if (!(sessionOpen > 0) || !(previousClose > 0)) return null;
+  return (sessionOpen - previousClose) / previousClose;
+}
+
+/** (close − open) / open on the previous daily bar. */
+export function computeDailyReturnPct(
+  open: number,
+  close: number,
+): number | null {
+  if (!(open > 0) || !(close > 0)) return null;
+  return (close - open) / open;
+}
+
+/** (close − low) / (high − low). Null on a doji. */
+export function computeCloseLocationPct(
+  high: number,
+  low: number,
+  close: number,
+): number | null {
+  const range = high - low;
+  if (!(range > 0)) return null;
+  return (close - low) / range;
+}
+
 /** (last − sessionOpen) / sessionOpen. Null when the open is not usable. */
 export function computeOpeningExtensionPct(
   last: number,

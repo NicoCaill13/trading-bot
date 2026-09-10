@@ -38,6 +38,20 @@ import {
   type OpeningDriveOptions,
 } from './openingDrive';
 import {
+  describeGapHoldDecision,
+  evaluateGapHold,
+  isGapHoldFunnelRejection,
+  type GapHoldContext,
+  type GapHoldOptions,
+} from './gapHold';
+import {
+  filterNewsGapMovers,
+  moversToGapHoldWatchlist,
+  scanGapHoldUniverse,
+} from './gapHoldScanner';
+import { createNewsProvider } from './newsProvider';
+import type { CatalystAssessment } from './sentiment';
+import {
   allocateStreamChannels,
   capMonitoredUniverse,
   describeStreamPlan,
@@ -121,8 +135,10 @@ import type {
   ImbalanceSignal,
   WsState,
   MarketDataEvent,
+  GapHoldTrack,
+  OpeningDriveDecision,
 } from './types';
-import { formatSetupTag, parseEnteredSetup } from './types';
+import { formatSetupTag, isMorningMomentumSetup, parseEnteredSetup } from './types';
 import type { SessionDataEntry } from './riskManager';
 import type { AlpacaBar, AlpacaOrder } from '@alpacahq/alpaca-trade-api';
 
@@ -130,6 +146,10 @@ const log = createLogger('SYSTEM');
 const traderLog = createLogger('TRADER');
 const l2Log = createLogger('L2');
 const odLog = createLogger('OPENING_DRIVE');
+const ghLog = createLogger('GAP_HOLD');
+const newsProvider = createNewsProvider();
+const gapHoldCatalystCache = new Map<string, CatalystAssessment>();
+const gapHoldTracks = new Map<string, GapHoldTrack>();
 
 /** WS producer → strategy consumer (decoupled ingest). */
 const marketDataBus = createMarketDataBus({
@@ -193,6 +213,8 @@ const openingDriveRejectLogged = new Set<string>();
 // armed set: a name can be capped at 09:51 and legitimately arm at 09:54 once
 // VWAP catches up, and both observations matter — but only the first cap does.
 const openingDriveAuditLogged = new Set<string>();
+const gapHoldTriggered = new Set<string>();
+const gapHoldRejectLogged = new Set<string>();
 // Live scanner ranking. Empty until the first 09:31 tick — no warmup substitute fills.
 const scannerMoverSymbols = new Set<string>();
 
@@ -653,6 +675,10 @@ function replaceMonitoredUniverse(watchlist: Watchlist): string[] {
   openingDriveTriggered.clear();
   openingDriveAuditLogged.clear();
   openingDriveRejectLogged.clear();
+  gapHoldTriggered.clear();
+  gapHoldRejectLogged.clear();
+  gapHoldTracks.clear();
+  gapHoldCatalystCache.clear();
   lastNbbo.clear();
   lastL2LogAt.clear();
   lastLoggedL2Wall.clear();
@@ -690,6 +716,9 @@ function purgeMonitoredSymbol(symbol: string): void {
   openingDriveTriggered.delete(symbol);
   openingDriveAuditLogged.delete(symbol);
   openingDriveRejectLogged.delete(symbol);
+  gapHoldTriggered.delete(symbol);
+  gapHoldRejectLogged.delete(symbol);
+  gapHoldTracks.delete(symbol);
   lastNbbo.delete(symbol);
   lastL2LogAt.delete(symbol);
   lastLoggedL2Wall.delete(symbol);
@@ -724,7 +753,7 @@ async function swapOpeningUniverse(
   const keptSymbols = capMonitoredUniverse({
     ranked: movers.map(s => s.symbol),
     entered: new Set(enteredBySetup.keys()),
-    triggered: openingDriveTriggered,
+    triggered: new Set([...openingDriveTriggered, ...gapHoldTriggered]),
     maxSymbols,
   });
   const keep = new Set(keptSymbols);
@@ -1516,6 +1545,146 @@ function evaluateOpeningDriveSignal(symbol: string, bar1m: BarData): void {
   });
 }
 
+function gapHoldWindowMinutes(): { start: number; end: number } {
+  const gh = config.gapHold;
+  return {
+    start: gh.windowStartHour * 60 + gh.windowStartMinute,
+    end: gh.windowEndHour * 60 + gh.windowEndMinute,
+  };
+}
+
+function gapHoldLiveOptions(): GapHoldOptions {
+  const gh = config.gapHold;
+  const window = gapHoldWindowMinutes();
+  return {
+    windowStartMinutes: window.start,
+    windowEndMinutes: window.end,
+    minOvernightGapPct: gh.minOvernightGapPct,
+    maxOvernightGapPct: gh.maxOvernightGapPct,
+    continuationMaxGapPct: gh.continuationMaxGapPct,
+    gapFillTolerancePct: gh.gapFillTolerancePct,
+    maxSpreadPct: config.openingDrive.maxSpreadPct,
+    hardStopFloorPct: config.risk.hardStopFloorPct,
+    requireScannerMember: true,
+    requireAboveVwap: true,
+  };
+}
+
+function gapHoldAsOpeningDecision(decision: {
+  armed: boolean;
+  extensionPct: number | null;
+  spreadPct: number | null;
+  entryPrice: number | null;
+  stopPrice: number | null;
+  score: number;
+}): OpeningDriveDecision {
+  return {
+    armed: decision.armed,
+    rejection: null,
+    extensionPct: decision.extensionPct,
+    rvol1m: null,
+    imbalance: null,
+    spreadPct: decision.spreadPct,
+    closeLocation: null,
+    tapeDelta: null,
+    entryPrice: decision.entryPrice,
+    stopPrice: decision.stopPrice,
+    score: decision.score,
+  };
+}
+
+/**
+ * Gap Hold path. Scanner ranks overnight gappers + continuation; this confirms
+ * the gap still holds after 09:35. Opening Drive is skipped while this is on.
+ */
+function evaluateGapHoldSignal(symbol: string, bar1m: BarData): void {
+  if (!config.gapHold.enabled) return;
+  if (tradingHalted) return;
+  if (hasEntered(symbol)) return;
+  if (gapHoldTriggered.has(symbol)) return;
+  if (!scannerMoverSymbols.has(symbol)) return;
+
+  const screenerData = screenerDataMap.get(symbol);
+  const nbbo = lastNbbo.get(symbol);
+  const track = gapHoldTracks.get(symbol) ?? null;
+  const catalyst = gapHoldCatalystCache.get(symbol);
+  const ctx: GapHoldContext = {
+    symbol,
+    barMinutesSinceMidnight: minutesSinceMidnight(toESTDate(new Date(bar1m.timestamp))),
+    rangeBar: openingRangeBar.get(symbol) ?? null,
+    previousClose: screenerData?.previousClose ?? screenerData?.lastClose ?? null,
+    previousHigh: screenerData?.previousHigh ?? null,
+    sessionOpen: sessionOpenPrice.get(symbol) ?? null,
+    sessionVwap: resolveVwapForSymbol(symbol),
+    impulseBar: bar1m,
+    oneMinBars: oneMinBarHistory.get(symbol) ?? [bar1m],
+    bid: nbbo?.bid ?? l2WallSignals.get(symbol)?.topBid?.price ?? null,
+    ask: nbbo?.ask ?? l2WallSignals.get(symbol)?.topAsk?.price ?? null,
+    inScanner: scannerMoverSymbols.has(symbol),
+    track,
+    catalystPasses: track === 'continuation' || !config.gapHold.requireCatalyst
+      ? true
+      : catalyst === undefined
+        ? null
+        : catalyst.passes,
+  };
+
+  const decision = evaluateGapHold(ctx, gapHoldLiveOptions());
+
+  if (!decision.armed) {
+    if (isGapHoldFunnelRejection(decision.rejection)) {
+      const key = `${symbol}:${decision.rejection}`;
+      if (!gapHoldRejectLogged.has(key)) {
+        gapHoldRejectLogged.add(key);
+        ghLog.info(
+          `${symbol}: setup rejected by ${decision.rejection} — ` +
+          describeGapHoldDecision(decision),
+        );
+      }
+    }
+    return;
+  }
+
+  gapHoldTriggered.add(symbol);
+
+  const banner = config.gapHold.shadow ? 'SHADOW signal' : 'signal';
+  ghLog.info(
+    `${symbol}: Gap Hold ${banner} (${decision.track ?? 'unknown'}) — ` +
+    describeGapHoldDecision(decision) +
+    ` | score ${Math.round(decision.score).toLocaleString()}`,
+  );
+
+  shadowJournal.recordShadowSignal({
+    symbol,
+    signalAt: bar1m.timestamp,
+    decision: gapHoldAsOpeningDecision(decision),
+    straightRunScore: decision.track === 'continuation' ? 1 : 0,
+    rejectedBy: null,
+    horizonMinutes: config.openingDrive.shadowHorizonMinutes,
+    strategy: 'gap_hold',
+  });
+
+  if (config.gapHold.shadow) return;
+
+  const bars5m = signalBars5m.get(symbol) ?? [];
+  const baseline = bars5m.slice(0, -1).slice(-config.entry.minBarsForVolumeAvg);
+  const avgVolume = baseline.length > 0
+    ? baseline.reduce((sum, b) => sum + b.volume, 0) / baseline.length
+    : bar1m.volume;
+
+  queuePendingSignal({
+    symbol,
+    setup: 'GAP_HOLD',
+    score: decision.score,
+    barData: bar1m,
+    vwap: ctx.sessionVwap ?? bar1m.close,
+    avgVolume,
+    fibLevels: null,
+    stopPriceOverride: decision.stopPrice,
+    skipFibonacciGate: true,
+  });
+}
+
 function evaluateSignal(symbol: string, latestBar: BarData): void {
   if (!config.entry.vwapPullbackEnabled) return;
   if (tradingHalted) return;
@@ -1870,7 +2039,7 @@ async function executeSignals(
       }
 
       const entryRsi = computeEntryRsi(symbol);
-      if (setup !== 'OPENING_DRIVE' && entryRsi !== null && entryRsi > config.entry.maxEntryRsi) {
+      if (!isMorningMomentumSetup(setup) && entryRsi !== null && entryRsi > config.entry.maxEntryRsi) {
         log.warn(
           `${symbol}: entry blocked — 1-min RSI ${entryRsi.toFixed(1)} ` +
           `> cap ${config.entry.maxEntryRsi} (momentum exhaustion)`,
@@ -1883,7 +2052,7 @@ async function executeSignals(
         ? (gapRaw <= 1 ? gapRaw * 100 : gapRaw)
         : null;
       if (
-        setup !== 'OPENING_DRIVE' &&
+        !isMorningMomentumSetup(setup) &&
         filters.maxGapPctForEntry !== null &&
         gapPct !== null &&
         gapPct > filters.maxGapPctForEntry
@@ -1994,7 +2163,7 @@ async function executeSignals(
 
 /**
  * Unified-pool flush: remaining slots = MAX_POSITIONS − open positions.
- * VWAP_PULLBACK waits for 10:00–11:30; ORB / OPENING_DRIVE wait for the regular session.
+ * VWAP_PULLBACK waits for 10:00–11:30; ORB / OPENING_DRIVE / GAP_HOLD wait for the regular session.
  * Eligible candidates compete by PendingSignal.score.
  */
 async function flushPendingSignals(): Promise<void> {
@@ -2072,7 +2241,7 @@ async function flushPendingSignals(): Promise<void> {
     if (sessionCandidates.length > 0) {
       if (!isRegularSessionStarted()) {
         log.info(
-          `Pre-market — ${sessionCandidates.length} ORB/OPENING_DRIVE signal(s) held until 09:30`,
+          `Pre-market — ${sessionCandidates.length} ORB/OPENING_DRIVE/GAP_HOLD signal(s) held until 09:30`,
         );
         schedulePendingSignalFlush();
       } else {
@@ -2134,7 +2303,11 @@ async function handleOneMinuteBarEvent(bar: WsBarMessage): Promise<void> {
   // Observation before evaluation, so this bar is folded into records opened on
   // earlier bars only. A setup's own impulse bar is its entry, not an outcome.
   shadowJournal.updateShadowRecords(symbol, barData);
-  evaluateOpeningDriveSignal(symbol, barData);
+  if (config.gapHold.enabled) {
+    evaluateGapHoldSignal(symbol, barData);
+  } else {
+    evaluateOpeningDriveSignal(symbol, barData);
+  }
   if (shadowJournal.pendingFlushCount() > 0) {
     void shadowJournal.flushShadowRecords();
   }
@@ -2663,6 +2836,10 @@ function scheduleDailyReset(): void {
     openingDriveTriggered.clear();
     openingDriveAuditLogged.clear();
     openingDriveRejectLogged.clear();
+    gapHoldTriggered.clear();
+    gapHoldRejectLogged.clear();
+    gapHoldTracks.clear();
+    gapHoldCatalystCache.clear();
     lastNbbo.clear();
     lastL2LogAt.clear();
     lastLoggedL2Wall.clear();
@@ -2897,18 +3074,55 @@ async function runOpeningScannerTick(): Promise<void> {
       return;
     }
   }
-  const pinned = new Set<string>([...openingDriveTriggered, ...enteredBySetup.keys()]);
-  const movers = await scanSessionExtension(pool.symbols, alpaca, {
-    minPrice: config.screener.minClosePrice,
-    maxPrice: config.screener.maxClosePrice,
-    minExtensionPct: config.openingDrive.scannerMinExtensionPct,
-    minRthDollarVolume: config.openingDrive.scannerMinRthDollarVolume,
-    maxSymbols: config.openingDrive.scannerMaxSymbols,
-    pinned,
-  });
+  const pinned = new Set<string>([
+    ...openingDriveTriggered,
+    ...gapHoldTriggered,
+    ...enteredBySetup.keys(),
+  ]);
+  const gh = config.gapHold;
+  const movers = gh.enabled
+    ? await (async () => {
+        let ranked = await scanGapHoldUniverse(pool.symbols, alpaca, {
+          minPrice: config.screener.minClosePrice,
+          maxPrice: config.screener.maxClosePrice,
+          minRthDollarVolume: config.openingDrive.scannerMinRthDollarVolume,
+          maxSymbols: config.openingDrive.scannerMaxSymbols,
+          pinned,
+          minOvernightGapPct: gh.minOvernightGapPct,
+          maxOvernightGapPct: gh.maxOvernightGapPct,
+          continuationMaxGapPct: gh.continuationMaxGapPct,
+          minYesterdayReturnPct: gh.minYesterdayReturnPct,
+          minYesterdayCloseLocation: gh.minYesterdayCloseLocation,
+          gapFillTolerancePct: gh.gapFillTolerancePct,
+          newsSlots: gh.newsSlots,
+          continuationSlots: gh.continuationSlots,
+        });
+        if (gh.requireCatalyst) {
+          ranked = await filterNewsGapMovers(ranked, newsProvider, gapHoldCatalystCache, {
+            lookbackHours: config.sentiment.lookbackHours,
+            concurrency: config.sentiment.fetchConcurrency,
+          });
+        }
+        return ranked;
+      })()
+    : await scanSessionExtension(pool.symbols, alpaca, {
+        minPrice: config.screener.minClosePrice,
+        maxPrice: config.screener.maxClosePrice,
+        minExtensionPct: config.openingDrive.scannerMinExtensionPct,
+        minRthDollarVolume: config.openingDrive.scannerMinRthDollarVolume,
+        maxSymbols: config.openingDrive.scannerMaxSymbols,
+        pinned,
+      });
   scannerMoverSymbols.clear();
-  for (const mover of movers) scannerMoverSymbols.add(mover.symbol);
-  const { added, removed } = await swapOpeningUniverse(moversToWatchlist(movers));
+  gapHoldTracks.clear();
+  for (const mover of movers) {
+    scannerMoverSymbols.add(mover.symbol);
+    if (mover.track !== undefined) gapHoldTracks.set(mover.symbol, mover.track);
+  }
+  const watchlist = gh.enabled
+    ? moversToGapHoldWatchlist(movers)
+    : moversToWatchlist(movers);
+  const { added, removed } = await swapOpeningUniverse(watchlist);
   swapLiveStream(added, removed);
   if (added.length > 0) await seedNewOpeningSymbols(added);
 }
@@ -2973,7 +3187,18 @@ async function main(): Promise<void> {
     `Market data: REST historical=${config.alpaca.dataFeed} | ` +
     `live stream=${config.alpaca.streamFeed}`,
   );
-  if (config.openingDrive.shadow) {
+  if (config.gapHold.enabled) {
+    const mode = config.gapHold.shadow ? 'SHADOW — journal only' : `live orders → ${config.alpaca.baseUrl}`;
+    log.warn(
+      `GAP_HOLD enabled — ${mode}. Opening Drive evaluate is off. ` +
+      `window ${config.gapHold.windowStartHour}:` +
+      `${String(config.gapHold.windowStartMinute).padStart(2, '0')}` +
+      `–${config.gapHold.windowEndHour}:` +
+      `${String(config.gapHold.windowEndMinute).padStart(2, '0')} ` +
+      `gap ${(config.gapHold.minOvernightGapPct * 100).toFixed(0)}–` +
+      `${(config.gapHold.maxOvernightGapPct * 100).toFixed(0)}%`,
+    );
+  } else if (config.openingDrive.shadow) {
     log.warn('OD_SHADOW=true — signals are journalled, no orders will be sent');
   } else {
     log.info(`PAPER live — orders will be sent to ${config.alpaca.baseUrl}`);

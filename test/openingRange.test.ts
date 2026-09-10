@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeSessionImpulseHigh, selectOpeningRangeBar } from '../src/openingRange';
+import { computeSessionImpulseHigh, computeSessionImpulseLow, selectOpeningRangeBar } from '../src/openingRange';
 import type { BarData } from '../src/types';
 
 const OPEN = 9 * 60 + 30;
@@ -66,5 +66,20 @@ describe('computeSessionImpulseHigh', () => {
       { ...bar('2026-08-27T13:31:00.000Z', 17.4), high: 17.5 },
     ];
     assert.equal(computeSessionImpulseHigh(bars, range), 17.5);
+  });
+});
+
+describe('computeSessionImpulseLow', () => {
+  it('tracks the RTH low from the 09:30 bar onward', () => {
+    const range = {
+      open: 12.0, high: 12.1, low: 11.95, close: 12.05, volume: 1000,
+      timestamp: '2026-09-03T13:30:00Z',
+    };
+    const bars: BarData[] = [
+      { open: 20, high: 21, low: 10, close: 11, volume: 1, timestamp: '2026-09-03T13:15:00Z' },
+      range,
+      { open: 12.05, high: 12.2, low: 11.90, close: 12.1, volume: 1000, timestamp: '2026-09-03T13:31:00Z' },
+    ];
+    assert.equal(computeSessionImpulseLow(bars, range), 11.90);
   });
 });

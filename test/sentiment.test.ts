@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assessBullishCatalyst,
+  assessStrictBullishCatalyst,
   classifyHeadline,
   filterWatchlistByBullishCatalyst,
 } from '../src/sentiment';
@@ -65,6 +66,25 @@ describe('assessBullishCatalyst', () => {
     assert.equal(r.sentiment, 'BULLISH');
     assert.ok(r.catalystScore >= 1);
     assert.ok(r.catalystHeadline?.includes('raises guidance'));
+  });
+});
+
+describe('assessStrictBullishCatalyst', () => {
+  it('fails when a bearish headline sits next to a bullish one (TYRA)', () => {
+    const r = assessStrictBullishCatalyst([
+      headline('Firm reports positive data from Phase 2 trial'),
+      headline('Shares plunge after serious adverse events', '2'),
+    ]);
+    assert.equal(r.passes, false);
+    assert.equal(r.sentiment, 'BEARISH');
+  });
+
+  it('passes a clean earnings beat', () => {
+    const r = assessStrictBullishCatalyst([
+      headline('Company beats estimates and lifts annual profit forecast'),
+    ]);
+    assert.equal(r.passes, true);
+    assert.equal(r.sentiment, 'BULLISH');
   });
 });
 

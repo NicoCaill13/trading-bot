@@ -6,6 +6,7 @@ import {
   compareOpeningExtensionRank,
   computeAdrPct,
   computeOpeningExtensionPct,
+  computeOvernightGapPct,
   isAllowedExchange,
   isEtfLikeProduct,
   isOpeningExtensionInBand,
@@ -289,6 +290,19 @@ describe('passesDollarVolumeBand', () => {
   it('rejects above an optional ceiling', () => {
     assert.equal(passesDollarVolumeBand(1_800_000_000, 5_000_000, 800_000_000), false);
     assert.equal(passesDollarVolumeBand(741_738_190, 5_000_000, 800_000_000), true);
+  });
+});
+
+describe('computeOvernightGapPct', () => {
+  it('measures CHPT 03/09 open vs previous close', () => {
+    const gap = computeOvernightGapPct(12.0, 9.0);
+    assert.ok(gap !== null);
+    assert.equal(gap, (12.0 - 9.0) / 9.0);
+  });
+
+  it('returns null when a leg is unusable', () => {
+    assert.equal(computeOvernightGapPct(12, 0), null);
+    assert.equal(computeOvernightGapPct(0, 9), null);
   });
 });
 

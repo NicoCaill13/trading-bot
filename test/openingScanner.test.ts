@@ -61,16 +61,37 @@ describe('snapshotToOpeningMover', () => {
     assert.ok(mover);
     assert.equal(mover.symbol, 'PATH');
     assert.ok(Math.abs(mover.extensionPct - (18.23 - 17.055) / 17.055) < 1e-9);
+    assert.ok(mover.overnightGapPct !== null);
+    assert.ok(Math.abs(mover.overnightGapPct - (17.055 - 16.75) / 16.75) < 1e-9);
   });
 });
 
+function extra(): Pick<
+  OpeningMover,
+  | 'overnightGapPct'
+  | 'yesterdayReturnPct'
+  | 'yesterdayCloseLocation'
+  | 'previousHigh'
+  | 'previousOpen'
+  | 'sessionLow'
+> {
+  return {
+    overnightGapPct: null,
+    yesterdayReturnPct: null,
+    yesterdayCloseLocation: null,
+    previousHigh: null,
+    previousOpen: null,
+    sessionLow: null,
+  };
+}
+
 describe('rankOpeningMovers', () => {
   const week: OpeningMover[] = [
-    { symbol: 'PATH', last: 18.23, sessionOpen: 17.055, previousClose: 16.75, rthDollarVolume: 2_800_000, extensionPct: 0.0689 },
-    { symbol: 'ASAN', last: 10.15, sessionOpen: 9.69, previousClose: 9.43, rthDollarVolume: 300_000, extensionPct: 0.0480 },
-    { symbol: 'INTC', last: 91.45, sessionOpen: 89.615, previousClose: 88.25, rthDollarVolume: 36_000_000, extensionPct: 0.0205 },
-    { symbol: 'TQQQ', last: 72.6, sessionOpen: 72.11, previousClose: 70.45, rthDollarVolume: 8_000_000, extensionPct: 0.0068 },
-    { symbol: 'SQQQ', last: 38.75, sessionOpen: 38.47, previousClose: 39.4, rthDollarVolume: 7_000_000, extensionPct: 0.0073 },
+    { symbol: 'PATH', last: 18.23, sessionOpen: 17.055, previousClose: 16.75, rthDollarVolume: 2_800_000, extensionPct: 0.0689, ...extra() },
+    { symbol: 'ASAN', last: 10.15, sessionOpen: 9.69, previousClose: 9.43, rthDollarVolume: 300_000, extensionPct: 0.0480, ...extra() },
+    { symbol: 'INTC', last: 91.45, sessionOpen: 89.615, previousClose: 88.25, rthDollarVolume: 36_000_000, extensionPct: 0.0205, ...extra() },
+    { symbol: 'TQQQ', last: 72.6, sessionOpen: 72.11, previousClose: 70.45, rthDollarVolume: 8_000_000, extensionPct: 0.0068, ...extra() },
+    { symbol: 'SQQQ', last: 38.75, sessionOpen: 38.47, previousClose: 39.4, rthDollarVolume: 7_000_000, extensionPct: 0.0073, ...extra() },
   ];
 
   it('keeps PATH and ASAN in the cap and drops TQQQ (below 1%)', () => {

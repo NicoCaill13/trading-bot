@@ -11,6 +11,12 @@ import config from '../../src/config';
 
 export type Feed = 'iex' | 'sip';
 
+/**
+ * Raw prices are what traded that day. Split-adjusted prices are what a return
+ * across several sessions needs: a reverse split otherwise reads as a +900% move.
+ */
+export type PriceAdjustment = 'raw' | 'split';
+
 export interface RawBar {
   t: string;
   o: number;
@@ -46,7 +52,8 @@ async function throttle(): Promise<void> {
   if (wait > 0) await sleep(wait);
 }
 
-async function getJson(url: string): Promise<Record<string, unknown>> {
+/** Throttled, retrying GET against any Alpaca data endpoint (bars, news). */
+export async function getJson(url: string): Promise<Record<string, unknown>> {
   let backoffMs = 1_000;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -75,6 +82,7 @@ export async function fetchBars(
   start: Date,
   end: Date,
   feed: Feed,
+  adjustment: PriceAdjustment = 'raw',
 ): Promise<Map<string, RawBar[]>> {
   const merged = new Map<string, RawBar[]>();
 
@@ -90,7 +98,7 @@ export async function fetchBars(
         end: end.toISOString(),
         feed,
         limit: '10000',
-        adjustment: 'raw',
+        adjustment,
       });
       if (pageToken) params.set('page_token', pageToken);
 

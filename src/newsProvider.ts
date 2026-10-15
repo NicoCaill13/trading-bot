@@ -26,7 +26,7 @@ export interface NewsProvider {
   ): Promise<NewsHeadline[]>;
 }
 
-interface AlpacaNewsArticle {
+export interface AlpacaNewsArticle {
   id?: number | string;
   headline?: string;
   summary?: string;
@@ -41,7 +41,7 @@ interface AlpacaNewsResponse {
   next_page_token?: string | null;
 }
 
-function parseArticle(raw: AlpacaNewsArticle): NewsHeadline | null {
+export function parseArticle(raw: AlpacaNewsArticle): NewsHeadline | null {
   const headline = typeof raw.headline === 'string' ? raw.headline.trim() : '';
   if (!headline) return null;
   const id =

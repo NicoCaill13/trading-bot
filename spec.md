@@ -76,3 +76,75 @@ Cette section définit les briques de haute performance nécessaires à l'exécu
 * Séparation totale de l'écoute des WebSockets et de la logique de décision.
 * Implémentation d'une file d'attente (Message Queue) pour ingérer les ticks en asynchrone sans bloquer la logique du programme.
 * Moteur de Replay Intégré (Backtest Tick-by-Tick) capable de lire ces mêmes messages asynchrones pour simuler le slippage au millième de seconde près en phase de test.
+
+## 8. Playbook live — Gap Hold (Hyper-Growth Cash, sept. 2026)
+
+Compte cash T+1, max 2 tickets, bande $5–$100. Opening Drive 2,5–5,5 % vs open est **éteint** (`GAP_HOLD_ENABLED=true`). VWAP Core off.
+
+Objectif : chasser les noms qui **battent le marché le jour J**, pas un spray scanner d’extension d’open.
+
+### A. Track `news_gap` (codé, live)
+* Gap overnight `(open − prevClose) / prevClose` dans **[8 %, 55 %]**.
+* Hold : last ≥ open après 09:35 EST, last > VWAP, low RTH n’a pas mangé l’open (−1 %).
+* Headline bullish dans la lookback, **zéro** headline bearish (veto type TYRA : data + adverse events).
+* Exemples de référence : CHPT +75 % (gap +33 % earnings), SIG +20 % (beat + raise), IRD +54 % (FDA / data).
+
+### B. Track `continuation` (codé, live)
+* Gap overnight dans **[0 %, 12 %]**.
+* Veille verte ≥ +3 %, close dans le haut de la barre (loc ≥ 0,60), last > high veille.
+* News optionnelle (thème / note, pas forcément un 8-K).
+* Exemples : AEHR, SNDK — déjà en run, jour de continuation.
+
+### C. Ce que le playbook A/B n’est pas
+* Pas la bande Opening Drive 2,5–5,5 % vs open (IONQ / QBTS / RGTI).
+* Pas les lottery < $5 ou gap > 55 % (MIMI).
+* Pas SNOW à $369 (hors bande prix).
+
+### D. Track `rth_runner` — à coder (leçon 10 sept. 2026)
+
+**FUBO** et **STNE** ont battu le marché ce jour-là. Le bot ne les a pas tradés. Ce n’est pas un bug : ils sont hors A et hors B.
+
+| Nom | Prev close | Open | Overnight | vs open (RTH) | vs veille | Print du matin |
+|---|---|---|---|---|---|---|
+| FUBO | $10,71 | $10,56 | **−1,4 %** | +7,5 % | +6,1 % | aucun |
+| STNE | $9,82 | $9,72 | **−1,0 %** | +6,1 % | +5,0 % | aucun |
+
+FUBO encore $10,64 à 09:45 ; le run part **10:15–10:40**. Open plat / rouge, puis grind RTH. Contrats A/B exigent un overnight ≥ 0 % (continuation) ou ≥ 8 % (news). Un gap down tue les deux.
+
+**Contrat à figer (3ᵉ track) :**
+* Overnight plat ou légèrement rouge (ex. **[−2 %, +8 %)** — sous le plancher news_gap).
+* Après 09:40 EST : last vs open **ou** last vs prevClose ≥ **~5 %**, last > VWAP, hold au-dessus de l’open.
+* Pas besoin d’un 8-K du matin (thème / flux de séance).
+* Même moteur d’exécution / stop / 2 tickets que Gap Hold.
+
+Tant que D n’est pas branché, un batteur de marché **sans gap overnight** (FUBO, STNE) restera invisible au ranker.
+
+> **Statut D (oct. 2026) :** ne pas coder avant d’avoir un edge démontré (voir §9). Les études ci-dessous contredisent la sélection par gap / volatilité / news sur laquelle reposent A, B et D.
+
+## 9. Résultats de recherche (oct. 2026) — thèses réfutées
+
+Toutes les études sont reproductibles (`scripts/study*.ts`, libs dans `scripts/lib/`, tests dans `test/`). Méthode commune : règles déclarées avant calcul, split hors échantillon (`SEEN_FROM = 2026-08-19`), IC clusterisés par séance, comparaison à un pool de base, coût aller-retour 1 %. Critère PASS : n ≥ 30 et borne basse de l’IC clusterisé > 0 (et borne basse de l’excès vs pool > 0 en multi-jours).
+
+| Famille | Étude | Verdict |
+|---|---|---|
+| Journal live (59 trades) | revue des trades | E_R −0,13R ; Gap Hold −0,065R ; $200 → $172 |
+| Sélection pré-open intraday (cible +10 % / stop −3 %) | `studyEligibleMovers.ts` | 13 règles sur 13 échouent hors échantillon ; rendement brut ≈ 0 pour toute paire cible/stop |
+| Direction par news (gate strict `assessStrictBullishCatalyst`) | `studyNewsDirection.ts` | 66 lignes sur 66 échouent ; l’effet change de signe entre moitiés |
+| Dérive multi-jours après catalyseur (H = 1, 3, 5, 10 ; 750 séances) | `studyMultiDayDrift.ts` | 48 lignes sur 48 échouent ; événements ≤ pool |
+| Momentum cross-section 12-1, rebalancement mensuel (59 mois, 1 330 à 1 944 noms liquides) | `studyMomentum.ts` | Aucun PASS. Décile net 0,3 % : +4,3 %/an contre +9,5 %/an pour SPY ; vs SPY −0,24 %/mois [−1,49 ; +1,01], vs pool +0,58 %/mois [−0,51 ; +1,67] |
+
+### Enseignements à retenir
+* Les features pré-open (gap, ATR, volume relatif, veille verte) sélectionnent la **volatilité**, pas la **direction** : taux de cible et taux de stop montent ensemble, l’espérance brute reste ≈ 0.
+* Le coût de 1 % n’est pas la cause : brut ≈ 0 en intraday. Il suffit en revanche à rendre le pool négatif en multi-jours (brut +0,55 % à H10, net −0,45 %).
+* Gap ≥ 8 % avec volume ≥ 3x : sous-performance vs pool à tous les horizons (H10 : −0,79 % si le gap tient, −1,57 % s’il faiblit). Pas exploitable en long seul sur compte cash.
+* Seul candidat positif (gap 4–8 % & vol ≥ 3x, tenu, H3) : instable entre moitiés (−0,21 % puis +1,12 % d’excès), IC englobant 0, 16 comparaisons par segment. Non retenu.
+* Limite de puissance : IC multi-jours de ±1 à 2 points ; un edge < ~1 % à H10 n’est pas exclu, un edge exploitable à H1 l’est.
+* Biais connus : survivorship (favorise les positifs, donc renforce les négatifs), coûts réels non mesurés, univers actuel uniquement.
+
+* Momentum : signature cohérente (décile haut > pool > décile bas dans les deux moitiés) mais non significative, et brut ≈ SPY (+0,91 %/mois contre +0,85 %) ; les coûts le font passer sous l’indice. Le pool équipondéré traîne SPY d’environ 6 points par an (indice porté par les méga-caps) : le stock picking dans cet univers part avec un handicap structurel.
+* Puissance du test momentum : erreur standard ≈ 0,65 %/mois, donc un edge doit dépasser ≈ 1,8 %/mois pour être détecté. Sur 5 ans de données mensuelles, une surperformance de quelques points par an est invérifiable ; l’indice reste l’hypothèse par défaut qui domine.
+
+### Règle de conduite
+* Aucune nouvelle stratégie live (nouveau track, nouveau filtre de sélection) sans PASS préalable sur une étude pré-déclarée de ce type, et un PASS ne suffit pas : il faut ensuite un shadow en avant.
+* Objectif réaliste du bot en l’état : suivre SPY au moindre coût, sans stock picking, tant qu’aucun edge n’est démontré. Toute ambition de surperformance se juge contre SPY (rendement et drawdown), pas contre zéro.
+* Pistes non testées : information différente (surprise sur résultats, flux d’ordres, options). Les variantes du momentum testées après lecture des résultats comptent comme du data snooping.

@@ -1,10 +1,11 @@
-import { estCalendarDayKey, minutesSinceMidnight, toESTDate } from './utils';
+import { estCalendarDayKey, minutesSinceMidnight, toZonedDate } from './utils';
 import type { HeartbeatSnapshot, WatchdogFinding, WatchdogThresholds } from './types';
 
 /**
  * Liveness of the study radar. There is no live tape and no open-order book:
- * the process must keep writing a heartbeat, and a trading day must produce
- * a report once the scan slot has passed.
+ * the process must keep writing a heartbeat, and a US trading day must produce
+ * a scan once the Paris slot has passed. The report names the previous US
+ * close, so freshness is the scan's calendar day, not the session it studied.
  */
 
 const MS_PER_HOUR = 3_600_000;
@@ -39,16 +40,21 @@ function evaluateReportFreshness(
 
   if (!snapshot.tradingDay) return null;
 
-  const estNow = toESTDate(new Date(nowMs));
-  if (minutesSinceMidnight(estNow) < thresholds.reportDueMinute) return null;
+  const zone = thresholds.reportDueTimeZone;
+  const wallNow = toZonedDate(new Date(nowMs), zone);
+  const weekday = wallNow.getDay();
+  if (weekday === 0 || weekday === 6) return null;
+  if (minutesSinceMidnight(wallNow) < thresholds.reportDueMinute) return null;
 
-  const today = estCalendarDayKey(estNow);
-  if (snapshot.reportTradingDay !== today) {
+  const scannedDay = lastScanMs === null
+    ? null
+    : estCalendarDayKey(toZonedDate(new Date(lastScanMs), zone));
+  const today = estCalendarDayKey(wallNow);
+  if (scannedDay !== today) {
     return {
       code: 'REPORT_STALE',
       message:
-        `Report day ${snapshot.reportTradingDay ?? 'none'} != ${today} ` +
-        `after the scan slot`,
+        `Last scan day ${scannedDay ?? 'none'} != ${today} after the scan slot`,
     };
   }
   return null;

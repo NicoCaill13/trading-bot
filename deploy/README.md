@@ -53,7 +53,7 @@ cat data/heartbeat.json
 pm2 logs trading-watchdog --lines 50
 ```
 
-Le heartbeat doit apparaître en moins d'une seconde après le start du bot. Les digests Telegram 09h35 / 16h10 EST rendent le silence vérifiable.
+Le heartbeat doit apparaître en moins d'une seconde après le start du bot. Le scan part à 14:00 Europe/Paris et étudie la dernière séance US déjà clôturée. Les digests Telegram 09h35 / 16h10 EST ne sont qu'un contrôle de vie, pas le rapport.
 
 ## Fuseau horaire
 

@@ -8,8 +8,9 @@ import type { HeartbeatSnapshot, SessionPhase } from './types';
 import {
   estCalendarDayKey,
   getESTDate,
-  nyWallTimeToUtc,
   toErrorMessage,
+  toZonedDate,
+  zonedWallTimeToUtc,
 } from './utils';
 
 const log = createLogger('SYSTEM');
@@ -42,20 +43,13 @@ function parseArgs(argv: readonly string[]): { once: boolean; date: string | nul
 }
 
 function nextScanInstant(fromMs: number): Date {
-  const est = getESTDate();
-  let when = nyWallTimeToUtc(
-    est,
-    config.session.screenerHour,
-    config.session.screenerMinute,
-  );
+  const zone = config.schedule.timeZone;
+  const wall = toZonedDate(new Date(fromMs), zone);
+  let when = zonedWallTimeToUtc(wall, config.schedule.hour, config.schedule.minute, zone);
   if (when.getTime() <= fromMs) {
-    const tomorrow = new Date(est.getTime());
+    const tomorrow = new Date(wall.getTime());
     tomorrow.setDate(tomorrow.getDate() + 1);
-    when = nyWallTimeToUtc(
-      tomorrow,
-      config.session.screenerHour,
-      config.session.screenerMinute,
-    );
+    when = zonedWallTimeToUtc(tomorrow, config.schedule.hour, config.schedule.minute, zone);
   }
   return when;
 }
@@ -124,8 +118,8 @@ async function main(): Promise<void> {
 
   log.info(
     `Swing study radar scheduled at ` +
-    `${String(config.session.screenerHour).padStart(2, '0')}:` +
-    `${String(config.session.screenerMinute).padStart(2, '0')} America/New_York`,
+    `${String(config.schedule.hour).padStart(2, '0')}:` +
+    `${String(config.schedule.minute).padStart(2, '0')} ${config.schedule.timeZone}`,
   );
 
   for (;;) {

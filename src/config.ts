@@ -6,8 +6,9 @@ function parseFeed(envKey: string, raw: string | undefined, fallback: 'iex' | 's
   throw new Error(`[SYSTEM] ${envKey} must be iex|sip: "${raw ?? ''}"`);
 }
 
-const scanHour = parseIntEnv('SCAN_HOUR', 16);
-const scanMinute = parseIntEnv('SCAN_MINUTE', 30);
+const scanTimeZone = parseStringEnv('SCAN_TIMEZONE', 'Europe/Paris');
+const scanHour = parseIntEnv('SCAN_HOUR', 14);
+const scanMinute = parseIntEnv('SCAN_MINUTE', 0);
 
 const config = {
   alpaca: {
@@ -38,9 +39,23 @@ const config = {
     poolMinPrevDollarVolume: parseFloatEnv('POOL_SIP_MIN_DOLLAR_VOLUME', 5_000_000),
   },
 
+  /**
+   * When the process wakes. 14:00 Europe/Paris is before the US cash open all
+   * year, including the weeks when the DST switches are not aligned.
+   */
+  schedule: {
+    timeZone: scanTimeZone,
+    hour: scanHour,
+    minute: scanMinute,
+  },
+
   session: {
-    screenerHour: scanHour,
-    screenerMinute: scanMinute,
+    /**
+     * NY close used only to decide which session is complete. A Paris-morning
+     * scan stays before this cutoff, so it studies the previous US close.
+     */
+    screenerHour: 16,
+    screenerMinute: 30,
     preMarketHour: parseIntEnv('PREMARKET_HOUR', 9),
     preMarketMinute: parseIntEnv('PREMARKET_MINUTE', 15),
   },
@@ -184,6 +199,11 @@ const config = {
   }
   if (scanHour < 0 || scanHour > 23 || scanMinute < 0 || scanMinute > 59) {
     throw new Error(`[SYSTEM] SCAN_HOUR/SCAN_MINUTE out of range: ${scanHour}:${scanMinute}`);
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: scanTimeZone });
+  } catch {
+    throw new Error(`[SYSTEM] SCAN_TIMEZONE is not a valid IANA zone: "${scanTimeZone}"`);
   }
   const s = config.referenceSizing;
   if (s.capitalUsd <= 0 || s.riskPerTradePct <= 0 || s.maxPositionPct <= 0) {

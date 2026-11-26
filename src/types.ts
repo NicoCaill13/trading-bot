@@ -97,8 +97,13 @@ export interface WatchdogFinding {
 export interface WatchdogThresholds {
   heartbeatStaleMs: number;
   reportMaxAgeHours: number;
-  /** Minutes since midnight EST after which today's report is required. */
+  /**
+   * Minutes since midnight in `reportDueTimeZone` after which a scan dated
+   * that calendar day is required. The report itself still names the last
+   * completed US session, which is not that calendar day.
+   */
   reportDueMinute: number;
+  reportDueTimeZone: string;
 }
 
 /** Daily bar used by every pure detector. Oldest to newest. */

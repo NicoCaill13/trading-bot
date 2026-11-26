@@ -54,7 +54,8 @@ const watchdogStartedAtMs = Date.now();
 const thresholds: WatchdogThresholds = {
   heartbeatStaleMs: parseIntEnv('WATCHDOG_HEARTBEAT_STALE_MS', 120_000),
   reportMaxAgeHours: parseIntEnv('WATCHDOG_REPORT_MAX_AGE_HOURS', 96),
-  reportDueMinute: parseIntEnv('WATCHDOG_REPORT_DUE_MINUTE', 16 * 60 + 45),
+  reportDueMinute: parseIntEnv('WATCHDOG_REPORT_DUE_MINUTE', 14 * 60 + 20),
+  reportDueTimeZone: parseStringEnv('WATCHDOG_REPORT_DUE_TZ', 'Europe/Paris'),
 };
 
 const digestSlots: readonly DigestSlot[] = [

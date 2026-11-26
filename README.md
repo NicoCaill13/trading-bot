@@ -22,7 +22,7 @@ cp .env.example .env
 npm run scan
 ```
 
-`npm run scan -- --date 2026-11-24` refait le rapport d'une séance passée. `npm start` attend chaque jour de bourse 16:30 heure de New York, puis scanne. Le watchdog (`npm run watchdog`) vérifie que le processus écrit encore son heartbeat et qu'un rapport du jour existe après 16:45.
+`npm run scan -- --date 2026-11-24` refait le rapport d'une séance passée. `npm start` attend chaque jour de bourse US **14:00 Europe/Paris** (avant l'ouverture de Wall Street), puis scanne la dernière séance déjà clôturée. Le watchdog (`npm run watchdog`) vérifie que le processus écrit encore son heartbeat et qu'un scan du jour calendaire de Paris existe après 14:20.
 
 Sorties :
 
@@ -44,7 +44,7 @@ npm run typecheck:all
 
 | Fichier | Rôle |
 |---|---|
-| `src/index.ts` | CLI `--once` / `--date`, ou boucle 16:30 |
+| `src/index.ts` | CLI `--once` / `--date`, ou boucle 14:00 Europe/Paris |
 | `src/screener.ts` | Univers, barres daily, entonnoir, écriture du rapport |
 | `src/marketRegime.ts` | Régime SPY / QQQ |
 | `src/relativeStrength.ts` | Centile de force relative |

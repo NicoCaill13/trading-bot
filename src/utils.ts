@@ -1,10 +1,15 @@
 /**
- * Projects any instant onto America/New_York wall-clock time. The returned Date
- * carries the EST/EDT calendar fields in its local getters — it is a wall-clock
- * carrier, not a valid instant, and must never be compared to Date.now().
+ * Projects any instant onto a zone's wall-clock. The returned Date carries that
+ * zone's calendar fields in its local getters — it is a wall-clock carrier, not
+ * a valid instant, and must never be compared to Date.now().
  */
+export function toZonedDate(instant: Date, timeZone: string): Date {
+  return new Date(instant.toLocaleString('en-US', { timeZone }));
+}
+
+/** America/New_York wall-clock carrier. See `toZonedDate`. */
 export function toESTDate(instant: Date): Date {
-  return new Date(instant.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return toZonedDate(instant, 'America/New_York');
 }
 
 export function getESTDate(): Date {
@@ -27,30 +32,40 @@ export function estCalendarDayKey(est: Date): string {
 }
 
 /**
- * Convert an America/New_York wall-clock time on the given EST calendar day to a UTC Date.
- * Handles EST/EDT via Intl offset probing.
+ * Convert a wall-clock time on the given calendar day to a UTC instant.
+ * The calendar day is read from the carrier's local getters. One refinement
+ * pass absorbs a DST gap or overlap.
  */
+export function zonedWallTimeToUtc(
+  wallCalendarDay: Date,
+  hour: number,
+  minute: number,
+  timeZone: string,
+): Date {
+  const year = wallCalendarDay.getFullYear();
+  const month = wallCalendarDay.getMonth() + 1;
+  const day = wallCalendarDay.getDate();
+
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, 0);
+  const offsetMs = zoneOffsetMsAt(new Date(utcGuess), timeZone);
+  let utc = Date.UTC(year, month - 1, day, hour, minute, 0) - offsetMs;
+  const offset2 = zoneOffsetMsAt(new Date(utc), timeZone);
+  utc = Date.UTC(year, month - 1, day, hour, minute, 0) - offset2;
+  return new Date(utc);
+}
+
+/** America/New_York wall time to UTC. See `zonedWallTimeToUtc`. */
 export function nyWallTimeToUtc(
   estCalendarDay: Date,
   hour: number,
   minute: number,
 ): Date {
-  const year = estCalendarDay.getFullYear();
-  const month = estCalendarDay.getMonth() + 1;
-  const day = estCalendarDay.getDate();
-
-  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, 0);
-  const offsetMs = nyOffsetMsAt(new Date(utcGuess));
-  let utc = Date.UTC(year, month - 1, day, hour, minute, 0) - offsetMs;
-  // Refine once around DST boundaries
-  const offset2 = nyOffsetMsAt(new Date(utc));
-  utc = Date.UTC(year, month - 1, day, hour, minute, 0) - offset2;
-  return new Date(utc);
+  return zonedWallTimeToUtc(estCalendarDay, hour, minute, 'America/New_York');
 }
 
-function nyOffsetMsAt(instant: Date): number {
+function zoneOffsetMsAt(instant: Date, timeZone: string): number {
   const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York',
+    timeZone,
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

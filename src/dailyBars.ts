@@ -74,6 +74,7 @@ export async function fetchDailyBars(
   start: Date,
   end: Date,
   feed: DataFeed,
+  adjustment: 'raw' | 'split' = 'raw',
 ): Promise<Map<string, DailyBar[]>> {
   const merged = new Map<string, DailyBar[]>();
 
@@ -89,7 +90,7 @@ export async function fetchDailyBars(
         end: end.toISOString(),
         feed,
         limit: '10000',
-        adjustment: 'raw',
+        adjustment,
       });
       if (pageToken) params.set('page_token', pageToken);
 

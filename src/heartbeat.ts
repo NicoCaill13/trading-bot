@@ -2,22 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { createLogger } from './logger';
 import { toErrorMessage } from './utils';
-import type { HeartbeatSnapshot, SessionPhase, WsState } from './types';
+import type { HeartbeatSnapshot, SessionPhase } from './types';
 
 const log = createLogger('HEARTBEAT');
 
 const SESSION_PHASES: readonly SessionPhase[] = [
-  'pre_open',
-  'session',
-  'post_close',
+  'idle',
+  'scanning',
   'non_trading_day',
-];
-
-const WS_STATES: readonly WsState[] = [
-  'disabled',
-  'disconnected',
-  'connecting',
-  'authenticated',
 ];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -45,16 +37,10 @@ export function isHeartbeatSnapshot(value: unknown): value is HeartbeatSnapshot 
     typeof value['pid'] === 'number' &&
     typeof value['sessionPhaseSince'] === 'string' &&
     typeof value['tradingDay'] === 'boolean' &&
-    typeof value['tradingHalted'] === 'boolean' &&
-    typeof value['monitoredSymbols'] === 'number' &&
-    typeof value['openPositions'] === 'number' &&
-    isNullableString(value['lastBarAt']) &&
-    isNullableString(value['openPositionsCheckedAt']) &&
-    isNullableString(value['watchlistGeneratedAt']) &&
-    isOptionalNullableString(value['watchlistTradingDay']) &&
-    isOptionalNullableString(value['requiredWatchlistTradingDay']) &&
-    SESSION_PHASES.includes(value['sessionPhase'] as SessionPhase) &&
-    WS_STATES.includes(value['wsState'] as WsState)
+    typeof value['candidateCount'] === 'number' &&
+    isNullableString(value['lastScanAt']) &&
+    isNullableString(value['reportTradingDay']) &&
+    SESSION_PHASES.includes(value['sessionPhase'] as SessionPhase)
   );
 }
 

@@ -15,18 +15,12 @@ const SNAPSHOT: HeartbeatSnapshot = {
   writtenAt: '2026-08-17T14:00:00.000Z',
   startedAt: '2026-08-17T13:00:00.000Z',
   pid: 4242,
-  sessionPhase: 'session',
+  sessionPhase: 'idle',
   sessionPhaseSince: '2026-08-17T13:30:00.000Z',
   tradingDay: true,
-  tradingHalted: false,
-  wsState: 'authenticated',
-  lastBarAt: '2026-08-17T13:59:50.000Z',
-  monitoredSymbols: 44,
-  openPositions: 1,
-  openPositionsCheckedAt: '2026-08-17T13:59:40.000Z',
-  watchlistGeneratedAt: '2026-08-17T00:01:00.000Z',
-  watchlistTradingDay: null,
-  requiredWatchlistTradingDay: null,
+  lastScanAt: '2026-08-17T20:30:00.000Z',
+  reportTradingDay: '2026-08-17',
+  candidateCount: 4,
 };
 
 let tmpDir: string;
@@ -82,22 +76,14 @@ describe('isHeartbeatSnapshot', () => {
     assert.equal(isHeartbeatSnapshot({ ...SNAPSHOT, sessionPhase: 'lunch' }), false);
   });
 
-  it('rejects an unknown websocket state', () => {
-    assert.equal(isHeartbeatSnapshot({ ...SNAPSHOT, wsState: 'flaky' }), false);
-  });
-
-  it('accepts null optional instants', () => {
-    const withNulls = { ...SNAPSHOT, lastBarAt: null, openPositionsCheckedAt: null };
+  it('accepts null scan fields', () => {
+    const withNulls = { ...SNAPSHOT, lastScanAt: null, reportTradingDay: null };
     assert.equal(isHeartbeatSnapshot(withNulls), true);
   });
 
-  it('accepts a legacy snapshot without calendar watchlist fields', () => {
-    const {
-      watchlistTradingDay: _have,
-      requiredWatchlistTradingDay: _need,
-      ...legacy
-    } = SNAPSHOT;
-    assert.equal(isHeartbeatSnapshot(legacy), true);
+  it('rejects a snapshot missing the report day', () => {
+    const { reportTradingDay: _day, ...partial } = SNAPSHOT;
+    assert.equal(isHeartbeatSnapshot(partial), false);
   });
 });
 

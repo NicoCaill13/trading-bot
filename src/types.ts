@@ -1,406 +1,28 @@
-/** @deprecated Watchlist `source` field only — not a capital bucket. */
-export type SignalTier = 'core' | 'satellite';
-
-/** Intraday playbook that produced a signal or fill (#31). */
-export type SetupKind = 'VWAP_PULLBACK' | 'ORB' | 'OPENING_DRIVE' | 'GAP_HOLD';
-
-const SETUP_KINDS: readonly SetupKind[] = [
-  'VWAP_PULLBACK',
-  'ORB',
-  'OPENING_DRIVE',
-  'GAP_HOLD',
-];
-
-export function isSetupKind(value: unknown): value is SetupKind {
-  return typeof value === 'string' && (SETUP_KINDS as readonly string[]).includes(value);
-}
-
-/** Opening Drive and Gap Hold may enter from the regular open, not the Core window. */
-export function isMorningMomentumSetup(setup: SetupKind): boolean {
-  return setup === 'OPENING_DRIVE' || setup === 'GAP_HOLD';
-}
-
-export type GapHoldTrack = 'news_gap' | 'continuation';
-
-export function formatSetupTag(setup: SetupKind): string {
-  return `[${setup}]`;
-}
-
 /**
- * Reads a session_state row. Pre-#31 files stored `tier: core|satellite`;
- * unknown or missing values fail closed onto VWAP_PULLBACK.
+ * Shared types for the swing study radar.
+ *
+ * TradeRecord and the small enums it depends on stay so the expectancy
+ * module (and its tests) keep compiling. The live bot no longer writes trades.
  */
-export function parseEnteredSetup(entry: EnteredSymbolEntry | string): SetupKind {
-  if (typeof entry === 'string') return 'VWAP_PULLBACK';
-  if (isSetupKind(entry.setup)) return entry.setup;
-  if (entry.tier === 'satellite') return 'ORB';
-  return 'VWAP_PULLBACK';
-}
 
-// ---------------------------------------------------------------------------
-// Fibonacci retracement types
-// ---------------------------------------------------------------------------
-
-export type FibLevelName = '23.6' | '38.2' | '50.0' | '61.8' | '78.6';
-
-export interface FibLevels {
-  swingLow: number;
-  swingHigh: number;
-  level_236: number;
-  level_382: number;
-  level_500: number;
-  level_618: number;
-  level_786: number;
-}
-
-export interface FibProximity {
-  nearestLevel: number;
-  nearestName: FibLevelName;
-  distancePct: number;
-  isNearSupport: boolean;
-}
-
-export type ExitReason =
-  | 'target-5pct'
-  | 'target-7pct'
-  | 'target-atr'
-  | 'stop-loss-initial'
-  | 'trailing-stop'
-  | 'rsi-overbought-exit'
-  | 'volume-exhaustion-trailing'
-  // Operational incident, not a strategy outcome: the protective stop was
-  // cancelled and its trailing replacement could not be placed.
-  | 'trail-placement-failed'
-  | 'time-stop'
-  | 'eod-liquidation'
-  | 'hard-close'
-  | 'circuit-breaker'
-  | 'daily-drawdown-kill'
-  | 'unknown';
-
-export type SpyTrend = 'bullish' | 'bearish' | 'neutral' | 'unknown';
-
-/** Strategy lineage tag persisted on the daily watchlist. */
 export type SignalOrigin = 'V1_CORE' | 'V2_PLAYMAKER';
+export type SpyTrend = 'bullish' | 'bearish' | 'neutral' | 'unknown';
+export type FibLevelName = '23.6' | '38.2' | '50.0' | '61.8' | '78.6';
+export type ExitReason = string;
 
-export function resolveSymbolTier(entry: Pick<WatchlistSymbol, 'origin' | 'source'>): SignalTier {
-  if (entry.origin === 'V2_PLAYMAKER') return 'satellite';
-  if (entry.origin === 'V1_CORE') return 'core';
-  return entry.source === 'satellite' ? 'satellite' : 'core';
-}
-
-export interface PortfolioAllocation {
-  totalCapital: number;
-  maxCapital: number;
-  deployed: number;
-  available: number;
-  canOpen: boolean;
-}
-
-export interface BarData {
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-  timestamp: string;
-}
-
-export interface SessionBarData {
-  vwap: number;
-  high: number;
-  lastBarLow: number;
-}
-
-/** Pullback state machine phase (V3 Satellite tick-up; Core stays on TRACKING until 5m confirm). */
-export type SignalState = 'TRACKING_PULLBACK' | 'TRIGGERED';
-
-export interface PullbackTracker {
-  state: SignalState;
-  localHigh: number;
-  prevClose: number;
-  vwapAtDetection: number;
-  setup: SetupKind;
-  score: number;
-  avgVolume: number;
-  fibLevels: FibLevels | null;
-  /** Volumes of N bars ending at VWAP breakout (dry-up impulse baseline). */
-  impulseVolumes: number[];
-  /** Volumes of 5m bars after breakout while tracking pullback. */
-  pullbackVolumes: number[];
-}
-
-export interface PendingSignal {
-  symbol: string;
-  setup: SetupKind;
-  score: number;
-  barData: BarData;
-  vwap: number;
-  avgVolume: number;
-  fibLevels: FibLevels | null;
-  /**
-   * Structural stop supplied by the strategy instead of the ATR-derived one
-   * (Opening Drive uses the impulse bar low). The hard stop floor still applies
-   * on top, so a stop sitting a few basis points away cannot inflate size.
-   */
-  stopPriceOverride?: number | null;
-  /** Set when the strategy opts out of the Fibonacci support gate. */
-  skipFibonacciGate?: boolean;
-}
-
-/** Motifs de rejet liquidité / univers (logs screener). */
-export type LiquidityRejectReason =
-  | 'exchange'
-  | 'price'
-  | 'dollar_volume'
-  | 'no_bar'
-  | 'missing_ticker'
-  | 'adr'
-  | 'float'
-  | 'insufficient_history'
-  | 'premarket_volume'
-  | 'gap'
-  | 'missing_price';
-
-/** Daily reversal structures (spec §3.A). */
-export type ReversalPattern = 'ETEI' | 'DOUBLE_BOTTOM_SPRING';
-
-export interface PivotPoint {
-  index: number;
-  price: number;
-  volume: number;
-}
-
-export interface ReversalPatternSignal {
-  pattern: ReversalPattern;
-  neckline?: number;
-  support?: number;
-  breakoutRvol?: number;
-  reclaimRvol?: number;
-  pivots: PivotPoint[];
-}
-
-/** Daily continuation structures (spec §3.B). */
-export type ContinuationPattern = 'BULL_FLAG' | 'CUP_HANDLE' | 'FLAT_BASE';
-
-export interface ContinuationPatternSignal {
-  pattern: ContinuationPattern;
-  impulsePct?: number;
-  flagHigh?: number;
-  rim?: number;
-  atrCompressionRatio?: number;
-  breakoutRvol?: number;
-  pivots: PivotPoint[];
-}
-
-/**
- * Which branch armed the straight-run tag (#29). `consecutive_closes` is the
- * textbook straight line; `range_breakout` catches a name that based then
- * cleared the window high in one move — same absence of pullback.
- */
-export type StraightRunTrigger = 'consecutive_closes' | 'range_breakout';
-
-export interface StraightRunAssessment {
-  isStraightRun: boolean;
-  trigger: StraightRunTrigger | null;
-  /** Unbroken close-over-close streak ending on the last bar. */
-  consecutiveUpDays: number;
-  /** Close-to-close return across the window. */
-  runReturnPct: number;
-  /** Deepest close-to-close decline inside the window. */
-  drawdownPct: number;
-  /** Window volume / pre-window baseline volume, unnormalised. Kept for logs. */
-  volumeRatio: number;
-  /**
-   * `volumeRatio` divided by the benchmark's own ratio. Absolute volume ratios
-   * track the market-wide seasonal trend — in the mid-August trough every name
-   * including SPY sits near 0.7 — so the gate is applied to this figure, which
-   * measures conviction relative to the market instead of the calendar.
-   */
-  marketRelativeRvol: number;
-  /** 0..1 blend, only meaningful when `isStraightRun` is true. */
-  score: number;
-}
-
-/**
- * Why an Opening Drive setup did not arm (#29).
- *
- * `max_extension` is evaluated last on purpose: a setup carrying that code
- * satisfied every other condition, which is what makes the shadow-mode audit of
- * the anti-chase cap meaningful.
- */
-export type OpeningDriveRejection =
-  | 'not_straight_run'
-  | 'outside_window'
-  | 'insufficient_data'
-  | 'not_in_scanner'
-  | 'gap_down'
-  | 'orb_not_ready'
-  | 'no_breakout'
-  | 'open_broken'
-  | 'extension_too_low'
-  | 'extension_too_high'
-  | 'chasing_open_high'
-  | 'below_vwap'
-  | 'no_momentum'
-  | 'no_impulse_body'
-  | 'adverse_tape'
-  | 'wide_spread'
-  | 'max_extension';
-
-export type GapHoldRejection =
-  | 'outside_window'
-  | 'insufficient_data'
-  | 'not_in_scanner'
-  | 'no_catalyst'
-  | 'gap_out_of_band'
-  | 'gap_filled'
-  | 'open_broken'
-  | 'below_vwap'
-  | 'wide_spread'
-  | 'no_breakout';
-
-export interface GapHoldDecision {
-  armed: boolean;
-  rejection: GapHoldRejection | null;
-  track: GapHoldTrack | null;
-  overnightGapPct: number | null;
-  extensionPct: number | null;
-  spreadPct: number | null;
-  entryPrice: number | null;
-  stopPrice: number | null;
-  score: number;
-}
-
-export interface OpeningDriveDecision {
-  armed: boolean;
-  rejection: OpeningDriveRejection | null;
-  /** Impulse close vs session VWAP. Null when the session state is incomplete. */
-  extensionPct: number | null;
-  rvol1m: number | null;
-  /** Top-of-book bid share; diagnostic only, never a gate. */
-  imbalance: number | null;
-  /** (ask−bid)/mid. Null when no two-sided quote was seen. */
-  spreadPct: number | null;
-  /** (close−low)/(high−low) of the impulse bar. Null on a doji. */
-  closeLocation: number | null;
-  /** Signed volume share on the impulse minute. Null when no classified prints. */
-  tapeDelta: number | null;
-  /** Impulse bar close — the theoretical fill this decision is about. */
-  entryPrice: number | null;
-  /** Effective stop: impulse bar low widened to the hard stop floor. */
-  stopPrice: number | null;
-  score: number;
-}
-
-/**
- * One observed Opening Drive setup, armed or audited, tracked over a fixed
- * horizon (#29 Étape 4).
- *
- * Deliberately kept out of `journal.json`: the FeedbackEngine derives live entry
- * filters from that file, and hypothetical setups that never reached the broker
- * would silently retune the Core path.
- *
- * All `*Pct` fields are fractions, not percentage points: 0.015 means +1.5%.
- * This matches `OpeningDriveDecision.extensionPct`, which feeds this record.
- */
-export interface ShadowSignalRecord {
-  symbol: string;
-  strategy: 'opening_drive' | 'gap_hold';
-  /** NY trading day, so records stay groupable without re-deriving timezones. */
-  tradingDay: string;
-  signalAt: string;
-  /**
-   * Null when the setup armed. Otherwise the single gate that stopped it — only
-   * gates worth auditing are recorded, currently `max_extension`.
-   */
-  rejectedBy: OpeningDriveRejection | null;
-  /** Theoretical fill: the impulse bar close. */
-  entryPrice: number;
-  /** Theoretical stop: impulse bar low widened to the hard stop floor. */
-  stopPrice: number;
-  extensionPct: number;
-  rvol1m: number | null;
-  imbalance: number | null;
-  straightRunScore: number;
-  horizonMinutes: number;
-  /** Best/worst excursion vs entry, measured on bar highs/lows (intrabar). */
-  mfePct: number;
-  maePct: number;
-  /** Bar index (0-based, from the first bar after the signal) of each event. */
-  mfeBarIndex: number | null;
-  stopHitBarIndex: number | null;
-  stopHit: boolean;
-  /**
-   * True when the stop was touched no later than the bar that set the MFE peak.
-   * A stop touched on the very bar that set a new high counts as "before": bar
-   * data cannot order a high and a low within the same minute, and overstating
-   * the opportunity would bias the anti-chase audit toward loosening the cap.
-   */
-  stopHitBeforeMfe: boolean;
-  barsObserved: number;
-  /** Set when the horizon elapsed or the session ended. */
-  closedAt: string | null;
-}
-
-/** Lexicon news headline sentiment for the catalyst gate (#21). */
 export type NewsSentiment = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 
 export interface WatchlistSymbol {
   symbol: string;
   origin: SignalOrigin;
-  /** @deprecated Use `origin` — kept for legacy watchlist files. */
-  source?: SignalTier;
-  relativeReturn?: number;
-  symbolReturn?: number;
-  gapUp?: number;
-  gapHeld?: boolean;
-  relativeVolume?: number;
-  dollarVolume?: number;
-  lastClose?: number;
-  lastOpen?: number;
-  /** Previous session close — Opening Drive gap-down gate (V2). */
-  previousClose?: number;
-  /** Previous session high — Gap Hold continuation breakout. */
-  previousHigh?: number;
-  preMarketGapPct?: number;
-  catalystScore?: number;
-  /** Lexicon sentiment of the strongest recent catalyst headline. */
+  source?: 'core' | 'satellite';
   sentiment?: NewsSentiment;
-  /** Headline that armed the bullish catalyst gate (when present). */
+  catalystScore?: number;
   catalystHeadline?: string;
-  /** Average Daily Range % over screener.adrLookbackDays (Core). */
-  adrPct?: number;
-  /** Free float shares when float filter provider is available. */
-  floatShares?: number;
-  /** Alpaca asset exchange (e.g. NYSE, NASDAQ). */
-  exchange?: string;
-  /** Weinstein Phase 2 — SMA 150 daily. */
-  sma150?: number;
-  /** Weinstein Phase 2 — SMA 200 daily. */
-  sma200?: number;
-  /** SMA150[t] - SMA150[t-8w]; non-negative required. */
-  sma150Slope?: number;
-  /** Soft annotate: ETEI or Spring when detected post-Weinstein. */
-  reversalPattern?: ReversalPattern;
-  reversalDetail?: ReversalPatternSignal;
-  /** Soft annotate: Bull Flag / Cup&Handle / Flat Base post-Weinstein. */
-  continuationPattern?: ContinuationPattern;
-  continuationDetail?: ContinuationPatternSignal;
-  /**
-   * Soft annotate (#29): daily straight-line run. Arms the isolated Opening
-   * Drive entry path; the Core VWAP pullback logic ignores it entirely.
-   */
-  isStraightRun?: boolean;
-  straightRunDetail?: StraightRunAssessment;
 }
 
 export interface Watchlist {
   generatedAt: string;
-  /**
-   * NY calendar day of the EOD close this list was screened from — same key as
-   * `data/eod/<day>/`. Absent on pre-#31 files; treat as stale.
-   */
   tradingDay?: string;
   benchmarkReturn: number | null;
   universeSize: number;
@@ -408,106 +30,12 @@ export interface Watchlist {
   symbols: WatchlistSymbol[];
 }
 
-export interface PremarketWatchlist {
-  generatedAt: string;
-  universeSize: number;
-  liquidFiltered: number;
-  symbols: WatchlistSymbol[];
-}
-
-export interface OrbState {
-  high: number;
-  low: number;
-  barsCollected: number;
-  triggered: boolean;
-}
-
-export interface PositionSizeResult {
-  qty: number;
-  stopLossPrice: number;
-  takeProfitPrice: number;
-  atr: number;
-}
-
-export interface EnteredSymbolEntry {
-  symbol: string;
-  setup?: SetupKind;
-  /** @deprecated Pre-#31 session_state — mapped by parseEnteredSetup. */
-  tier?: SignalTier;
-}
-
-export interface AdaptiveFilters {
-  maxVwapEntryDistancePct: number;
-  maxGapPctForEntry: number | null;
-  blockV1WhenSpyBearish: boolean;
-  atrStopTooWideWarning: boolean;
-  computedAt: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Liveness contract — written by the bot, read by the standalone watchdog.
-// This is the only coupling between the two processes: no shared config, no
-// shared business logic, no socket.
-// ---------------------------------------------------------------------------
-
-export type SessionPhase = 'pre_open' | 'session' | 'post_close' | 'non_trading_day';
-
-export type WsState = 'disabled' | 'disconnected' | 'connecting' | 'authenticated';
-
-export interface HeartbeatSnapshot {
-  writtenAt: string;
-  startedAt: string;
-  pid: number;
-  sessionPhase: SessionPhase;
-  /** Instant the current phase was first observed — grace period for staleness rules. */
-  sessionPhaseSince: string;
-  tradingDay: boolean;
-  tradingHalted: boolean;
-  wsState: WsState;
-  lastBarAt: string | null;
-  monitoredSymbols: number;
-  /** Broker-sourced count — the in-process map is not authoritative after the close. */
-  openPositions: number;
-  openPositionsCheckedAt: string | null;
-  watchlistGeneratedAt: string | null;
-  /** NY day stamped on the loaded watchlist; null when the file has no field. */
-  watchlistTradingDay: string | null;
-  /** NY day the session is required to trade; null when the calendar is unavailable. */
-  requiredWatchlistTradingDay: string | null;
-}
-
-export type WatchdogFindingCode =
-  | 'HEARTBEAT_MISSING'
-  | 'HEARTBEAT_STALE'
-  | 'MARKET_DATA_STALE'
-  | 'WATCHLIST_STALE'
-  | 'POSITIONS_OPEN_AFTER_CLOSE';
-
-export interface WatchdogFinding {
-  code: WatchdogFindingCode;
-  message: string;
-}
-
-export interface WatchdogThresholds {
-  heartbeatStaleMs: number;
-  marketDataStaleMs: number;
-  watchlistMaxAgeHours: number;
-  /** EST wall-clock time after which any open position is considered overnight risk. */
-  openPositionCheckHour: number;
-  openPositionCheckMinute: number;
-  /** Beyond this age the broker position count is too old to raise an overnight alert. */
-  openPositionDataMaxAgeMs: number;
-}
-
 export interface TradeRecord {
-  // Pre-trade context (Screener Data)
   symbol: string;
   origin: SignalOrigin;
   alpha_vs_spy: number | null;
   gap_percentage: number | null;
   relative_volume: number | null;
-
-  // Entry & Technical Indicators
   entry_time: string;
   entry_price: number;
   qty: number;
@@ -516,43 +44,21 @@ export interface TradeRecord {
   sma20_at_entry: number | null;
   distance_to_sma20_percent: number | null;
   spy_trend_5m: SpyTrend;
-
-  // Partial exit — populated when a scale-out fires (50% sold at target)
   scale_out_price: number | null;
   scale_out_qty: number | null;
   scale_out_reason: 'target-5pct' | 'target-7pct' | 'target-atr' | null;
-
-  // Fibonacci context at entry — nearest retracement level and its name
   fib_level_at_entry: number | null;
   fib_level_name_at_entry: FibLevelName | null;
-
-  // Final exit metrics (null until fully closed)
   exit_time: string | null;
   exit_price: number | null;
   exit_reason: ExitReason | null;
-  // Dollar-weighted PnL across both scale-out and final exit legs
   net_pnl_dollars: number | null;
   net_pnl_percentage: number | null;
   mfe_percent: number | null;
   mae_percent: number | null;
-
-  // Risk in R-multiples (V7 expectancy) — null on legacy journal rows
   equity_at_entry: number | null;
   risk_dollars_at_entry: number | null;
   pnl_r: number | null;
-}
-
-export interface DailyReportData {
-  startEquity: number;
-  endEquity: number;
-  tradesEntered: number;
-  circuitBreakerFired: boolean;
-  symbols: string[];
-}
-
-export interface SessionState {
-  date: string;
-  enteredSymbols: EnteredSymbolEntry[] | string[];
 }
 
 export interface Logger {
@@ -567,133 +73,189 @@ export interface DiscordField {
   inline?: boolean;
 }
 
-export interface WsBarMessage {
-  T: 'b';
-  S: string;
-  o: number;
-  h: number;
-  l: number;
-  c: number;
-  v: number;
-  t: string;
+export type SessionPhase = 'idle' | 'scanning' | 'non_trading_day';
+
+export interface HeartbeatSnapshot {
+  writtenAt: string;
+  startedAt: string;
+  pid: number;
+  sessionPhase: SessionPhase;
+  sessionPhaseSince: string;
+  tradingDay: boolean;
+  lastScanAt: string | null;
+  reportTradingDay: string | null;
+  candidateCount: number;
 }
 
-/** Alpaca IEX quote (top-of-book). Not full multi-level L2. */
-export interface WsQuoteMessage {
-  T: 'q';
-  S: string;
-  /** Bid price */
-  bp: number;
-  /** Bid size */
-  bs: number;
-  /** Ask price */
-  ap: number;
-  /** Ask size */
-  as: number;
-  t: string;
+export type WatchdogFindingCode = 'HEARTBEAT_MISSING' | 'HEARTBEAT_STALE' | 'REPORT_STALE';
+
+export interface WatchdogFinding {
+  code: WatchdogFindingCode;
+  message: string;
 }
 
-/** Alpaca trade print (IEX or SIP depending on the stream feed). */
-export interface WsTradeMessage {
-  T: 't';
-  S: string;
-  /** Trade price */
-  p: number;
-  /** Trade size in shares */
-  s: number;
-  t: string;
+export interface WatchdogThresholds {
+  heartbeatStaleMs: number;
+  reportMaxAgeHours: number;
+  /** Minutes since midnight EST after which today's report is required. */
+  reportDueMinute: number;
 }
 
-export interface WsSuccessMessage {
-  T: 'success';
-  msg: string;
+/** Daily bar used by every pure detector. Oldest to newest. */
+export interface PriceBar {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
 }
 
-export interface WsErrorMessage {
-  T: 'error';
-  code: number;
-  msg: string;
+/** Daily bar tagged with its NY session day (YYYY-MM-DD) for weekly aggregation. */
+export interface DatedDailyBar extends PriceBar {
+  day: string;
 }
 
-export type WsMessage =
-  | WsBarMessage
-  | WsQuoteMessage
-  | WsTradeMessage
-  | WsSuccessMessage
-  | WsErrorMessage
-  | { T: string };
+/** ISO-week OHLCV bar built from split-adjusted daily sessions. */
+export interface WeeklyBar extends PriceBar {
+  weekStart: string;
+  weekEnd: string;
+  sessions: number;
+}
 
-/** Backpressure policy when the market-data queue is full. */
-export type BusDropPolicy = 'drop_oldest' | 'drop_newest';
+export type WeinsteinStage = 'STAGE_1' | 'STAGE_2' | 'STAGE_3' | 'STAGE_4';
 
-/**
- * Typed market-data bus events (WS producer → strategy consumer).
- */
-export type MarketDataEvent =
-  | {
-      kind: 'bar_1m';
-      receivedAt: number;
-      bar: WsBarMessage;
-    }
-  | {
-      kind: 'quote';
-      receivedAt: number;
-      quote: WsQuoteMessage;
-    }
-  | {
-      kind: 'trade';
-      receivedAt: number;
-      trade: WsTradeMessage;
-    };
-
-export interface OrderBookLevel {
+export interface PriceZone {
   price: number;
-  size: number;
+  touches: number;
 }
 
-export interface OrderBookSnapshot {
+export interface WeeklyAssessment {
+  stage: WeinsteinStage;
+  close: number;
+  sma10w: number;
+  sma30w: number;
+  sma40w: number | null;
+  sma30wSlopePct: number;
+  maAligned: boolean;
+  tightWeeksCount: number;
+  supportZones: PriceZone[];
+  resistanceZones: PriceZone[];
+}
+
+export interface WeeklyClearance {
+  nearestSupport: PriceZone | null;
+  nearestResistance: PriceZone | null;
+  blueSky: boolean;
+  roomToResistancePct: number | null;
+  roomToResistanceR: number | null;
+  nearSma10wSupport: boolean;
+}
+
+export type MarketRegimeStatus =
+  | 'CONFIRMED_UPTREND'
+  | 'UPTREND_UNDER_PRESSURE'
+  | 'CORRECTION';
+
+export type SetupState = 'FORMING_AT_PIVOT' | 'FRESH_BREAKOUT';
+
+export type SwingPattern =
+  | 'VCP'
+  | 'CUP_HANDLE'
+  | 'KULLAMAGI_FLAG'
+  | 'FLAT_BASE'
+  | 'WYCKOFF_SPRING'
+  | 'ETEI'
+  | 'EPISODIC_PIVOT';
+
+export type StudyGrade = 'A+' | 'A' | 'B';
+
+export interface SwingSetup {
+  pattern: SwingPattern;
+  state: SetupState;
+  pivot: number;
+  stop: number;
+  rvol: number | null;
+  thesis: string;
+  /** Average volume of the contraction / average volume before it. Lower is drier. */
+  volumeDryUpRatio: number | null;
+  contractionDepths: number[];
+}
+
+export interface IndexRegime {
   symbol: string;
-  bids: OrderBookLevel[];
-  asks: OrderBookLevel[];
-  mid: number | null;
-  timestamp: string;
+  status: MarketRegimeStatus;
+  close: number;
+  sma50: number;
+  sma200: number;
+  sma50Rising: boolean;
+  distributionDays: number;
+  recommendedExposurePct: 0 | 50 | 100;
+  weeklyStage?: WeinsteinStage | null;
+  sma10w?: number | null;
+  sma30w?: number | null;
 }
 
-export interface ImbalanceSignal {
+export interface FunnelStats {
+  universe: number;
+  liquid: number;
+  adrPass: number;
+  templatePass: number;
+  weeklyTrendPass: number;
+  chartSetups: number;
+  episodicCandidates: number;
+  episodicPass: number;
+  rejectedOverheadSupply: number;
+  rejectedWideRisk: number;
+  published: number;
+}
+
+export interface StudyCard {
   symbol: string;
-  imbalance: number | null;
-  mid: number | null;
-  wall: boolean;
-  topBid: OrderBookLevel | null;
-  topAsk: OrderBookLevel | null;
-  assessedAt: number;
+  exchange: string;
+  pattern: SwingPattern;
+  state: SetupState;
+  grade: StudyGrade;
+  masterScore: number;
+  close: number;
+  pivot: number;
+  stop: number;
+  riskPct: number;
+  entry: number;
+  target2r: number;
+  target3r: number;
+  referenceQty: number;
+  rsRating: number | null;
+  adrPct: number;
+  rvol: number | null;
+  distanceFromHigh52wPct: number | null;
+  ema10: number | null;
+  ema20: number | null;
+  sma50: number | null;
+  weeklyStage: WeinsteinStage | null;
+  sma10w: number | null;
+  sma30w: number | null;
+  sma40w: number | null;
+  weeklyMaAligned: boolean;
+  tightWeeksCount: number;
+  weeklySupport: number | null;
+  weeklyResistance: number | null;
+  weeklyBlueSky: boolean;
+  roomToResistanceR: number | null;
+  thesis: string;
+  catalystHeadline: string | null;
+  tradingViewUrl: string;
 }
 
-/** Morning market regime label (heuristic / future ONNX classifier). */
-export type MarketRegime = 'TRENDING' | 'CHOPPY' | 'UNKNOWN';
-
-export interface RegimeFeatures {
-  vixLast: number | null;
-  spyAdr14d: number | null;
-  /** Proxy: sum of SPY+QQQ 1Min share volume in EST [04:00, 09:30). */
-  premarketGlobalVolumeProxy: number | null;
-}
-
-export interface RegimeSnapshot {
-  regime: MarketRegime;
-  features: RegimeFeatures;
-  effectiveRiskPerTradePct: number;
-  minRiskRewardRatio: number;
-  predictedAt: string;
-  /** False when REGIME_MODEL_SHADOW or model disabled — sizing stays nominal. */
-  applied: boolean;
-}
-
-/**
- * Injected risk/TP scaler consumed by riskManager (DIP — no broker coupling).
- */
-export interface RegimeRiskScaler {
-  getEffectiveRiskPerTradePct(): number;
-  getMinRiskRewardRatio(): number;
-  getRegime(): MarketRegime;
+export interface SwingStudyReport {
+  generatedAt: string;
+  tradingDay: string;
+  benchmarkReturn: number | null;
+  universeSize: number;
+  liquidFiltered: number;
+  symbols: WatchlistSymbol[];
+  regimes: IndexRegime[];
+  combinedStatus: MarketRegimeStatus;
+  recommendedExposurePct: 0 | 50 | 100;
+  funnel: FunnelStats;
+  cards: StudyCard[];
 }

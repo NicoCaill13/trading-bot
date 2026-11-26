@@ -133,6 +133,11 @@ export function isNonRetryableOrderError(message: string): boolean {
   );
 }
 
+/** Narrows an untyped JSON value to a plain object, so fields can be checked one by one. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function toErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   // Axios / SDK errors expose response.data or response.status

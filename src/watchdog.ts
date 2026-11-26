@@ -53,11 +53,8 @@ const watchdogStartedAtMs = Date.now();
 
 const thresholds: WatchdogThresholds = {
   heartbeatStaleMs: parseIntEnv('WATCHDOG_HEARTBEAT_STALE_MS', 120_000),
-  marketDataStaleMs: parseIntEnv('WATCHDOG_MARKET_DATA_STALE_MS', 180_000),
-  watchlistMaxAgeHours: parseIntEnv('WATCHDOG_WATCHLIST_MAX_AGE_HOURS', 96),
-  openPositionCheckHour: parseIntEnv('WATCHDOG_OPEN_POSITION_CHECK_HOUR', 16),
-  openPositionCheckMinute: parseIntEnv('WATCHDOG_OPEN_POSITION_CHECK_MINUTE', 5),
-  openPositionDataMaxAgeMs: parseIntEnv('WATCHDOG_POSITION_DATA_MAX_AGE_MS', 600_000),
+  reportMaxAgeHours: parseIntEnv('WATCHDOG_REPORT_MAX_AGE_HOURS', 96),
+  reportDueMinute: parseIntEnv('WATCHDOG_REPORT_DUE_MINUTE', 16 * 60 + 45),
 };
 
 const digestSlots: readonly DigestSlot[] = [
@@ -179,7 +176,7 @@ async function main(): Promise<void> {
   log.info(
     `Watchdog started — heartbeat ${heartbeatPath} | poll ${Math.round(pollIntervalMs / 1000)}s | ` +
     `heartbeat stale ${Math.round(thresholds.heartbeatStaleMs / 1000)}s | ` +
-    `bar stale ${Math.round(thresholds.marketDataStaleMs / 1000)}s | ` +
+    `report due minute ${thresholds.reportDueMinute} | ` +
     `startup grace ${Math.round(startupGraceMs / 1000)}s`,
   );
 

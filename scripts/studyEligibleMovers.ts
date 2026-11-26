@@ -29,7 +29,7 @@ import config from '../src/config';
 import { getDynamicUniverse } from '../src/screener';
 import { nyWallTimeToUtc } from '../src/utils';
 import { fetchBars, fetchRecentSessions, type Feed, type RawBar } from './lib/barFetch';
-import { barMinutes } from './lib/scannerReplay';
+import { barMinutes } from './lib/sessionTime';
 import {
   FEATURE_LOOKBACK,
   STUDY_RULES,

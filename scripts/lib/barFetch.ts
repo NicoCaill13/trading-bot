@@ -8,6 +8,7 @@
  */
 
 import config from '../../src/config';
+import { createThrottle, sleep } from './throttle';
 
 export type Feed = 'iex' | 'sip';
 
@@ -40,17 +41,8 @@ const headers = {
   'APCA-API-SECRET-KEY': config.alpaca.secretKey,
 };
 
-const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
-
-let nextRequestAt = 0;
-
 /** Serialises requests so the whole process stays under the rate limit. */
-async function throttle(): Promise<void> {
-  const now = Date.now();
-  const wait = Math.max(0, nextRequestAt - now);
-  nextRequestAt = Math.max(now, nextRequestAt) + MIN_REQUEST_INTERVAL_MS;
-  if (wait > 0) await sleep(wait);
-}
+const throttle = createThrottle(MIN_REQUEST_INTERVAL_MS);
 
 /** Throttled, retrying GET against any Alpaca data endpoint (bars, news). */
 export async function getJson(url: string): Promise<Record<string, unknown>> {
@@ -139,4 +131,10 @@ export async function fetchRecentSessions(count: number): Promise<string[]> {
   const days = (await res.json()) as { date: string }[];
   const today = new Date().toISOString().slice(0, 10);
   return days.map(d => d.date).filter(d => d < today).slice(-count);
+}
+
+/** A YYYY-MM-DD session as the local calendar Date that nyWallTimeToUtc expects. */
+export function sessionDay(session: string): Date {
+  const [year, month, day] = session.split('-').map(Number);
+  return new Date(year, month - 1, day);
 }

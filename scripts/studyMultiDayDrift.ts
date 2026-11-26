@@ -27,7 +27,7 @@
 import config from '../src/config';
 import { getDynamicUniverse } from '../src/screener';
 import { nyWallTimeToUtc } from '../src/utils';
-import { fetchBars, fetchRecentSessions, type Feed, type RawBar } from './lib/barFetch';
+import { fetchBars, fetchRecentSessions, sessionDay, type Feed, type RawBar } from './lib/barFetch';
 import {
   CONTEXT_LOOKBACK,
   DRIFT_EVENTS,
@@ -72,11 +72,6 @@ interface StudyState {
   baseline: Map<string, HorizonAccumulator>;
   hits: EventHit[][];
   poolRows: number;
-}
-
-function sessionDay(session: string): Date {
-  const [year, month, day] = session.split('-').map(Number);
-  return new Date(year, month - 1, day);
 }
 
 const dateOf = (timestamp: string): string => timestamp.slice(0, 10);

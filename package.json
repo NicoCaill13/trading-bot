@@ -1,11 +1,12 @@
 {
   "name": "trading-bot",
   "version": "1.0.0",
-  "description": "Quantitative algorithmic trading bot for US equities via Alpaca API",
+    "description": "Read-only swing study radar for US equities via the Alpaca market-data API",
   "main": "src/index.ts",
   "type": "commonjs",
   "scripts": {
     "start": "tsx src/index.ts",
+    "scan": "tsx src/index.ts --once",
     "watchdog": "tsx src/watchdog.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:all": "tsc -p tsconfig.scripts.json",
@@ -16,13 +17,10 @@
   },
   "dependencies": {
     "@alpacahq/alpaca-trade-api": "^3.1.2",
-    "dotenv": "^16.4.5",
-    "technicalindicators": "^3.1.0",
-    "ws": "^8.17.0"
+    "dotenv": "^16.4.5"
   },
   "devDependencies": {
     "@types/node": "^20.19.41",
-    "@types/ws": "^8.18.1",
     "tsx": "^4.22.3",
     "typescript": "^5.9.3"
   },

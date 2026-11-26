@@ -84,7 +84,8 @@ export async function queryRequiredWatchlistTradingDay(
     minutesSinceMidnight: minutesSinceMidnight(date),
     screenerMinutes: config.session.screenerHour * 60 + config.session.screenerMinute,
     previousTradingDay,
-    eveningScreenerEnabled: config.screener.eveningScreenerEnabled,
-    preMarketMinutes: config.session.preMarketHour * 60 + config.session.preMarketMinute,
+    // The radar always studies the last completed US close. The legacy
+    // EVENING_SCREENER_ENABLED=false path returns null on a holiday and
+    // before 09:15 NY, which makes `npm run scan` unusable.
   });
 }
